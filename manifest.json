@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Adjust → Meta ROAS Overlay",
+  "version": "0.1.0",
+  "description": "Pull accurate multi-window ROAS from Adjust and overlay onto Meta Ads Manager UI for decision support.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://automate.adjust.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Adjust ROAS Overlay",
+    "default_icon": {
+      "16": "assets/icons/16.png",
+      "32": "assets/icons/32.png",
+      "48": "assets/icons/48.png",
+      "128": "assets/icons/128.png"
+    }
+  },
+  "icons": {
+    "16": "assets/icons/16.png",
+    "32": "assets/icons/32.png",
+    "48": "assets/icons/48.png",
+    "128": "assets/icons/128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://adsmanager.facebook.com/adsmanager/*"
+      ],
+      "js": ["content/meta-injector.js"],
+      "css": ["content/meta-injector.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

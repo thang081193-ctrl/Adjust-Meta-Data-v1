@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/icons/32.png">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; width: 360px; margin: 0; padding: 12px; }
+  h3 { margin: 0 0 8px; font-size: 14px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+  button.primary { background: #1877f2; color: #fff; border-color: #1877f2; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+
+  .status { font-size: 12px; color: #666; margin: 6px 0; }
+
+  .periods { display: flex; gap: 4px; flex-wrap: wrap; margin: 8px 0; }
+  .periods button { flex: 1; min-width: 60px; padding: 6px 8px; font-size: 11px; }
+  .periods button.active {
+    background: #00C566; color: #fff; border-color: #00C566; font-weight: 600;
+  }
+
+  .group { margin: 6px 0; padding: 6px; border-radius: 4px; font-size: 12px; }
+  .group-pause { background: #fee; color: #b00020; }
+  .group-scale { background: #e8f5e9; color: #1b5e20; }
+  .group-hold  { background: #f5f5f5; color: #424242; }
+  .group-noisy { background: #fff3e0; color: #6a3a00; }
+
+  .err { color: #b00020; font-size: 12px; margin: 6px 0; }
+  details { margin-top: 8px; }
+  textarea { width: 100%; height: 60px; font-family: ui-monospace, monospace; font-size: 11px; }
+  label { font-size: 12px; }
+</style>
+</head>
+<body>
+  <h3>Adjust ROAS Overlay</h3>
+
+  <div class="status" id="status">Loading…</div>
+
+  <div class="periods" id="periods" role="group" aria-label="Date period">
+    <button data-period="yesterday">Yesterday</button>
+    <button data-period="rolling3">Last 3d</button>
+    <button data-period="rolling7">Last 7d</button>
+    <button data-period="rolling30">Last 30d</button>
+    <button data-period="last_month">Last month</button>
+  </div>
+
+  <div class="row">
+    <button id="sync" class="primary">Sync (cached if fresh)</button>
+    <button id="forceSync">Force refresh</button>
+  </div>
+
+  <div id="error" class="err" style="display:none"></div>
+
+  <div id="groups"></div>
+
+  <details>
+    <summary>Settings</summary>
+    <div class="row">
+      <label>Adjust API token:<br>
+        <input id="apiToken" type="password" style="width:100%" />
+      </label>
+    </div>
+    <div class="row">
+      <label>UTC offset:
+        <input id="utcOffset" type="text" value="+07:00" style="width:80px" />
+      </label>
+    </div>
+    <div class="row">
+      <label style="font-size:11px;color:#777">
+        Custom date period (advanced — overrides buttons above):<br>
+        <input id="datePeriod" type="text" value="rolling30" style="width:100%"
+               title="Rolling: rolling3, rolling7, rolling30 | Adjust keywords: today, yesterday, this_week, last_week, this_month, last_month | or YYYY-MM-DD:YYYY-MM-DD" />
+      </label>
+    </div>
+    <button id="saveCfg">Save config</button>
+  </details>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
