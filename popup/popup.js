@@ -57,6 +57,7 @@ async function loadCfg() {
     $('apiToken').value = dataSourceConfig?.apiToken || '';
     $('utcOffset').value = dataSourceConfig?.utcOffset || '+07:00';
     $('datePeriod').value = dataSourceConfig?.datePeriod || 'rolling30';
+    $('appTokens').value = dataSourceConfig?.appTokens || '';
   }
   syncPeriodButtons(dataSourceConfig?.datePeriod || 'rolling30');
 }
@@ -67,6 +68,7 @@ async function saveCfg() {
     apiToken: $('apiToken').value.trim(),
     utcOffset: $('utcOffset').value.trim() || '+07:00',
     datePeriod: $('datePeriod').value.trim() || 'rolling30',
+    appTokens: $('appTokens').value.trim(),
   };
   await chrome.storage.local.set({ dataSourceConfig: cfg });
   $('status').textContent = 'Config saved. Click Sync.';

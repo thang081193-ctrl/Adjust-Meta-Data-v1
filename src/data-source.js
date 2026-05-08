@@ -10,10 +10,11 @@ import { fetchCampaignROAS } from './adjust-client.js';
  */
 
 export class AdjustDirectDataSource {
-  constructor({ apiToken, utcOffset, datePeriod }) {
+  constructor({ apiToken, utcOffset, datePeriod, appTokens }) {
     this.apiToken = apiToken;
     this.utcOffset = utcOffset;
     this.datePeriod = datePeriod;
+    this.appTokens = appTokens;
   }
 
   async fetchAll() {
@@ -21,13 +22,14 @@ export class AdjustDirectDataSource {
       apiToken: this.apiToken,
       utcOffset: this.utcOffset,
       datePeriod: this.datePeriod,
+      appTokens: this.appTokens,
     });
   }
 
   describe() {
     // The v2 endpoint pulls data for every app the API token has access to,
     // so there's nothing app-specific to identify the source by.
-    return 'Adjust Reporting v2 (Meta channels)';
+    return 'Adjust Reporting v2 (Meta + TikTok)';
   }
 }
 

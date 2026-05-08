@@ -18,9 +18,18 @@
 
 const ADJUST_BASE = 'https://automate.adjust.com/reports-service/report';
 
-// Adjust channel ids for Meta. Verified from the dashboard URL's
-// channel_id__in param (partner_34 = Facebook).
-const META_CHANNEL_ID = 'partner_34';
+// Adjust channel ids per ad network. Verified from the dashboard URL's
+// `channel_id__in` param. We pass both in a single comma-separated request so
+// one Adjust call returns rows for every network the extension supports — the
+// response carries a `channel` field per row (e.g. "Facebook", "TikTok for
+// Business") that the per-platform content scripts use to filter.
+//
+// To add another network: capture its channel_id from the Adjust dashboard
+// URL after applying its filter, and append here.
+const NETWORK_CHANNEL_IDS = [
+  'partner_34',    // Facebook (Meta Ads Manager)
+  'partner_1678',  // TikTok for Business
+];
 
 /**
  * Fetch ROAS data at three levels (campaign / ad set / ad) so pills can
@@ -50,16 +59,17 @@ export async function fetchCampaignROAS({
   apiToken,
   utcOffset = '+07:00',
   datePeriod = 'rolling30',
+  appTokens,
 }) {
   const resolvedPeriod = expandDatePeriod(datePeriod);
 
   const [campaignRows, adRows] = await Promise.all([
     fetchAtLevel({
-      apiToken, utcOffset, datePeriod: resolvedPeriod,
+      apiToken, utcOffset, datePeriod: resolvedPeriod, appTokens,
       dimensions: 'channel,campaign_network',
     }),
     fetchAtLevel({
-      apiToken, utcOffset, datePeriod: resolvedPeriod,
+      apiToken, utcOffset, datePeriod: resolvedPeriod, appTokens,
       dimensions: 'channel,campaign_network,adgroup_network,creative_network',
     }),
   ]);
@@ -70,7 +80,7 @@ export async function fetchCampaignROAS({
   return out;
 }
 
-async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions }) {
+async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTokens }) {
   const params = new URLSearchParams({
     format_dates: 'false',
     full_data: 'true',
@@ -78,7 +88,7 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions }) {
     ad_spend_mode: 'network',
     attribution_source: 'first',
     attribution_type: 'all',
-    channel_id__in: META_CHANNEL_ID,
+    channel_id__in: NETWORK_CHANNEL_IDS.join(','),
     cohort_maturity: 'immature',
     date_period: datePeriod,
     dimensions,
@@ -100,6 +110,19 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions }) {
     sort: '-installs',
     utc_offset: utcOffset,
   });
+
+  // Without app_token__in, Adjust auto-applies a default tracker_filter
+  // built from the user's account-wide tracker permissions. Verified
+  // 2026-05-08: that auto-filter excludes newer trackers (TikTok integration
+  // tokens minted after a cutoff date), so install/revenue rollups for newer
+  // networks come back as zero while the cost endpoint still reports spend.
+  // Passing app_token__in scopes Adjust's auto tracker_filter to the chosen
+  // apps' full tracker set — matching what the Datascape dashboard does when
+  // a user filters by App in the UI.
+  if (appTokens) {
+    const cleaned = String(appTokens).trim();
+    if (cleaned) params.set('app_token__in', cleaned);
+  }
 
   const url = `${ADJUST_BASE}?${params}`;
 
@@ -133,9 +156,12 @@ function toRow(row, level) {
   const cost = parseNum(row.cost);
   const cohortAllRevenue = parseNum(row.cohort_all_revenue);
   const allTime = cost != null && cost > 0 ? cohortAllRevenue / cost : null;
-  // campaign_id_network is Meta's actual campaign id and shows up in the
-  // ?selected_campaign_ids=... URL param when the user drills into a campaign.
-  // We use it to break ad-name ties (same ad name across multiple campaigns).
+  // attr_dependency carries Meta's network IDs:
+  //   campaign_id_network → Meta campaign_id (matches ?selected_campaign_ids URL)
+  //   adgroup_id_network  → Meta adset_id
+  //   creative_id_network → Meta ad_id (Meta's API names this `adgroup_id`)
+  // The content script keys lookups by these IDs to resolve same-named ads
+  // across campaigns without depending on name normalization.
   const dep = row.attr_dependency || {};
   return {
     level,
@@ -143,6 +169,8 @@ function toRow(row, level) {
     adsetName: row.adgroup_network || null,
     adName: row.creative_network || null,
     campaignId: dep.campaign_id_network || null,
+    adsetId: dep.adgroup_id_network || null,
+    adId: dep.creative_id_network || null,
     network: row.channel,
     cost,
     cohortAllRevenue,

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Adjust → Meta ROAS Overlay",
-  "version": "0.1.0",
-  "description": "Pull accurate multi-window ROAS from Adjust and overlay onto Meta Ads Manager UI for decision support.",
+  "version": "0.3.0",
+  "description": "Pull accurate multi-window ROAS from Adjust and overlay onto Meta Ads Manager and TikTok Ads Manager UIs for decision support.",
   "permissions": [
     "storage"
   ],
@@ -34,7 +34,31 @@
       "matches": [
         "https://adsmanager.facebook.com/adsmanager/*"
       ],
+      "js": ["content/page-bridge.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://adsmanager.facebook.com/adsmanager/*"
+      ],
       "js": ["content/meta-injector.js"],
+      "css": ["content/meta-injector.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://ads.tiktok.com/i18n/manage/*"
+      ],
+      "js": ["content/tiktok-page-bridge.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://ads.tiktok.com/i18n/manage/*"
+      ],
+      "js": ["content/tiktok-injector.js"],
       "css": ["content/meta-injector.css"],
       "run_at": "document_idle"
     }

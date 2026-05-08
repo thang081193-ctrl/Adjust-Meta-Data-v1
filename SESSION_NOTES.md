@@ -19,14 +19,72 @@ Pull repo về chạy lại bị `resolvedByMetaPreload: 0` cho mọi row. Diagn
 
 ### ❌ Chưa làm session này (carry over)
 
-- **Mục A — Test trên account Meta LPT 14 (DecorAI)** với schema trees mới. Có thể format trees ở account khác lại khác → cần verify regex `[^{}]*?` còn match.
+- ~~**Mục A — Test trên account Meta LPT 14 (DecorAI)** với schema trees mới.~~ ✅ Verified 2026-05-08 bằng [docs/diagnostics/verify-meta-preload.js](docs/diagnostics/verify-meta-preload.js): 20/20 trees parse OK, format giống hệt PlantAI (`adset_id` → `adgroup_id`+`name` → `campaign_id`+`name`).
 - **Mục B — Cell `$X.XX` virtualization**: hiện đã không còn dùng spend matching nên mục này về cơ bản đã hết relevance, nhưng nếu sau này cần fallback bằng metric khác (impressions/reach) thì xem lại.
 - **Mục C — $0 collision**: irrelevant với approach mới (không match qua spend nữa).
 - **Mục D — Adjust thiếu data cho `(campId, adName)`**: vẫn còn — fallback ambiguous nếu Adjust không có data, dù Meta đã resolve campId. Cần phân biệt rõ "ambiguous thật" vs "no Adjust data" (mục H).
-- **Mục F — Capture `creative_id_network` / `adgroup_id_network` từ Adjust** ([src/adjust-client.js:139](src/adjust-client.js:139)). Nếu có ad_id trực tiếp từ Adjust → match thẳng với `byAdgroupId` → resolve được KHÔNG cần Campaign column visible. Đây là path duy nhất để bypass constraint của Meta.
+- ~~**Mục F — Capture `creative_id_network` / `adgroup_id_network` từ Adjust**~~ ✅ Done 2026-05-08:
+  - [src/adjust-client.js](src/adjust-client.js) `toRow()` thêm `adId` (creative_id_network) + `adsetId` (adgroup_id_network) vào row payload (zero extra request — `include_attr_dependency` đã set sẵn).
+  - [content/meta-injector.js](content/meta-injector.js) `buildAdIndex` build thêm `byAdId: Map<MetaAdId, AdEntry>`, `buildAggregatedIndex` build `byId` (cho adset).
+  - Strategy mới `findEntryViaAdjustId()` xen vào sau URL scope, trước Meta preload by-name. Resolve adId Meta DOM → entry Adjust trực tiếp, **không qua name composite**.
+  - Stats counter mới: `resolvedByAdjustId`. Test trên PlantAI: 10/11 ambiguous rows resolve qua F khi Campaign columns OFF — bypass thành công constraint Meta column visibility.
+
+  **Architectural finding khi làm F:** isolated-world content script không đọc được `__reactProps`/`__reactFiber` mà page JS attach vào DOM elements (Chrome JS world isolation). Strategy 4 cũ (`findCampaignIdViaReactProps`, `resolvedByReactProps`) đã luôn = 0 từ đầu nhưng silent fail. Fix bằng cách split content script: thêm [content/page-bridge.js](content/page-bridge.js) `world: "MAIN"` đọc props, communicate với injector qua synchronous CustomEvent + `<script id="aox-bridge-data">`. Strategy 4 cũ + helpers (`findCampaignIdViaReactProps`, `findAdgroupIdInValue`, `SKIP_FIBER_FIELDS`) đã xóa khỏi injector vì là dead code. Chi tiết: [docs/findings/page_world_bridge.md](docs/findings/page_world_bridge.md).
 - **Mục G — Decoration tốc độ**: `querySelectorAll('*')` 50-100ms/cycle vẫn nguyên. Cache Y-bucket có thể tối ưu thêm.
 - **Mục H — UX phân biệt ambiguous vs no-data**: chưa làm.
 - **README TODOs** (KPI Service v1/v2, multi-app, Marketing API action layer): chưa làm.
+
+## 2026-05-08 — Mở rộng sang TikTok Ads Manager
+
+- [src/adjust-client.js](src/adjust-client.js): `META_CHANNEL_ID = 'partner_34'` → `NETWORK_CHANNEL_IDS = ['partner_34', 'partner_1678']`. 1 fetch trả cả 2 networks; injectors filter qua `row.network` (channel name). Channel ID `partner_1678` xác nhận từ Adjust Datascape filter URL.
+- [content/tiktok-page-bridge.js](content/tiktok-page-bridge.js) (mới, MAIN world): selector `[class*="KsLink--inherit"]` cho name cells. Khác Meta: TikTok không có row DOM container (chain `KS-LINK` → cell wrapper → thẳng `KS-VIRTUAL-TABLE`), nhưng leaf cell's `__reactProps` chứa sẵn row's id (campaign_id / adgroup_id / ad_id) ở depth ~5 → bridge chỉ scan `findIdInOwnProps(el)` thay vì walk row subtree.
+- [content/tiktok-injector.js](content/tiktok-injector.js) (mới, ISOLATED world): 3 indexes (campaign/adset/ad) như Meta, build thêm `campByIdIndex` cho campaign-level disambiguation. Tab detection qua URL pathname (`/manage/campaign|adgroup|creative`) → priority order ad/adset/campaign. Strategy chain đơn giản: name lookup → bridge id match → ambiguous fallback. Bỏ Meta-specific: URL scope (TikTok không có `?selected_campaign_ids=`), Meta tree parser, Y-bucket DOM scan.
+- [manifest.json](manifest.json) `v0.3.0`: thêm 2 content_scripts entries cho TikTok matches `https://ads.tiktok.com/i18n/manage/*` (bridge MAIN + injector ISOLATED). Chia sẻ `meta-injector.css` cho pill/banner style.
+- **Pill rendering trên TikTok**: TikTok cell wrapper có `cl-w-full cl-overflow-hidden` clip pill nếu insert sibling như Meta. Switched sang `position: fixed` trên `<body>` + `requestAnimationFrame` loop để follow cell qua scroll (TikTok virtualized table dùng `transform: translateY` thay vì native scroll → window.scroll listener không fire). Loop tự dừng khi `cellToPill.size === 0`. Cache `lastPositioned` để skip update khi cell không di chuyển.
+- **Polish**: log signature dùng `console.log('%c[AOX-TT]...')` styled — bro filter "AOX-TT" trong Console để thấy log của extension giữa noise của TikTok. Selector fallback `[class*="KsLink"]` nếu primary `[class*="KsLink--inherit"]` không match. Safety interval re-decorate mỗi 2s trong 30s đầu khi candidate count thay đổi (TikTok render chậm).
+
+### 🔴 ĐANG STUCK — Data sai trên TikTok (chưa fix xong, để lúc về làm tiếp)
+
+**Triệu chứng** (verify 2026-05-08 trên account của bro):
+- Pill render OK, follow scroll OK
+- Adjust dashboard với `app_token__in="lpz0c08fnitc"` (PlantAI) cho campaign "Tiktok 09 - ChartAI - CPA - video old 1703 - 0.03" yesterday: cost $4.47, ROAS 31%, revenue $1.39 ✓
+- Extension cache: cost $4.47 ✓ nhưng **`roas: {d0: 0, d3: 0, d7: 0, allTime: 0}`** ✗
+
+**Root cause đã khoanh vùng** (xem raw API response trong service worker DevTools, Network tab):
+- ALL TikTok rows có `installs: 0` và `cohort_all_revenue: "0.0"` kể cả campaign cost $2267 → install/revenue data bị filter mất hoàn toàn
+- Cost vẫn đúng vì lấy từ endpoint khác `cc-cost/internal/fetch?network__in=facebook,tiktok` (không bị tracker_filter)
+- Adjust auto-apply `tracker_filter` trong response chỉ chứa trackers cũ (prefix `1t`/`1u`/`1v`/`1y`), thiếu trackers mới (`1z`/`20`+) — TikTok integration trackers chắc nằm trong batch mới
+- Dashboard có `app_token__in` → Adjust auto-resolve full tracker set cho app đó
+
+**Fix đã code (chưa work)**:
+- Thêm `appTokens` field vào popup Settings, pass thành `app_token__in` param: [src/adjust-client.js](src/adjust-client.js), [src/data-source.js](src/data-source.js), [popup/popup.html](popup/popup.html), [popup/popup.js](popup/popup.js)
+- User test: paste `lpz0c08fnitc` (PlantAI app_token từ dashboard URL) → vẫn data sai
+
+**Để làm tiếp khi về:**
+
+1. **Verify app_tokens hiện tại** — ngoài `lpz0c08fnitc` (PlantAI), bro có 8 apps trong response debug:
+   ```
+   b6yjkg1hc7wg, c1um2rdnch6o, kb64lotprz7k, lpz0c08fnitc,
+   ox6zszk8msjk, pmh28w0ksfls, rzfdacwjzm68, vpjmthw8l8u8
+   ```
+   Campaign "Tiktok 09" thuộc app `com.tradebuddy.ai.trading` (TradeBuddy) — KHÔNG phải PlantAI. Cần token đúng của TradeBuddy. Test paste **cả 8 tokens** comma-separated trước khi narrow.
+
+2. **Check service worker DevTools sau khi pass `app_token__in`** — verify request URL có `app_token__in=...` không, response `tracker_filter` có khác trước (full set?), TikTok rows có `installs > 0` chưa.
+
+3. **Nếu vẫn sai sau khi pass app_token**: thử pass **`tracker_filter=`** rỗng (có thể override Adjust default), hoặc thử endpoint mới `https://suite.adjust.com/datascape/report` thay cho `automate.adjust.com/reports-service/report` (matches dashboard URL exactly).
+
+4. **Nếu các approach trên fail**: có thể Adjust limit account-level — TikTok integration cần admin enable trackers cho user. Liên hệ Adjust support.
+
+**Files khả nghi nếu cần debug thêm**: 
+- [src/adjust-client.js:73-130](src/adjust-client.js:73) — `fetchAtLevel`, params builder. Có thể thêm log raw URL để verify request.
+- Có thể dump full response vào console để inspect tracker_filter:
+  ```js
+  // adjust-client.js, sau fetch:
+  const json = await res.json();
+  console.log('[Adjust] tracker_filter:', json.debug?.service_urls?.[0]?.params?.tracker_filter);
+  console.log('[Adjust] sample TikTok row:', json.rows.find(r => r.channel === 'TikTok for Business'));
+  return json.rows || [];
+  ```
 
 ## Bug chính đã giải quyết
 

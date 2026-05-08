@@ -39,6 +39,12 @@
 (function () {
   'use strict';
 
+  // Bump on every change to confirm the page is running the freshly-reloaded
+  // build (page console logs this on every diagnostic dump). Format: vMAJOR.
+  // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
+  const INJECTOR_VERSION = 'v0.4.2-F-bridge';
+  console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
+
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
   // ⚠️ KEEP IN SYNC WITH src/matcher.js. If you change normalization rules here
   // without updating that file (or vice versa), content-side keys will diverge
@@ -75,6 +81,13 @@
   // matches Meta's selected_campaign_ids URL param exactly.
   let adsetCompositeIndex = new Map();
   let adCompositeIndex = new Map();
+  // Direct ID lookups keyed by Meta IDs that Adjust supplies via attr_dependency
+  // (creative_id_network → Meta ad_id, adgroup_id_network → Meta adset_id).
+  // When Meta's row React props expose those same digit IDs, we resolve the
+  // Adjust entry without touching name keys at all — the most reliable
+  // disambiguation path because it's invariant under any name normalization.
+  let adByIdIndex = new Map();
+  let adsetByIdIndex = new Map();
   let lastSyncAt = null;
   let sourceLabel = '';
 
@@ -104,8 +117,8 @@
   let lastDecorateStats = {
     ambiguous: 0,
     resolvedByScope: 0,
+    resolvedByAdjustId: 0,
     resolvedByMetaPreload: 0,
-    resolvedByReactProps: 0,
     resolvedByDom: 0,
     stillAmbiguous: 0,
   };
@@ -117,14 +130,6 @@
   // campaign_id mapping for every ad currently in the user's view. This
   // bypasses all DOM fragility (frozen columns, virtualized cells, varying
   // class names, line-clamp wrappers).
-  //
-  // History: an earlier version of this index used (ad_name, spend) →
-  // campaign_id pulled from preloaded insights rows. As of 2026-05 Meta
-  // dropped ad-level rows from preload (insights now ships campaign-level
-  // dimension_values only), so spend-matching at ad level is no longer
-  // possible from the static preload. The structure tree is naturally
-  // scoped to the user's filter, which usually leaves a name unique
-  // in-view; when it doesn't, we fall back to DOM Y-position.
   //
   // metaPreloadIndex.byName        : Map<nameKey, Set<campId>>
   // metaPreloadIndex.byAdgroupId   : Map<adgroupId, campId>
@@ -163,14 +168,20 @@
       const adRows = cached.campaigns.filter(r => r.level === 'ad');
 
       campaignIndex = buildDirectIndex(campaignRows, r => r.campaignName);
-      const adsetBuilt = buildAggregatedIndex(adRows, r => r.adsetName);
+      const adsetBuilt = buildAggregatedIndex(adRows, r => r.adsetName, r => r.adsetId);
       adsetIndex = adsetBuilt.byName;
       adsetCompositeIndex = adsetBuilt.byComposite;
+      adsetByIdIndex = adsetBuilt.byId;
       const adBuilt = buildAdIndex(adRows);
       adIndex = adBuilt.byName;
       adCompositeIndex = adBuilt.byComposite;
+      adByIdIndex = adBuilt.byAdId;
       lastSyncAt = cached.lastSyncAt;
       sourceLabel = cached.sourceLabel;
+
+      // Push the freshly-built id sets to the page-world bridge so it knows
+      // which digit strings to look for on subsequent row scans.
+      dispatchBridgeKnownIds();
 
       showBanner(buildBannerText(), cached.isStale ? 'warn' : 'ok');
       // Clear before redecorating — otherwise after a sync, existing pills
@@ -206,13 +217,15 @@
   }
 
   // Ad index with collision handling. Returns:
-  //   byName: Map<adKey, AdEntry | AmbiguousEntry>
+  //   byName:      Map<adKey, AdEntry | AmbiguousEntry>
   //   byComposite: Map<`${campaignId}::${adKey}`, AdEntry>  (always unique)
+  //   byAdId:      Map<MetaAdId, AdEntry>  (Adjust creative_id_network)
   // AmbiguousEntry shape:
   //   { ambiguous: true, candidates: Row[], campaignName, roas (aggregated), ... }
   function buildAdIndex(adRows) {
     const byName = new Map();
     const byComposite = new Map();
+    const byAdId = new Map();
     const collisions = new Set();
     const accums = new Map(); // adKey -> all rows for that name
 
@@ -230,10 +243,15 @@
         parentCampaignName: row.campaignName,
         parentAdsetName: row.adsetName,
         campaignId: row.campaignId,
+        adsetId: row.adsetId || null,
+        adId: row.adId || null,
       };
 
       if (row.campaignId) {
         byComposite.set(`${row.campaignId}::${k}`, single);
+      }
+      if (row.adId) {
+        byAdId.set(String(row.adId), single);
       }
 
       if (!byName.has(k)) {
@@ -259,17 +277,21 @@
       });
     }
 
-    return { byName, byComposite };
+    return { byName, byComposite, byAdId };
   }
 
   // Aggregated index for ad sets (API doesn't return adset-level rows; we
   // roll ads up by adsetName). Same composite-key disambiguation as ads —
   // adset names can repeat across campaigns ("2003 Italy" in 8 campaigns).
-  function buildAggregatedIndex(rows, getName) {
+  // When `getId` is provided, also builds a direct ID lookup (Adjust's
+  // adgroup_id_network → Meta adset_id) for name-free disambiguation.
+  function buildAggregatedIndex(rows, getName, getId) {
     const byName = new Map();
     const byComposite = new Map();
+    const byId = new Map();
     const composites = new Map(); // `${campId}::${k}` -> rows[]
     const flats = new Map();      // k -> rows[]
+    const idGroups = new Map();   // metaId -> rows[]
 
     for (const row of rows) {
       const name = getName(row);
@@ -282,10 +304,27 @@
         if (!composites.has(ck)) composites.set(ck, []);
         composites.get(ck).push(row);
       }
+      if (getId) {
+        const id = getId(row);
+        if (id) {
+          const sid = String(id);
+          if (!idGroups.has(sid)) idGroups.set(sid, []);
+          idGroups.get(sid).push(row);
+        }
+      }
     }
 
     for (const [ck, rs] of composites) {
       byComposite.set(ck, {
+        campaignName: getName(rs[0]),
+        network: rs[0].network,
+        rowCount: rs.length,
+        ...aggregateRoas(rs),
+      });
+    }
+
+    for (const [sid, rs] of idGroups) {
+      byId.set(sid, {
         campaignName: getName(rs[0]),
         network: rs[0].network,
         rowCount: rs.length,
@@ -309,7 +348,7 @@
       byName.set(k, entry);
     }
 
-    return { byName, byComposite };
+    return { byName, byComposite, byId };
   }
 
   // Sum cost and back-computed cohort revenue across rows, divide at the end.
@@ -361,17 +400,81 @@
     let ambiguousCount = 0;
     for (const e of adIndex.values()) if (e?.ambiguous) ambiguousCount++;
     const scope = getScopedCampaignIds();
+    // Sample one Adjust adId so we can verify ID space alignment with Meta
+    // tree's adgroup_id quickly when triaging F (resolvedByAdjustId).
+    let sampleAdjustAdId = null;
+    let sampleAdjustAdsetId = null;
+    for (const e of adByIdIndex.values()) { sampleAdjustAdId = e?.adId; break; }
+    for (const e of adsetByIdIndex.values()) {
+      // adset entry has no adsetId field; we just need to know one key exists.
+      sampleAdjustAdsetId = adsetByIdIndex.keys().next().value;
+      break;
+    }
+
+    // bridgeProbe: did the page-world bridge load, receive id sets, and
+    // find hits in the current viewport? Surfaces the F (resolvedByAdjustId)
+    // pipeline state without re-walking React props from the isolated world
+    // (which always returns zero — see findEntryViaAdjustId comment).
+    const bridgeProbe = probeBridge();
+
     console.log('[Adjust Overlay] DOM diagnostics', {
+      version: INJECTOR_VERSION,
       candidateSelector: NAME_CANDIDATE_SELECTOR,
       candidatesFound: candidates.length,
       matchedToAdjustNames: matchCount,
       firstMatchText: firstMatch,
       firstMatchLevel: matchedLevel,
-      indexSizes: { campaign: campaignIndex.size, adset: adsetIndex.size, ad: adIndex.size },
+      indexSizes: {
+        campaign: campaignIndex.size,
+        adset: adsetIndex.size,
+        ad: adIndex.size,
+        adById: adByIdIndex.size,
+        adsetById: adsetByIdIndex.size,
+      },
+      sampleAdjustAdId,
+      sampleAdjustAdsetId,
       adNamesAmbiguousInIndex: ambiguousCount,
       urlScopedCampaignIds: scope ? [...scope] : null,
       lastDecoratePass: { ...lastDecorateStats },
+      bridgeProbe,
     });
+  }
+
+  // Probe the page-world bridge: read the data node it writes, count how
+  // many ambiguous rows the bridge resolved, and return a sample so we can
+  // diagnose end-to-end without re-walking React props from this isolated
+  // world (which would always fail — see findEntryViaAdjustId comment).
+  function probeBridge() {
+    const node = document.getElementById('aox-bridge-data');
+    if (!node) return { error: 'aox-bridge-data node not found — bridge not loaded?' };
+    let payload;
+    try { payload = JSON.parse(node.textContent || '{}'); } catch (e) { return { error: 'bad JSON in bridge data: ' + e.message }; }
+
+    const ambKeys = new Set();
+    for (const [k, v] of adIndex) if (v?.ambiguous) ambKeys.add(k);
+
+    const ambiguousRowsInDom = [];
+    for (const el of document.querySelectorAll(NAME_CANDIDATE_SELECTOR)) {
+      const k = canonicalKey(el.textContent || '');
+      if (!ambKeys.has(k)) continue;
+      ambiguousRowsInDom.push((el.textContent || '').trim());
+    }
+
+    const hits = Array.isArray(payload?.results) ? payload.results : [];
+    const matchedAmbiguous = hits.filter(h => ambiguousRowsInDom.includes(h.t));
+
+    return {
+      bridgeVersion: payload?.version,
+      bridgeAgeMs: payload?.timestamp ? Date.now() - payload.timestamp : null,
+      bridgeKnownAdIds: payload?.knownAdIdsSize,
+      bridgeKnownAdsetIds: payload?.knownAdsetIdsSize,
+      bridgeRowsScanned: payload?.scanned,
+      bridgeRowsHit: payload?.hits,
+      sampleHits: hits.slice(0, 6),
+      ambiguousInDomCount: ambiguousRowsInDom.length,
+      ambiguousMatchedByBridge: matchedAmbiguous.length,
+      ambiguousMatchedSample: matchedAmbiguous.slice(0, 6),
+    };
   }
 
   // ---- Decorate one candidate ----
@@ -389,8 +492,8 @@
     // levels (same string used as both a campaign name and an ad name) are
     // rare. If they do happen, ad wins because it's the actionable unit.
     const data =
-      lookupAmbiguousAware(el, key, adIndex, adCompositeIndex) ||
-      lookupAmbiguousAware(el, key, adsetIndex, adsetCompositeIndex) ||
+      lookupAmbiguousAware(el, key, adIndex, adCompositeIndex, adByIdIndex, 'ad') ||
+      lookupAmbiguousAware(el, key, adsetIndex, adsetCompositeIndex, adsetByIdIndex, 'adset') ||
       campaignIndex.get(key);
     if (!data) return;
 
@@ -419,14 +522,22 @@
   }
 
   // Resolve an ambiguous index entry to a single (campaignId, name) match
-  // using two strategies in order. Returns the resolved entry, the original
-  // ambiguous entry as a fallback, or null when the name isn't indexed at all.
+  // using a chain of strategies. Returns the resolved entry, the original
+  // ambiguous entry as a fallback, or null when the name isn't indexed.
   //
   // Strategy 1 — URL scope:
   //   When the user drilled into a single campaign, Meta puts
   //   ?selected_campaign_ids=ID in the URL. Composite-index lookup is exact.
   //
-  // Strategy 2 — Meta preload structure tree by ad name:
+  // Strategy 2 — Adjust ID from row React props via page bridge:
+  //   Adjust's attr_dependency carries Meta's ad_id (creative_id_network)
+  //   and adset_id (adgroup_id_network). The MAIN-world page bridge walks
+  //   each row's `__reactProps`/`__reactFiber` and reports any digit string
+  //   in our id maps. We resolve the Adjust entry by ID directly — no name
+  //   matching, no Meta tree, and works regardless of which Meta columns
+  //   the user has currently enabled.
+  //
+  // Strategy 3 — Meta preload structure tree by ad name:
   //   Meta loads each filtered campaign's `campaign_structure_tree` as JSON
   //   inside <script> tags BEFORE rendering the table. We parse those once
   //   to build ad-name → Set<campaign_id>. Because the tree only contains
@@ -434,22 +545,14 @@
   //   already a singleton; otherwise we narrow by intersecting with Adjust's
   //   candidate campaigns and (when present) urlScopedCampaignIds.
   //
-  // Strategy 3 — Row's own adgroup_id from React props (most reliable):
-  //   Meta's grid renders each row with React; React stores the developer's
-  //   props on the DOM via hidden `__reactProps$XXX` properties on each
-  //   element. Those props embed the row's adgroup_id (Meta's ad ID). We
-  //   walk the row container's subtree, locate any 15–19 digit string in
-  //   the props that matches our preload `byAdgroupId` map, and resolve
-  //   directly to that adgroup's campaign_id. Robust against same-name
-  //   ambiguity, virtualization, frozen columns, and column visibility.
-  //
   // Strategy 4 — DOM row context (Y-position match):
   //   Last resort. Look for a Meta campaign id (15–19 digits) or full
-  //   campaign name in another cell on the same visual row.
+  //   campaign name in another cell on the same visual row. Requires the
+  //   user to have a Campaign-name or Campaign-ID column visible.
   //
   // If nothing resolves, we return the ambiguous aggregate so the user at
   // least sees a (clearly-flagged) totals pill rather than nothing.
-  function lookupAmbiguousAware(el, key, byName, byComposite) {
+  function lookupAmbiguousAware(el, key, byName, byComposite, byId, kind) {
     const entry = byName.get(key);
     if (!entry) return null;
     if (!entry.ambiguous) return entry;
@@ -466,20 +569,19 @@
       }
     }
 
+    if (byId && byId.size > 0) {
+      const direct = findEntryViaAdjustId(el, byId, kind);
+      if (direct) {
+        lastDecorateStats.resolvedByAdjustId++;
+        return direct;
+      }
+    }
+
     const metaPreloadCampId = findCampaignIdViaMetaPreload(key, entry.candidates);
     if (metaPreloadCampId) {
       const m = byComposite.get(`${metaPreloadCampId}::${key}`);
       if (m) {
         lastDecorateStats.resolvedByMetaPreload++;
-        return m;
-      }
-    }
-
-    const reactPropsCampId = findCampaignIdViaReactProps(el, entry.candidates);
-    if (reactPropsCampId) {
-      const m = byComposite.get(`${reactPropsCampId}::${key}`);
-      if (m) {
-        lastDecorateStats.resolvedByReactProps++;
         return m;
       }
     }
@@ -495,6 +597,79 @@
 
     lastDecorateStats.stillAmbiguous++;
     return entry;
+  }
+
+  // Resolve an Adjust ad/adset entry for `nameEl` by reading the page-bridge
+  // result table. We do NOT scan React props here: in an isolated content
+  // script `Object.keys(domEl)` cannot see the page world's `__reactProps`
+  // expandos, so the walk would always return zero. The bridge runs in
+  // MAIN world (manifest content_scripts.world: "MAIN"), reads the props,
+  // and writes hits to <script id="aox-bridge-data">. We refresh that
+  // table once per decorate pass via dispatchBridgeScan().
+  function findEntryViaAdjustId(nameEl, byId, kind) {
+    const hit = lookupBridgeRowHit(nameEl);
+    if (!hit) return null;
+    const id = kind === 'adset' ? hit.s : hit.a;
+    if (!id) return null;
+    return byId.get(id) || null;
+  }
+
+  // Per-pass cache: parse the bridge data once and reuse for every row in
+  // the current decorate pass. The bridge writes a flat JSON envelope; we
+  // index `results[]` by `${text}|${roundedYBucket}` so per-row lookup is
+  // O(1). The cache invalidates when bridgeScanToken changes (set by
+  // dispatchBridgeScan after each scan).
+  let bridgeScanToken = 0;
+  let bridgeIndex = null;
+  let bridgeIndexToken = -1;
+
+  function lookupBridgeRowHit(nameEl) {
+    if (bridgeIndexToken !== bridgeScanToken) {
+      bridgeIndex = parseBridgeData();
+      bridgeIndexToken = bridgeScanToken;
+    }
+    if (!bridgeIndex || bridgeIndex.size === 0) return null;
+    const text = (nameEl.textContent || '').trim();
+    if (!text) return null;
+    const rect = nameEl.getBoundingClientRect();
+    const y = Math.round((rect.top + rect.bottom) / 2);
+    // Exact text + rounded Y bucket. We probe the exact bucket plus ±1 to
+    // tolerate sub-pixel jitter between when the bridge measured and when
+    // the content script reads.
+    for (let dy = -1; dy <= 1; dy++) {
+      const k = `${text}|${y + dy}`;
+      const hit = bridgeIndex.get(k);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function parseBridgeData() {
+    const node = document.getElementById('aox-bridge-data');
+    if (!node) return null;
+    let payload;
+    try { payload = JSON.parse(node.textContent || '{}'); } catch { return null; }
+    const out = new Map();
+    const results = Array.isArray(payload?.results) ? payload.results : [];
+    for (const r of results) {
+      if (!r?.t) continue;
+      out.set(`${r.t}|${r.y}`, r);
+    }
+    return out;
+  }
+
+  function dispatchBridgeKnownIds() {
+    document.dispatchEvent(new CustomEvent('aox-set-known-ids', {
+      detail: {
+        adIds: [...adByIdIndex.keys()],
+        adsetIds: [...adsetByIdIndex.keys()],
+      },
+    }));
+  }
+
+  function dispatchBridgeScan() {
+    document.dispatchEvent(new CustomEvent('aox-scan-rows'));
+    bridgeScanToken++;
   }
 
   // ---- Meta preload structure tree parser ----
@@ -644,98 +819,6 @@
     if (scope) {
       const narrowed = intersected.filter(id => scope.has(id));
       if (narrowed.length === 1) return narrowed[0];
-    }
-    return null;
-  }
-
-  // Read the row's own adgroup_id from the React props that Meta attaches
-  // to its DOM nodes via `__reactProps$XXX` hidden properties (a stable
-  // React 17+ convention). The props embed the row's adgroup_id as a 15–19
-  // digit string; once we find one that's in our preload `byAdgroupId`
-  // map, we resolve directly to that adgroup's campaign_id — no DOM column
-  // visibility, spend matching, or Y-position guesswork required.
-  //
-  // We BFS the row container's subtree, walking each node's React props
-  // recursively (cycle-safe) and matching any 15–19 digit substring
-  // against the known-adgroup-id map. The first hit whose campaign_id is
-  // also in Adjust's candidate set wins.
-  function findCampaignIdViaReactProps(nameEl, candidates) {
-    const idx = ensureMetaPreloadIndex();
-    if (idx.byAdgroupId.size === 0) return null;
-
-    const validCampIds = new Set();
-    for (const c of candidates) {
-      if (c?.campaignId) validCampIds.add(String(c.campaignId));
-    }
-    if (validCampIds.size === 0) return null;
-
-    const rowContainer = findRowAncestor(nameEl).node;
-    if (!rowContainer || rowContainer === document.body) return null;
-
-    // DFS via stack with a scan cap — typical row has tens of elements,
-    // but a runaway subtree should not stall decoration.
-    const stack = [rowContainer];
-    let scanned = 0;
-    const MAX_SCAN = 300;
-
-    while (stack.length > 0 && scanned < MAX_SCAN) {
-      const el = stack.pop();
-      scanned++;
-
-      for (const propKey of Object.keys(el)) {
-        if (!propKey.startsWith('__reactProps')) continue;
-        const props = el[propKey];
-        if (!props || typeof props !== 'object') continue;
-
-        const adgroupId = findAdgroupIdInValue(props, idx.byAdgroupId);
-        if (adgroupId) {
-          const campId = idx.byAdgroupId.get(adgroupId);
-          if (campId && validCampIds.has(campId)) return campId;
-        }
-      }
-
-      if (el.children) {
-        for (const child of el.children) stack.push(child);
-      }
-    }
-    return null;
-  }
-
-  // Recursively scan a value (object/array/string/etc.) for a 15–19 digit
-  // substring that appears as a key in `byAdgroupId`. Returns the matched
-  // id string, or null. Depth-limited and cycle-safe via WeakSet.
-  function findAdgroupIdInValue(value, byAdgroupId, depth, seen) {
-    depth = depth || 0;
-    seen = seen || new WeakSet();
-    if (depth > 6) return null;
-    if (value == null) return null;
-
-    if (typeof value === 'string') {
-      const matches = value.match(/\d{15,19}/g);
-      if (!matches) return null;
-      for (const id of matches) {
-        if (byAdgroupId.has(id)) return id;
-      }
-      return null;
-    }
-
-    if (typeof value !== 'object') return null;
-    if (seen.has(value)) return null;
-    seen.add(value);
-
-    if (Array.isArray(value)) {
-      for (const v of value) {
-        const r = findAdgroupIdInValue(v, byAdgroupId, depth + 1, seen);
-        if (r) return r;
-      }
-      return null;
-    }
-
-    for (const k of Object.keys(value)) {
-      try {
-        const r = findAdgroupIdInValue(value[k], byAdgroupId, depth + 1, seen);
-        if (r) return r;
-      } catch {}
     }
     return null;
   }
@@ -966,8 +1049,12 @@
   function decorateAllVisibleRows() {
     // Reset stats and Y-buckets at start of pass; the bucket index will be
     // built lazily on the first ambiguous lookup and reused for the rest.
-    lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByMetaPreload: 0, resolvedByReactProps: 0, resolvedByDom: 0, stillAmbiguous: 0 };
+    lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByAdjustId: 0, resolvedByMetaPreload: 0, resolvedByDom: 0, stillAmbiguous: 0 };
     rowYBuckets = null;
+    // Refresh the page-world bridge's row-id table so findEntryViaAdjustId
+    // sees the current viewport. Synchronous: by the time dispatchEvent
+    // returns, the bridge's listener has finished writing the data node.
+    dispatchBridgeScan();
     document.querySelectorAll(NAME_CANDIDATE_SELECTOR).forEach(decorateCandidate);
     rowYBuckets = null; // release; rects go stale on next mutation anyway
 
