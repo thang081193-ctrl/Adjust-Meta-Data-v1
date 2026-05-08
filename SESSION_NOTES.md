@@ -2,6 +2,32 @@
 
 Lần làm việc này tập trung fix bug **ambiguous matching ở Ads tab** khi nhiều ad cùng tên (vd `MVideo 2003`) tồn tại ở nhiều campaign khác nhau và pill hiển thị data sai (aggregated hoặc của campaign khác).
 
+## Cập nhật chiều 2026-05-07 — Meta đổi preload schema
+
+Pull repo về chạy lại bị `resolvedByMetaPreload: 0` cho mọi row. Diagnostic phát hiện:
+- Key `"ad_campaign_group_id"` đã biến mất khỏi `<script>` tags (Meta đổi tên).
+- `dimension_values` mới chỉ còn 6 fields (bỏ AD_ID), spend giờ ở **campaign-level** chứ không còn ad-level.
+- Format mới: `"campaign_structure_tree":{children:[{adset_id, name, children:[{adgroup_id, name}]}], campaign_id, name}` — mỗi tree 1 campaign.
+
+### ✅ Đã resolve session này
+
+- **Schema breakage** — `ensureMetaPreloadIndex()` viết lại để parse `campaign_structure_tree` bằng brace-counting walker (string- và escape-aware) thay cho regex spend cũ. Index mới: `{byName: Map<nameKey, Set<campId>>, byAdgroupId: Map<adgroupId, campId>}`. Cache invalidate theo `urlFingerprint = window.location.search` thay vì TTL only.
+- **`findCampaignIdViaMetaPreload()` rewrite** — bỏ scan DOM `$X.XX` (vì Meta preload không còn ad-level spend); intersect tree-campIds ∩ Adjust-candidates ∩ urlScopedCampaignIds.
+- **Mục E (`scope.size > 1`)** — không còn cần code riêng, tự động xử lý qua tree intersection ở trên.
+- **Strategy 3 mới — `findCampaignIdViaReactProps()`** — DFS row container, đọc `__reactProps$XXX` của từng element, recursive scan tìm chuỗi `\d{15,19}` match `byAdgroupId` → ra campId. Helper `findRowAncestor()` extract dùng chung với `getRowYRange()`. Stats mới: `resolvedByReactProps`.
+- **Finding chốt**: Meta CHỈ preload data cho cột user đang enable. Khi Campaign name / Campaign ID column tắt, cả `campaign_structure_tree` và React props đều không đủ info để resolve — verify trên account PlantAI: 8/8 row fail. User bật Campaign name column → Strategy 4 (DOM Y) resolve hết. Banner cũ ("enable Campaign name/ID column") đã đúng hướng, không có cách engineering nào lách được.
+
+### ❌ Chưa làm session này (carry over)
+
+- **Mục A — Test trên account Meta LPT 14 (DecorAI)** với schema trees mới. Có thể format trees ở account khác lại khác → cần verify regex `[^{}]*?` còn match.
+- **Mục B — Cell `$X.XX` virtualization**: hiện đã không còn dùng spend matching nên mục này về cơ bản đã hết relevance, nhưng nếu sau này cần fallback bằng metric khác (impressions/reach) thì xem lại.
+- **Mục C — $0 collision**: irrelevant với approach mới (không match qua spend nữa).
+- **Mục D — Adjust thiếu data cho `(campId, adName)`**: vẫn còn — fallback ambiguous nếu Adjust không có data, dù Meta đã resolve campId. Cần phân biệt rõ "ambiguous thật" vs "no Adjust data" (mục H).
+- **Mục F — Capture `creative_id_network` / `adgroup_id_network` từ Adjust** ([src/adjust-client.js:139](src/adjust-client.js:139)). Nếu có ad_id trực tiếp từ Adjust → match thẳng với `byAdgroupId` → resolve được KHÔNG cần Campaign column visible. Đây là path duy nhất để bypass constraint của Meta.
+- **Mục G — Decoration tốc độ**: `querySelectorAll('*')` 50-100ms/cycle vẫn nguyên. Cache Y-bucket có thể tối ưu thêm.
+- **Mục H — UX phân biệt ambiguous vs no-data**: chưa làm.
+- **README TODOs** (KPI Service v1/v2, multi-app, Marketing API action layer): chưa làm.
+
 ## Bug chính đã giải quyết
 
 ### 1. Ambiguous fallback ở "All ads" view → pill aggregated cho mọi row trùng tên

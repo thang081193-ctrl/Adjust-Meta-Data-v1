@@ -105,19 +105,38 @@
     ambiguous: 0,
     resolvedByScope: 0,
     resolvedByMetaPreload: 0,
+    resolvedByReactProps: 0,
     resolvedByDom: 0,
     stillAmbiguous: 0,
   };
 
-  // Meta preloads ad metadata as JSON inside <script> tags BEFORE rendering
-  // the table. We parse those scripts to build a direct (ad_name, spend) →
-  // campaign_id index — bypassing all DOM fragility (frozen columns,
-  // virtualized cells, varying class names, line-clamp wrappers).
+  // Meta preloads campaign/ad structure as JSON inside <script> tags BEFORE
+  // rendering the table — specifically `campaign_structure_tree` payloads,
+  // one per filtered campaign. Each tree exposes the campaign_id alongside
+  // its nested adgroup_id + name pairs, giving us a direct ad-name →
+  // campaign_id mapping for every ad currently in the user's view. This
+  // bypasses all DOM fragility (frozen columns, virtualized cells, varying
+  // class names, line-clamp wrappers).
   //
-  // metaPreloadIndex.bySpend  : Map<`${nameKey}::${spend2dp}`, campId>
-  // metaPreloadIndex.byAdId   : Map<adId, campId>
-  // metaPreloadIndex.parsedAt : timestamp; null until first parse
-  let metaPreloadIndex = { bySpend: new Map(), byAdId: new Map(), parsedAt: 0 };
+  // History: an earlier version of this index used (ad_name, spend) →
+  // campaign_id pulled from preloaded insights rows. As of 2026-05 Meta
+  // dropped ad-level rows from preload (insights now ships campaign-level
+  // dimension_values only), so spend-matching at ad level is no longer
+  // possible from the static preload. The structure tree is naturally
+  // scoped to the user's filter, which usually leaves a name unique
+  // in-view; when it doesn't, we fall back to DOM Y-position.
+  //
+  // metaPreloadIndex.byName        : Map<nameKey, Set<campId>>
+  // metaPreloadIndex.byAdgroupId   : Map<adgroupId, campId>
+  // metaPreloadIndex.parsedAt      : timestamp
+  // metaPreloadIndex.urlFingerprint: window.location.search at parse time;
+  //   invalidates the cache when the user changes filters.
+  let metaPreloadIndex = {
+    byName: new Map(),
+    byAdgroupId: new Map(),
+    parsedAt: 0,
+    urlFingerprint: '',
+  };
 
   // ---- Sync data from background ----
   async function loadData() {
@@ -407,14 +426,24 @@
   //   When the user drilled into a single campaign, Meta puts
   //   ?selected_campaign_ids=ID in the URL. Composite-index lookup is exact.
   //
-  // Strategy 2 — Meta preload JSON (most reliable):
-  //   Meta loads ALL ad metadata as JSON inside <script> tags BEFORE rendering
-  //   the table. We parse those scripts once and build (ad_name, spend) →
-  //   campaign_id. This bypasses all DOM fragility (frozen columns,
-  //   virtualized cells, varying class names). The spend value is read from
-  //   a sibling cell on the same row using the existing Y-bucket lookup.
+  // Strategy 2 — Meta preload structure tree by ad name:
+  //   Meta loads each filtered campaign's `campaign_structure_tree` as JSON
+  //   inside <script> tags BEFORE rendering the table. We parse those once
+  //   to build ad-name → Set<campaign_id>. Because the tree only contains
+  //   campaigns Meta actually loaded for the current view, the set is often
+  //   already a singleton; otherwise we narrow by intersecting with Adjust's
+  //   candidate campaigns and (when present) urlScopedCampaignIds.
   //
-  // Strategy 3 — DOM row context (Y-position match):
+  // Strategy 3 — Row's own adgroup_id from React props (most reliable):
+  //   Meta's grid renders each row with React; React stores the developer's
+  //   props on the DOM via hidden `__reactProps$XXX` properties on each
+  //   element. Those props embed the row's adgroup_id (Meta's ad ID). We
+  //   walk the row container's subtree, locate any 15–19 digit string in
+  //   the props that matches our preload `byAdgroupId` map, and resolve
+  //   directly to that adgroup's campaign_id. Robust against same-name
+  //   ambiguity, virtualization, frozen columns, and column visibility.
+  //
+  // Strategy 4 — DOM row context (Y-position match):
   //   Last resort. Look for a Meta campaign id (15–19 digits) or full
   //   campaign name in another cell on the same visual row.
   //
@@ -437,11 +466,20 @@
       }
     }
 
-    const metaPreloadCampId = findCampaignIdViaMetaPreload(el, key, entry.candidates);
+    const metaPreloadCampId = findCampaignIdViaMetaPreload(key, entry.candidates);
     if (metaPreloadCampId) {
       const m = byComposite.get(`${metaPreloadCampId}::${key}`);
       if (m) {
         lastDecorateStats.resolvedByMetaPreload++;
+        return m;
+      }
+    }
+
+    const reactPropsCampId = findCampaignIdViaReactProps(el, entry.candidates);
+    if (reactPropsCampId) {
+      const m = byComposite.get(`${reactPropsCampId}::${key}`);
+      if (m) {
+        lastDecorateStats.resolvedByReactProps++;
         return m;
       }
     }
@@ -459,90 +497,112 @@
     return entry;
   }
 
-  // ---- Meta preload JSON parser ----
-  // Meta Ads Manager ships ad metadata as JSON payloads inside <script> tags
-  // (preloaded GraphQL/Insights responses). We extract:
-  //   1. Adgroup nodes:    {node_id, ad_campaign_group_id, name}
-  //   2. Insights rows:    dimension_values=[obj, camp_name, camp_id, acct,
-  //                                          ad_id, …], atomic_values=[spend, …]
-  // Together these give (ad_name, spend) → campaign_id, which we use to
-  // pin each row's ad to its true parent campaign without touching the
-  // table DOM.
+  // ---- Meta preload structure tree parser ----
+  // Meta Ads Manager ships each filtered campaign's full structure as JSON
+  // inside <script> tags. The shape is:
   //
-  // We re-parse on each loadData() because Meta refreshes preload data
-  // when the user changes filters / date range. Within a single decorate
-  // pass the index is stable — the cost is one regex scan per script tag.
+  //   "campaign_structure_tree": {
+  //     "children": [{
+  //       "adset_id": "...", "name": "<adset name>", "status": "...",
+  //       "children": [{
+  //         "adgroup_id": "<ad id>", "name": "<ad name>", "status": "..."
+  //       }, ...]
+  //     }, ...],
+  //     "campaign_id": "<camp id>", "name": "<camp name>", "status": "..."
+  //   }
+  //
+  // The OUTER campaign_id is the only one in the tree (adgroups don't have a
+  // campaign_id field), so we can extract it with a non-greedy first-match
+  // regex. Adgroup pairs are extracted with a flat-block regex because each
+  // adgroup object never nests another `{}` between its adgroup_id and name.
+  //
+  // The cache is keyed by URL search-string fingerprint so changing filters
+  // immediately invalidates it (parsedAt TTL covers within-filter mutations).
   function ensureMetaPreloadIndex() {
-    // Reuse if parsed within the last 30s — covers a full decorate pass plus
-    // a couple of mutation-driven repeats without re-scanning the same DOM.
-    if (Date.now() - metaPreloadIndex.parsedAt < 30000 && metaPreloadIndex.bySpend.size > 0) {
+    const fingerprint = window.location.search;
+    const fresh = Date.now() - metaPreloadIndex.parsedAt < 30000;
+    const sameFilter = fingerprint === metaPreloadIndex.urlFingerprint;
+    if (fresh && sameFilter && metaPreloadIndex.byName.size > 0) {
       return metaPreloadIndex;
     }
 
-    const adIdToCamp = new Map();
-    const adIdToName = new Map();
-    const adIdToSpend = new Map();
+    const byName = new Map();        // nameKey -> Set<campId>
+    const byAdgroupId = new Map();   // adgroupId -> campId
 
-    const adgroupRe = /"node_id":"(\d+)"[^{}]*?"ad_campaign_group_id":"(\d+)"[^{}]*?"name":"((?:[^"\\]|\\.)*)"/g;
-    // dimension_values: ["OBJECTIVE", "CAMPAIGN_NAME", "CAMPAIGN_ID", "ACCT_ID",
-    //                    "AD_ID", "DATE_START", "DATE_END"]
-    // atomic_values   : ["SPEND", ...]
-    const insightsRe = /"dimension_values":\["[^"]*","(?:[^"\\]|\\.)*","(\d+)","\d+","(\d+)","[^"]*","[^"]*"\],"atomic_values":\["([^"]+)"/g;
+    const campIdRe = /"campaign_id":"(\d+)"/;
+    const adgroupRe = /"adgroup_id":"(\d+)"[^{}]*?"name":"((?:[^"\\]|\\.)*)"/g;
 
     for (const script of document.querySelectorAll('script')) {
       const text = script.textContent || '';
       if (text.length < 500) continue;
+      if (!text.includes('"campaign_structure_tree"')) continue;
 
-      if (text.includes('"ad_campaign_group_id"')) {
+      for (const treeBody of extractStructureTreeBodies(text)) {
+        const cm = campIdRe.exec(treeBody);
+        if (!cm) continue;
+        const campId = cm[1];
+
         adgroupRe.lastIndex = 0;
-        let m;
-        while ((m = adgroupRe.exec(text)) !== null) {
-          const adId = m[1], campId = m[2], rawName = m[3];
-          adIdToCamp.set(adId, campId);
-          adIdToName.set(adId, decodeJsonStringEscapes(rawName));
-        }
-      }
+        let am;
+        while ((am = adgroupRe.exec(treeBody)) !== null) {
+          const adgroupId = am[1];
+          const rawName = am[2];
+          const name = rawName.includes('\\') ? decodeJsonStringEscapes(rawName) : rawName;
+          const nameKey = canonicalKey(name);
+          if (!nameKey) continue;
 
-      if (text.includes('"dimension_values"')) {
-        insightsRe.lastIndex = 0;
-        let m;
-        while ((m = insightsRe.exec(text)) !== null) {
-          const campId = m[1], adId = m[2], spend = m[3];
-          adIdToCamp.set(adId, campId);
-          adIdToSpend.set(adId, spend);
-        }
-      }
-    }
+          let set = byName.get(nameKey);
+          if (!set) { set = new Set(); byName.set(nameKey, set); }
+          set.add(campId);
 
-    // bySpend value is either a campId string OR the sentinel '__AMBIGUOUS__'
-    // when multiple ads share the same (name, spend) — common with $0 ads
-    // (paused / no-delivery) that all collapse to the same key. Treating
-    // them as ambiguous prevents silently picking the wrong campaign id.
-    const bySpend = new Map();
-    const AMBIGUOUS = '__AMBIGUOUS__';
-    for (const [adId, campId] of adIdToCamp) {
-      const name = adIdToName.get(adId);
-      const spendStr = adIdToSpend.get(adId);
-      if (!name) continue;
-      const nameKey = canonicalKey(name);
-      // Normalize trailing zeros: Meta JSON has "10.1", UI has "$10.10".
-      const spendNum = spendStr != null ? parseFloat(spendStr) : NaN;
-      if (!Number.isFinite(spendNum)) continue;
-      const k = `${nameKey}::${spendNum.toFixed(2)}`;
-      const existing = bySpend.get(k);
-      if (existing == null) {
-        bySpend.set(k, campId);
-      } else if (existing !== campId) {
-        bySpend.set(k, AMBIGUOUS);
+          byAdgroupId.set(adgroupId, campId);
+        }
       }
     }
 
     metaPreloadIndex = {
-      bySpend,
-      byAdId: adIdToCamp,
+      byName,
+      byAdgroupId,
       parsedAt: Date.now(),
+      urlFingerprint: fingerprint,
     };
     return metaPreloadIndex;
+  }
+
+  // Walk the script text once to find every `"campaign_structure_tree":{...}`
+  // payload, returning each one's body (the chars between its outer braces).
+  // The brace counter is string- and escape-aware so we don't get fooled by
+  // `}` inside string literals (e.g. names containing punctuation).
+  function extractStructureTreeBodies(text) {
+    const bodies = [];
+    const marker = '"campaign_structure_tree":{';
+    let pos = 0;
+    while (true) {
+      const start = text.indexOf(marker, pos);
+      if (start === -1) break;
+      const bodyStart = start + marker.length;
+      let depth = 1;
+      let i = bodyStart;
+      let inStr = false;
+      let esc = false;
+      while (i < text.length && depth > 0) {
+        const c = text[i];
+        if (esc) {
+          esc = false;
+        } else if (c === '\\') {
+          esc = true;
+        } else if (c === '"') {
+          inStr = !inStr;
+        } else if (!inStr) {
+          if (c === '{') depth++;
+          else if (c === '}') depth--;
+        }
+        i++;
+      }
+      if (depth === 0) bodies.push(text.slice(bodyStart, i - 1));
+      pos = i;
+    }
+    return bodies;
   }
 
   function decodeJsonStringEscapes(s) {
@@ -553,70 +613,152 @@
       .replace(/\\t/g, '\t');
   }
 
-  // Find the row's spend cells by Y-position, then look up
-  // (ad_name, spend) in Meta's preload index → campaign_id.
+  // Resolve via Meta's structure tree: ad-name → Set<campaign_id>, narrowed
+  // by Adjust's candidate campaigns and (when present) urlScopedCampaignIds.
   //
-  // CRITICAL: a row contains MULTIPLE $-formatted cells (Amount Spent AND
-  // Cost Per Result, possibly more). Picking the first hit and returning
-  // its campaign_id risked silently selecting Cost Per Result, which —
-  // if it happens to numerically equal another ad's Amount Spent — would
-  // map the row to the wrong campaign and surface another campaign's ROAS
-  // (observed 2026-05-07: Ba Lan row showed Ita data because Ba Lan's
-  // CPR coincided with Ita's Amount Spent).
-  //
-  // Defence: collect every $-cell's mapped campaign_id, and only resolve
-  // if exactly one unique candidate-set campaign_id appears. Multiple
-  // distinct matches → ambiguous, return null and let later strategies
-  // (or the aggregate fallback) handle it. This trades a small number of
-  // false negatives (rare collisions) for eliminating false positives.
-  function findCampaignIdViaMetaPreload(nameEl, nameKey, candidates) {
+  // The tree is naturally scoped to the user's filter — Meta only ships trees
+  // for campaigns currently loaded — so a name unique within that filter
+  // resolves immediately. When the same name appears in multiple in-view
+  // campaigns the intersection often still collapses to one (Adjust may
+  // only have data for some of them); if not, return null and let DOM
+  // Y-position handle it.
+  function findCampaignIdViaMetaPreload(nameKey, candidates) {
     const idx = ensureMetaPreloadIndex();
-    if (idx.bySpend.size === 0) return null;
+    if (idx.byName.size === 0) return null;
 
-    // Restrict to candidates' campaign ids so a stray Meta entry from another
-    // app/account can't accidentally match.
+    const treeCampIds = idx.byName.get(nameKey);
+    if (!treeCampIds || treeCampIds.size === 0) return null;
+
     const validCampIds = new Set();
     for (const c of candidates) {
       if (c?.campaignId) validCampIds.add(String(c.campaignId));
     }
     if (validCampIds.size === 0) return null;
 
-    const myRect = nameEl.getBoundingClientRect();
-    if (myRect.height === 0) return null;
-    const rowRange = getRowYRange(nameEl);
-    const buckets = ensureRowYBuckets();
-    const rowMid = (rowRange.top + rowRange.bottom) / 2;
-    const rowMidKey = Math.round(rowMid / ROW_BUCKET_PX);
-    const halfHeight = (rowRange.bottom - rowRange.top) / 2;
-    const bucketSpan = Math.max(1, Math.ceil(halfHeight / ROW_BUCKET_PX));
+    const intersected = [...treeCampIds].filter(id => validCampIds.has(id));
+    if (intersected.length === 1) return intersected[0];
+    if (intersected.length === 0) return null;
 
-    const SPEND_RE = /^\$([\d,]+(?:\.\d+)?)$/;
-    const matched = new Set();
+    // Multiple intersect — narrow further by URL scope if available.
+    const scope = getScopedCampaignIds();
+    if (scope) {
+      const narrowed = intersected.filter(id => scope.has(id));
+      if (narrowed.length === 1) return narrowed[0];
+    }
+    return null;
+  }
 
-    for (let dk = -bucketSpan; dk <= bucketSpan; dk++) {
-      const bucket = buckets.get(rowMidKey + dk);
-      if (!bucket) continue;
-      for (const el of bucket) {
-        if (el === nameEl) continue;
-        const r = el.getBoundingClientRect();
-        if (r.height === 0) continue;
-        const mid = (r.top + r.bottom) / 2;
-        if (mid < rowRange.top || mid > rowRange.bottom) continue;
-        const txt = (el.textContent || '').trim();
-        const m = txt.match(SPEND_RE);
-        if (!m) continue;
-        const spendNum = parseFloat(m[1].replace(/,/g, ''));
-        if (!Number.isFinite(spendNum)) continue;
-        const lookupKey = `${nameKey}::${spendNum.toFixed(2)}`;
-        const campId = idx.bySpend.get(lookupKey);
-        // Skip preload-side ambiguous keys (multiple Meta ads share this
-        // (name, spend) — typically two paused ads both at $0).
-        if (!campId || campId === '__AMBIGUOUS__') continue;
-        if (validCampIds.has(campId)) matched.add(campId);
+  // Read the row's own adgroup_id from the React props that Meta attaches
+  // to its DOM nodes via `__reactProps$XXX` hidden properties (a stable
+  // React 17+ convention). The props embed the row's adgroup_id as a 15–19
+  // digit string; once we find one that's in our preload `byAdgroupId`
+  // map, we resolve directly to that adgroup's campaign_id — no DOM column
+  // visibility, spend matching, or Y-position guesswork required.
+  //
+  // We BFS the row container's subtree, walking each node's React props
+  // recursively (cycle-safe) and matching any 15–19 digit substring
+  // against the known-adgroup-id map. The first hit whose campaign_id is
+  // also in Adjust's candidate set wins.
+  function findCampaignIdViaReactProps(nameEl, candidates) {
+    const idx = ensureMetaPreloadIndex();
+    if (idx.byAdgroupId.size === 0) return null;
+
+    const validCampIds = new Set();
+    for (const c of candidates) {
+      if (c?.campaignId) validCampIds.add(String(c.campaignId));
+    }
+    if (validCampIds.size === 0) return null;
+
+    const rowContainer = findRowAncestor(nameEl).node;
+    if (!rowContainer || rowContainer === document.body) return null;
+
+    // DFS via stack with a scan cap — typical row has tens of elements,
+    // but a runaway subtree should not stall decoration.
+    const stack = [rowContainer];
+    let scanned = 0;
+    const MAX_SCAN = 300;
+
+    while (stack.length > 0 && scanned < MAX_SCAN) {
+      const el = stack.pop();
+      scanned++;
+
+      for (const propKey of Object.keys(el)) {
+        if (!propKey.startsWith('__reactProps')) continue;
+        const props = el[propKey];
+        if (!props || typeof props !== 'object') continue;
+
+        const adgroupId = findAdgroupIdInValue(props, idx.byAdgroupId);
+        if (adgroupId) {
+          const campId = idx.byAdgroupId.get(adgroupId);
+          if (campId && validCampIds.has(campId)) return campId;
+        }
+      }
+
+      if (el.children) {
+        for (const child of el.children) stack.push(child);
       }
     }
+    return null;
+  }
 
-    return matched.size === 1 ? matched.values().next().value : null;
+  // Recursively scan a value (object/array/string/etc.) for a 15–19 digit
+  // substring that appears as a key in `byAdgroupId`. Returns the matched
+  // id string, or null. Depth-limited and cycle-safe via WeakSet.
+  function findAdgroupIdInValue(value, byAdgroupId, depth, seen) {
+    depth = depth || 0;
+    seen = seen || new WeakSet();
+    if (depth > 6) return null;
+    if (value == null) return null;
+
+    if (typeof value === 'string') {
+      const matches = value.match(/\d{15,19}/g);
+      if (!matches) return null;
+      for (const id of matches) {
+        if (byAdgroupId.has(id)) return id;
+      }
+      return null;
+    }
+
+    if (typeof value !== 'object') return null;
+    if (seen.has(value)) return null;
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        const r = findAdgroupIdInValue(v, byAdgroupId, depth + 1, seen);
+        if (r) return r;
+      }
+      return null;
+    }
+
+    for (const k of Object.keys(value)) {
+      try {
+        const r = findAdgroupIdInValue(value[k], byAdgroupId, depth + 1, seen);
+        if (r) return r;
+      } catch {}
+    }
+    return null;
+  }
+
+  // Walk up from `nameEl` to find the tallest plausible single-row ancestor.
+  // Returns both the ancestor node (used by React-props scan) and its rect
+  // (used by Y-bucket lookup). Stops once an ancestor exceeds 200px since
+  // that means we've left the row and entered a multi-row container.
+  function findRowAncestor(nameEl) {
+    const myRect = nameEl.getBoundingClientRect();
+    let bestNode = nameEl;
+    let bestRect = myRect;
+    let node = nameEl.parentElement;
+    for (let i = 0; i < 8 && node && node !== document.body; i++, node = node.parentElement) {
+      const r = node.getBoundingClientRect();
+      if (r.height === 0) continue;
+      if (r.height > 200) break;
+      if (r.height > bestRect.height) {
+        bestRect = r;
+        bestNode = node;
+      }
+    }
+    return { node: bestNode, rect: bestRect };
   }
 
   // Lazily build (and cache for the duration of the current decorate pass) a
@@ -662,25 +804,14 @@
     return rowYBuckets;
   }
 
-  // Walk up from `nameEl` to find the tallest plausible single-row ancestor
-  // and return its vertical range. The ancestor's bounding rect spans the
-  // FULL row height (image + name + pill stack), so cells in any column —
-  // even those rendered with different vertical alignment in their own
-  // column subtree — will have midpoints inside this Y range.
-  //
-  // Stops walking once the ancestor's height exceeds 200px (means we've
-  // left the row and entered a multi-row container).
+  // Vertical range of the row that contains `nameEl`. The ancestor's
+  // bounding rect spans the FULL row height (image + name + pill stack),
+  // so cells in any column — even those rendered with different vertical
+  // alignment in their own column subtree — will have midpoints inside
+  // this Y range. Shares the row-ancestor walk with React-props lookup.
   function getRowYRange(nameEl) {
-    const myRect = nameEl.getBoundingClientRect();
-    let bestRect = myRect;
-    let node = nameEl.parentElement;
-    for (let i = 0; i < 8 && node && node !== document.body; i++, node = node.parentElement) {
-      const r = node.getBoundingClientRect();
-      if (r.height === 0) continue;
-      if (r.height > 200) break;
-      if (r.height > bestRect.height) bestRect = r;
-    }
-    return { top: bestRect.top - 2, bottom: bestRect.bottom + 2 };
+    const { rect } = findRowAncestor(nameEl);
+    return { top: rect.top - 2, bottom: rect.bottom + 2 };
   }
 
   // Find an ID/name match in cells sharing nameEl's row.
@@ -835,7 +966,7 @@
   function decorateAllVisibleRows() {
     // Reset stats and Y-buckets at start of pass; the bucket index will be
     // built lazily on the first ambiguous lookup and reused for the rest.
-    lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByMetaPreload: 0, resolvedByDom: 0, stillAmbiguous: 0 };
+    lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByMetaPreload: 0, resolvedByReactProps: 0, resolvedByDom: 0, stillAmbiguous: 0 };
     rowYBuckets = null;
     document.querySelectorAll(NAME_CANDIDATE_SELECTOR).forEach(decorateCandidate);
     rowYBuckets = null; // release; rects go stale on next mutation anyway
