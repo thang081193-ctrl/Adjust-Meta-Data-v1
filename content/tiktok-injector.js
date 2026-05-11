@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.2.0-tt-perf-raf-fix+col-cache';
+  const INJECTOR_VERSION = 'v0.3.5-tt-today-pill-width-cache-fix';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -117,6 +117,44 @@
     resolvedByBridgeId: 0,
     stillAmbiguous: 0,
   };
+
+  // Today-pill stats for the last decorate pass. Read by buildBannerText
+  // (banner warn lines) and logDomDiagnostics (console). Reset at the top of
+  // every decorate pass via createEmptyTodayStats so the shape stays in sync
+  // between initial value and reset; adding a field in one place but not the
+  // other previously caused `sampleRowCandidates` to silently disappear after
+  // the first decorate pass.
+  function createEmptyTodayStats() {
+    return {
+      columnFound: false, columnHeaderText: null, columnX: null,
+      pillsRendered: 0, pillsRenderedOffDate: 0,
+      skippedNoCostCell: 0, skippedCurrencyMismatch: 0,
+      skippedAmbiguous: 0, skippedAbbreviated: 0, skippedOffDate: 0,
+      sampleSpend: null, sampleRevToday: null,
+      detectedTikTokCurrency: null, adjustCurrencyExample: null,
+      sampleRowCandidates: null,
+      ttDateIsToday: null, ttDateLabel: null, ttDateSource: null,
+    };
+  }
+  let lastTodayStats = createEmptyTodayStats();
+
+  // CSS class names for the three today-pill variants. Defined once so the
+  // strings can't drift between the render branches and the dedup cleanup
+  // sweep in decorateCandidate / maybeRenderTodayPill.
+  const TODAY_PILL_CLASS_NORMAL   = 'adjust-pill adjust-pill-today';
+  const TODAY_PILL_CLASS_OFFDATE  = 'adjust-pill adjust-pill-today-offdate';
+  const TODAY_PILL_CLASS_MISMATCH = 'adjust-pill adjust-pill-today-mismatch';
+  // Per-pass caches populated at the start of decorateAllVisibleRows.
+  let currentCostColumn = null;
+  let currentTikTokDate = null;
+  let rowYBuckets = null;
+  // Today pill is a SEPARATE position:fixed pill rendered to the right of the
+  // main pill, tracked in its own Map so the rAF reposition loop can move
+  // both together when the row scrolls. Lifecycle: created/refreshed by
+  // maybeRenderTodayPill, removed when the main pill is removed (cell
+  // disconnects or virtualizes).
+  const cellToTodayPill = new Map();
+  const decoratedTodayKey = new WeakMap();
 
   // ---- Bridge integration ----
   let bridgeScanToken = 0;
@@ -231,6 +269,12 @@
 
       lastSyncAt = cached.lastSyncAt;
       sourceLabel = cached.sourceLabel;
+
+      // Post-build: attach revenueToday + adjustCurrency onto each index
+      // entry by summing the per-row `revenueToday` field that data-source.js
+      // merged in. Kept as a separate pass so we never modify the signatures
+      // of the existing index builders — diff stays additive.
+      attachTodayMetrics(campaignRows, adRows);
 
       dispatchBridgeKnownIds();
 
@@ -420,6 +464,606 @@
     };
   }
 
+  // ============================================================
+  // Today pill — TikTok UI cost × Adjust today revenue
+  // ============================================================
+  //
+  // Mirrors meta-injector.js's Today pill. Numerator: Adjust today event-date
+  // revenue (`revenue + ad_revenue`). Denominator: the row's "Cost" cell read
+  // directly from TikTok Ads Manager. The existing D0/3d/7d/All pill is
+  // untouched.
+  //
+  // TikTok-specific quirks vs Meta:
+  //   - TikTok renders inside <ks-virtual-table> which clips siblings, so the
+  //     main pill is already position:fixed (cellToPill Map). The today pill
+  //     must follow the same pattern with its own cellToTodayPill Map; the
+  //     rAF reposition loop moves both together when the row scrolls.
+  //   - Date filter URL format is `?st=YYYY-MM-DD&et=YYYY-MM-DD` with no
+  //     preset keyword (unlike Meta's `date_preset=today` or `,today` suffix).
+
+  // Header text TikTok uses for the Cost column across locales. Keys are
+  // canonicalKey'd at construction. Failure is graceful (column-missing
+  // banner) rather than silent miscoluming.
+  const TIKTOK_COST_HEADER_KEYS = new Set([
+    canonicalKey('Cost'),
+    canonicalKey('Chi phí'),
+    canonicalKey('Costo'),
+    canonicalKey('Coût'),
+    canonicalKey('Kosten'),
+    canonicalKey('Custo'),
+    canonicalKey('费用'),
+    canonicalKey('費用'),
+    canonicalKey('비용'),
+  ]);
+
+  // Currencies with no fractional unit. Symbol detection uses these to decide
+  // whether trailing `.` / `,` is decimal or thousands grouping.
+  const ZERO_DECIMAL_CURRENCIES = new Set(['VND', 'JPY', 'KRW', 'IDR', 'CLP']);
+
+  // Currency symbol → ISO code. Used when the cell carries only a symbol.
+  const SYMBOL_TO_ISO = {
+    '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₫': 'VND',
+    '₹': 'INR', '₩': 'KRW', '฿': 'THB', '₱': 'PHP', '₪': 'ILS',
+    '₺': 'TRY', '₽': 'RUB',
+  };
+
+  // Skip-tag list for full-DOM leaf scans. SCRIPT/STYLE leaves carry source
+  // text that never renders; SVG-internal nodes have rects but never display
+  // row data.
+  const HEADER_SCAN_SKIP_TAGS = new Set([
+    'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE',
+    'META', 'LINK', 'TITLE', 'HEAD',
+    'SVG', 'PATH', 'CIRCLE', 'RECT', 'POLYGON', 'G', 'DEFS', 'USE',
+  ]);
+
+  // Bucket index granularity for row Y-coordinate lookup. Small enough that a
+  // typical row only spans 1–2 buckets, large enough that lookups stay O(1).
+  const ROW_BUCKET_PX = 8;
+
+  // Aggregate revenueToday + adjustCurrency from the merged rows onto each
+  // index entry that decorate-time lookups will return. Mirrors how each
+  // index keys its rows in buildDirectIndex / buildAdIndex /
+  // buildAggregatedIndex, so the same rows route to the same entries — no
+  // re-indexing.
+  //
+  // CRITICAL: buildAdIndex shares the SAME entry object across byName /
+  // byComposite / byAdId for non-collision ads. Naive multi-index bumping
+  // would triple-count the same row's revenue onto the same object. We guard
+  // with a per-row `visited` WeakSet so each unique entry is bumped at most
+  // once per row.
+  function attachTodayMetrics(campaignRows, adRows) {
+    for (const r of campaignRows) {
+      if (!r.campaignName) continue;
+      const visited = new WeakSet();
+      bumpToday(campaignIndex, canonicalKey(r.campaignName), r, visited);
+      if (r.campaignId) bumpToday(campByIdIndex, String(r.campaignId), r, visited);
+    }
+    for (const r of adRows) {
+      const visited = new WeakSet();
+      if (r.adsetName) {
+        const ak = canonicalKey(r.adsetName);
+        bumpToday(adsetIndex, ak, r, visited);
+        if (r.campaignId) bumpToday(adsetCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+        if (r.adsetId) bumpToday(adsetByIdIndex, String(r.adsetId), r, visited);
+      }
+      if (r.adName) {
+        const ak = canonicalKey(r.adName);
+        bumpToday(adIndex, ak, r, visited);
+        if (r.campaignId) bumpToday(adCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+        if (r.adId) bumpToday(adByIdIndex, String(r.adId), r, visited);
+      }
+    }
+  }
+
+  function bumpToday(idx, key, row, visited) {
+    const e = idx.get(key);
+    if (!e) return;
+    if (visited.has(e)) return;
+    visited.add(e);
+    e.revenueToday = (e.revenueToday || 0) + (row.revenueToday || 0);
+    if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
+    e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
+  }
+
+  // Locate the TikTok "Cost" header cell once per decorate pass. Returns
+  // { headerEl, headerX, headerLeft, headerRight, headerWidth, headerText }
+  // on success, null otherwise. The header X mid-pixel is the column anchor
+  // used to find each row's cost cell by nearest-X within shared row Y.
+  //
+  // We deliberately match on header TEXT rather than column index because
+  // TikTok's <ks-virtual-table> renders cells without a stable row-wrapper
+  // node, so child-indexed walks across the table are brittle. Same scan
+  // pattern Meta uses (full leaf walk minus skip tags).
+  function locateCostColumn() {
+    // Two anti-decoys at work here:
+    //  (1) Scope the scan to <ks-virtual-table> — TikTok's left nav and top
+    //      toolbar carry text leaves that match our cost-header keys.
+    //  (2) Even inside the table, custom-column popovers and frozen left
+    //      columns can hold a "Cost" label that wins on Y alone. We score
+    //      candidates by currency-cells-below-X (step 2) instead of trusting
+    //      Y order.
+    const tableScope = document.querySelector('ks-virtual-table')
+      || document.querySelector('[class*="ks-table"]')
+      || document.body;
+
+    // Step 1: gather every header-text candidate within scope.
+    const candidates = [];
+    for (const el of tableScope.querySelectorAll('*')) {
+      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
+      if (el.children.length > 0) continue; // leaf only
+      const raw = el.textContent || '';
+      if (!raw || raw.length > 60) continue;
+      const k = canonicalKey(raw);
+      let matched = TIKTOK_COST_HEADER_KEYS.has(k);
+      if (!matched && raw.match(/[.…]+$/)) {
+        // Header may be truncated at narrow column widths ("Cos…").
+        const prefix = k.replace(/[.…\s]+$/, '');
+        if (prefix.length >= 3) {
+          for (const hk of TIKTOK_COST_HEADER_KEYS) {
+            if (hk.startsWith(prefix)) { matched = true; break; }
+          }
+        }
+      }
+      if (!matched) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height === 0 || r.top < 0) continue;
+      candidates.push({ el, rect: r });
+    }
+    if (candidates.length === 0) return null;
+
+    // Step 2: pick the candidate that anchors a real data column. The real
+    // Cost header has currency-looking cells stacked vertically under it
+    // (one per row); spurious "Cost" leaves elsewhere have none. Score each
+    // candidate by counting currency leaves below it at the same X (±60px).
+    // Single pre-pass over all currency leaves keeps this O(leaves + cands).
+    let winner;
+    if (candidates.length === 1) {
+      winner = candidates[0];
+    } else {
+      const currencyLeaves = [];
+      for (const el of tableScope.querySelectorAll('*')) {
+        if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
+        if (el.children.length > 0) continue;
+        const txt = (el.textContent || '').trim();
+        if (!txt) continue;
+        if (!looksLikeCurrency(txt)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.height === 0) continue;
+        currencyLeaves.push({ midX: (r.left + r.right) / 2, top: r.top });
+      }
+      let bestScore = -1;
+      for (const cand of candidates) {
+        const candX = (cand.rect.left + cand.rect.right) / 2;
+        const candBottom = cand.rect.bottom;
+        let score = 0;
+        for (const lf of currencyLeaves) {
+          if (lf.top < candBottom) continue;
+          if (Math.abs(lf.midX - candX) > 60) continue;
+          score++;
+        }
+        // Higher score wins; tie-break by topmost (the actual header row
+        // sits at the table top while frozen-column duplicates can render
+        // farther down).
+        if (score > bestScore
+            || (score === bestScore && winner && cand.rect.top < winner.rect.top)) {
+          bestScore = score;
+          winner = cand;
+        }
+      }
+      if (!winner) winner = candidates[0];
+    }
+
+    // Step 3: walk up from the text leaf to find the column header CELL
+    // container — header text may be left-aligned in a wider cell while
+    // data cells in the same column are right-aligned numbers. The cell
+    // container's X range is what matters for matching data cells.
+    const bestHeader = winner.el;
+    let cellAncestor = bestHeader;
+    let cellRect = winner.rect;
+    let node = bestHeader.parentElement;
+    for (let i = 0; i < 5 && node && node !== document.body; i++, node = node.parentElement) {
+      const r = node.getBoundingClientRect();
+      if (r.height === 0) continue;
+      if (r.height > 80) break;
+      if (r.width > 400) break;
+      if (r.width > cellRect.width) {
+        cellAncestor = node;
+        cellRect = r;
+      }
+    }
+    return {
+      headerX: (cellRect.left + cellRect.right) / 2,
+      headerText: (bestHeader.textContent || '').trim().slice(0, 40),
+    };
+  }
+
+  // Lazily build (and cache for the current decorate pass) a bucketed index
+  // of every visible-text leaf within the data table, keyed by rounded Y
+  // midpoint. Scope mirrors locateCostColumn — leaves outside the table
+  // (left-nav, top-toolbar, banner, the today pills we just rendered) would
+  // pollute the buckets and make findCostCellText pick currency-looking text
+  // from unrelated UI chrome that happens to share a row's Y.
+  function ensureRowYBuckets() {
+    if (rowYBuckets) return rowYBuckets;
+    rowYBuckets = new Map();
+    const tableScope = document.querySelector('ks-virtual-table')
+      || document.querySelector('[class*="ks-table"]')
+      || document.body;
+    for (const el of tableScope.querySelectorAll('*')) {
+      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
+      if (el.children.length > 0) continue;
+      const t = (el.textContent || '').trim();
+      if (!t || t.length > 300) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height === 0) continue;
+      const mid = (r.top + r.bottom) / 2;
+      const k = Math.round(mid / ROW_BUCKET_PX);
+      let bucket = rowYBuckets.get(k);
+      if (!bucket) { bucket = []; rowYBuckets.set(k, bucket); }
+      bucket.push(el);
+    }
+    return rowYBuckets;
+  }
+
+  // Vertical range of the row that contains `nameEl`. nameEl is the <KsLink>
+  // wrapping the campaign-name text only — its bounding box ≈ name line
+  // height (~16-20px), much shorter than the full row (~40-60px once the
+  // budget / delivery sub-line is included). Cost-column cells are
+  // vertical-aligned to the full row, so their Y midpoint lands outside
+  // nameEl's own range. The column ancestor's rect spans the full row
+  // height (one cell per row in a column), giving a Y range that catches
+  // any column's cell on this row.
+  function getRowYRange(nameEl) {
+    const column = getColumnAncestor(nameEl);
+    const r = (column || nameEl).getBoundingClientRect();
+    return { top: r.top - 2, bottom: r.bottom + 2 };
+  }
+
+  // Read this row's cost cell text. Strategy: among same-row Y-bucket cells
+  // whose text passes the currency filter, pick the one whose X mid is
+  // nearest to the Cost-column header's X. No threshold — the closest
+  // currency cell to the column header IS the cost cell by definition.
+  function findCostCellText(nameEl) {
+    if (!currentCostColumn) return null;
+    const rowRange = getRowYRange(nameEl);
+    const buckets = ensureRowYBuckets();
+    const rowMid = (rowRange.top + rowRange.bottom) / 2;
+    const rowMidKey = Math.round(rowMid / ROW_BUCKET_PX);
+    const halfHeight = (rowRange.bottom - rowRange.top) / 2;
+    const bucketSpan = Math.max(1, Math.ceil(halfHeight / ROW_BUCKET_PX));
+    const headerX = currentCostColumn.headerX;
+
+    let best = null;
+    let bestDist = Infinity;
+    const candidatesForDiag = [];
+    for (let dk = -bucketSpan; dk <= bucketSpan; dk++) {
+      const bucket = buckets.get(rowMidKey + dk);
+      if (!bucket) continue;
+      for (const el of bucket) {
+        if (el === nameEl) continue;
+        const r = el.getBoundingClientRect();
+        if (r.height === 0 || r.width === 0) continue;
+        const mid = (r.top + r.bottom) / 2;
+        if (mid < rowRange.top || mid > rowRange.bottom) continue;
+        const txt = (el.textContent || '').trim();
+        if (!txt) continue;
+        if (!looksLikeCurrency(txt)) continue;
+        const cellMidX = (r.left + r.right) / 2;
+        const dist = Math.abs(cellMidX - headerX);
+        // Capture first row's same-row currency candidates so diagnostics can
+        // dump them. Helps diagnose "cost never reads" without DOM probing.
+        if (lastTodayStats.sampleRowCandidates == null) {
+          candidatesForDiag.push({ x: Math.round(cellMidX), text: txt.slice(0, 30), dist: Math.round(dist) });
+        }
+        if (dist < bestDist) { best = txt; bestDist = dist; }
+      }
+    }
+    if (lastTodayStats.sampleRowCandidates == null && candidatesForDiag.length > 0) {
+      lastTodayStats.sampleRowCandidates = candidatesForDiag.sort((a, b) => a.x - b.x).slice(0, 12);
+    }
+    return best;
+  }
+
+  // Plausibility test: does this cell text look like a money value? Loose by
+  // design — final parsing happens in parseCurrencyCell. CRITICAL: the
+  // leading-char gate rejects labelled subtext like "Starting daily budget:
+  // 250.00 USD" (TikTok's budget tooltip renders next to the cost column).
+  // Without the gate, that tooltip can be picked as a cost cell. Real cost
+  // cells start with sign / paren / digit / symbol, or an ISO prefix.
+  function looksLikeCurrency(txt) {
+    if (/^[–—-]$/.test(txt)) return true;
+    if (!/\d/.test(txt)) return false;
+    if (/%$/.test(txt)) return false;
+    if (!/^\s*(?:[A-Z]{2,3}\s+)?[(\-−\d\$€£¥₫₹₩฿₱₪₺₽]/.test(txt)) return false;
+    if (/[\$€£¥₫₹₩฿₱₪₺₽]/.test(txt)) return true;
+    if (/\b(USD|EUR|GBP|JPY|VND|INR|KRW|THB|PHP|ILS|TRY|RUB|AUD|CAD|MXN|BRL|CHF|SEK|NOK|DKK|PLN|TWD|HKD|SGD|MYR|IDR|CNY|NZD)\b/i.test(txt)) return true;
+    if (/\d[.,]\d/.test(txt) && txt.length >= 4) return true;
+    return false;
+  }
+
+  // Parse a TikTok UI currency cell. Returns { value, currency, parsed }:
+  //   value    — number or null when unparseable.
+  //   currency — best-effort ISO 3-letter code, or null.
+  //   parsed   — false for abbreviations (e.g. "$1.2K"), empty/dash cells.
+  // See meta-injector.parseCurrencyCell for full format-support notes.
+  function parseCurrencyCell(text) {
+    if (!text) return { value: null, currency: null, parsed: false };
+    const trimmed = text.trim();
+    if (!trimmed || /^[–—-]$/.test(trimmed)) {
+      return { value: null, currency: null, parsed: false };
+    }
+    if (/\d[\s]?[KMB]\b/i.test(trimmed)) {
+      return { value: null, currency: null, parsed: false, abbreviated: true };
+    }
+    if (/[٠-٩۰-۹०-९]/.test(trimmed)) {
+      return { value: null, currency: null, parsed: false };
+    }
+
+    let currency = null;
+    for (const ch of trimmed) {
+      if (SYMBOL_TO_ISO[ch]) { currency = SYMBOL_TO_ISO[ch]; break; }
+    }
+    if (!currency) {
+      const iso = trimmed.match(/\b([A-Z]{3})\b/);
+      if (iso) currency = iso[1];
+    }
+
+    let negative = false;
+    let cleaned = trimmed;
+    if (/^\(.*\)$/.test(cleaned)) { negative = true; cleaned = cleaned.slice(1, -1); }
+    if (/^[-−]/.test(cleaned)) { negative = true; cleaned = cleaned.replace(/^[-−]/, ''); }
+
+    cleaned = cleaned
+      .replace(/[\$€£¥₫₹₩฿₱₪₺₽]/g, '')
+      .replace(/\b[A-Z]{3}\b/g, '')
+      .replace(/[   \s]/g, '')
+      .trim();
+
+    if (!/^[\d.,]+$/.test(cleaned)) {
+      return { value: null, currency, parsed: false };
+    }
+
+    const isZeroDecimal = currency && ZERO_DECIMAL_CURRENCIES.has(currency);
+    let numericStr;
+    if (isZeroDecimal) {
+      numericStr = cleaned.replace(/[.,]/g, '');
+    } else {
+      const lastDot = cleaned.lastIndexOf('.');
+      const lastComma = cleaned.lastIndexOf(',');
+      const lastSep = Math.max(lastDot, lastComma);
+      const fractionLen = lastSep >= 0 ? cleaned.length - lastSep - 1 : -1;
+      if (lastSep >= 0 && fractionLen >= 1 && fractionLen <= 2) {
+        const intPart = cleaned.slice(0, lastSep).replace(/[.,]/g, '');
+        const fracPart = cleaned.slice(lastSep + 1);
+        numericStr = `${intPart}.${fracPart}`;
+      } else {
+        numericStr = cleaned.replace(/[.,]/g, '');
+      }
+    }
+
+    const value = parseFloat(numericStr);
+    if (!Number.isFinite(value)) return { value: null, currency, parsed: false };
+    return { value: negative ? -value : value, currency, parsed: true };
+  }
+
+  // Detect whether TikTok UI's date filter is set to "Today". TikTok exposes
+  // the active range via `?st=YYYY-MM-DD&et=YYYY-MM-DD` with no preset
+  // keyword (unlike Meta's `date_preset` / `,today` suffix). When both equal
+  // browser-local today → isToday=true. When absent → isToday=false (don't
+  // silently divide by an unknown range's spend).
+  //
+  // Returns: { isToday: bool, label: string, source: 'range'|'absent'|'error' }
+  function detectTikTokDateInfo() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const st = params.get('st');
+      const et = params.get('et');
+      if (!st && !et) {
+        return { isToday: false, label: 'unknown', source: 'absent' };
+      }
+      if (st && et && /^\d{4}-\d{2}-\d{2}$/.test(st) && /^\d{4}-\d{2}-\d{2}$/.test(et)) {
+        const today = todayLocalIsoDate();
+        if (st === today && et === today) {
+          return { isToday: true, label: 'today', source: 'range' };
+        }
+        const label = st === et ? st : `${st}…${et}`;
+        return { isToday: false, label, source: 'range' };
+      }
+      return { isToday: false, label: `${st || '?'}…${et || '?'}`, source: 'range' };
+    } catch {
+      return { isToday: false, label: 'unknown', source: 'error' };
+    }
+  }
+
+  function todayLocalIsoDate() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function formatMoneyOrDash(n) {
+    if (n == null || !Number.isFinite(n)) return '–';
+    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function formatTodayTooltip(rev, spend, displayCcy, adjCcy, data) {
+    const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+    const lines = [
+      `Today realtime ROAS`,
+      `Rev (Adjust today${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(rev)}`,
+      `Spend (TikTok UI${displayCcy ? `, ${displayCcy}` : ''}): ${formatMoneyOrDash(spend)}`,
+    ];
+    if (ageMin != null) lines.push(`Adjust sync age: ${ageMin}m`);
+    if (!data.todayRowExisted) {
+      lines.push(`Note: no cohort data for this row (new today?)`);
+    }
+    return lines.join('\n');
+  }
+
+  // Build (or refresh) the today pill for this row. ALWAYS renders when the
+  // cost column is found and the row is not ambiguous — even when rev or
+  // spend is missing/zero, the pill shows `Today: rev/spend` so the user can
+  // SEE pipeline state instead of guessing why nothing appeared. Skip paths
+  // bump counters but never throw.
+  function maybeRenderTodayPill(nameEl, mainPill, data, mainKey) {
+    if (!data || data.ambiguous) { lastTodayStats.skippedAmbiguous++; return; }
+    if (!currentCostColumn) return; // banner handles user messaging
+
+    const rev = (data.revenueToday == null) ? null : data.revenueToday;
+    const adjCcy = data.adjustCurrency;
+
+    // Off-date: TikTok UI is on a different date range, so the cost cell is
+    // not today's spend. Render a rev-only warn pill (pipeline-state-visible
+    // rule) and skip the cost-cell read — its value would only confuse
+    // diagnostics.
+    if (currentTikTokDate && !currentTikTokDate.isToday) {
+      const todayKey = `${mainKey}|offdate:${currentTikTokDate.label}|rev:${rev}|a:${adjCcy || ''}`;
+      if (decoratedTodayKey.get(nameEl) === todayKey) return;
+
+      const todayPill = document.createElement('span');
+      todayPill.className = TODAY_PILL_CLASS_OFFDATE;
+      todayPill.textContent =
+        `Today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)} ` +
+        `(TikTok on ${currentTikTokDate.label})`;
+      todayPill.title =
+        `Today ROAS not computed — TikTok UI date range is "${currentTikTokDate.label}".\n` +
+        `Cost cell reflects that range, not today's spend, so dividing would mislead.\n` +
+        `Switch TikTok UI date picker to Today for live ROAS.\n` +
+        (rev != null
+          ? `Adjust today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)}`
+          : `Adjust has no revenue for this row today yet.`);
+
+      lastTodayStats.pillsRenderedOffDate++;
+      lastTodayStats.skippedOffDate++;
+      if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
+      if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
+      commitTodayPill(nameEl, mainPill, todayPill, todayKey);
+      return;
+    }
+
+    const spendText = findCostCellText(nameEl);
+    let spend = null;
+    let ttCcy = null;
+    if (spendText != null) {
+      const parsed = parseCurrencyCell(spendText);
+      if (parsed.abbreviated) {
+        lastTodayStats.skippedAbbreviated++;
+      } else if (parsed.parsed && parsed.value != null) {
+        spend = parsed.value;
+        ttCcy = parsed.currency;
+      }
+    } else {
+      lastTodayStats.skippedNoCostCell++;
+    }
+
+    if (lastTodayStats.sampleSpend == null && spend != null) lastTodayStats.sampleSpend = spend;
+    if (lastTodayStats.detectedTikTokCurrency == null && ttCcy) lastTodayStats.detectedTikTokCurrency = ttCcy;
+    if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
+    if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
+
+    const currencyMismatch = ttCcy && adjCcy && ttCcy !== adjCcy;
+
+    const todayKey = `${mainKey}|rev:${rev}|spend:${spend}|t:${ttCcy || ''}|a:${adjCcy || ''}|mm:${currencyMismatch}`;
+    if (decoratedTodayKey.get(nameEl) === todayKey) return;
+
+    const todayPill = document.createElement('span');
+
+    if (currencyMismatch) {
+      todayPill.className = TODAY_PILL_CLASS_MISMATCH;
+      todayPill.textContent = `Today: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)} (${adjCcy}→${ttCcy})`;
+      todayPill.title =
+        `Today ROAS unavailable — cross-currency.\n` +
+        `Adjust app revenue (${adjCcy}): ${formatMoneyOrDash(rev)}\n` +
+        `TikTok ad-account spend (${ttCcy}): ${formatMoneyOrDash(spend)}\n` +
+        `Refusing to divide across currencies (would mislead).`;
+      lastTodayStats.skippedCurrencyMismatch++;
+    } else {
+      todayPill.className = TODAY_PILL_CLASS_NORMAL;
+      todayPill.appendChild(document.createTextNode(
+        `Today: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`
+      ));
+      if (rev != null && spend != null && spend > 0) {
+        const roas = rev / spend;
+        todayPill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
+        todayPill.appendChild(valSpan);
+      }
+      todayPill.title = formatTodayTooltip(rev, spend, ttCcy || adjCcy || '?', adjCcy, data);
+      lastTodayStats.pillsRendered++;
+    }
+
+    commitTodayPill(nameEl, mainPill, todayPill, todayKey);
+  }
+
+  // Final commit step shared by both render branches: drop any stale pill,
+  // apply position-fixed styling, position once on the current frame, attach
+  // to body, register in the tracking Maps, invalidate the rAF early-exit
+  // (so the next frame re-syncs the new pill with the cell's current rect),
+  // and arm the loop. Centralized so neither branch can drift on style/dedup
+  // bookkeeping.
+  function commitTodayPill(nameEl, mainPill, todayPill, todayKey) {
+    const stale = cellToTodayPill.get(nameEl);
+    if (stale) { stale.remove(); cellToTodayPill.delete(nameEl); }
+    todayPill.style.position = 'fixed';
+    todayPill.style.zIndex = '99999';
+    todayPill.style.margin = '0';
+    positionTodayPillToCell(nameEl, mainPill, todayPill);
+    document.body.appendChild(todayPill);
+    cellToTodayPill.set(nameEl, todayPill);
+    decoratedTodayKey.set(nameEl, todayKey);
+    // The rAF early-exit prefilter only tracks the main pill's cell rect; a
+    // newly-created today pill would otherwise sit at its initial position
+    // until the row moved. Drop the prefilter cache so the next frame runs
+    // the full positioning path once and re-records the prev state.
+    lastPositioned.delete(nameEl);
+    ensureRepositionLoop();
+  }
+
+  // Position the today pill to the right of the main pill. Both pills are
+  // position:fixed children of body. We DELIBERATELY avoid
+  // `mainPill.getBoundingClientRect()` here: repositionLoopTick writes the
+  // main pill's style.left/top immediately before calling this fn, so a rect
+  // read would force a synchronous layout flush per visible row per scroll
+  // frame. Instead we anchor off the main pill's left from `lastPositioned`
+  // (same source positionPillToCell wrote to) plus the pill's width cached
+  // on the element at creation. Fallback path (no cached entry yet) anchors
+  // past the column right; the next rAF tick tightens placement once both
+  // caches are populated.
+  function positionTodayPillToCell(cell, mainPill, todayPill) {
+    const cr = cell.getBoundingClientRect();
+    const offscreen = cr.width === 0 || cr.height === 0
+      || cr.bottom < 0 || cr.top > window.innerHeight;
+    if (offscreen) {
+      todayPill.style.display = 'none';
+      return;
+    }
+    const cached = lastPositioned.get(cell);
+    let mainWidth = mainPill._aoxWidth || 0;
+    // Lazy re-measure if the creation-time read returned 0 (shouldn't happen
+    // with the off-screen park, but be defensive — e.g. if CSS animations
+    // were mid-flight on creation). Costs one layout flush per pill once.
+    if (mainWidth === 0 && mainPill.isConnected) {
+      mainWidth = mainPill.offsetWidth;
+      if (mainWidth > 0) mainPill._aoxWidth = mainWidth;
+    }
+    let leftAnchor;
+    if (cached && !cached.hidden && mainWidth > 0) {
+      leftAnchor = cached.left + mainWidth + 4;
+    } else {
+      const column = getColumnAncestor(cell);
+      const colRight = column ? column.getBoundingClientRect().right : cr.right;
+      leftAnchor = colRight + 110;
+    }
+    todayPill.style.display = '';
+    todayPill.style.left = Math.round(leftAnchor) + 'px';
+    todayPill.style.top = Math.round(cr.top + (cr.height / 2) - 9) + 'px';
+  }
+
   function logDomDiagnostics() {
     const candidates = pickNameCandidates();
     const usedSelector = candidates.length > 0
@@ -501,6 +1145,7 @@
       sampleAdKeys:       pickSampleKeys(adIndex,       firstUnmatchedSample),
       lastDecoratePass: { ...lastDecorateStats },
       bridgeProbe,
+      today: { ...lastTodayStats },
     });
   }
 
@@ -539,18 +1184,31 @@
     lastDecorateStats.matched++;
 
     if (decoratedKey.get(el) === key) {
-      // Same cell + same content — the rAF loop is already (or about to be)
-      // tracking this pill's position; nothing else to do.
+      // Same cell + same content — main pill is up to date. Today pill has
+      // its own independent dedup map (decoratedTodayKey) and MUST still be
+      // attempted: column header may not have been visible on the first pass,
+      // or the date filter may have flipped. The rAF loop is already (or
+      // about to be) tracking pill positions; nothing else to do for main.
+      const existingPill = cellToPill.get(el);
+      if (existingPill) maybeRenderTodayPill(el, existingPill, data, key);
       ensureRepositionLoop();
       return;
     }
 
     // Cell got reassigned to a different campaign (virtualization recycle):
-    // drop the old pill before creating a fresh one.
+    // drop the old pills before creating fresh ones. Today pill is tracked
+    // separately and must also be dropped or it would orphan once cellToPill
+    // is rekeyed.
     const stale = cellToPill.get(el);
     if (stale) {
       stale.remove();
       cellToPill.delete(el);
+    }
+    const staleToday = cellToTodayPill.get(el);
+    if (staleToday) {
+      staleToday.remove();
+      cellToTodayPill.delete(el);
+      decoratedTodayKey.delete(el);
     }
 
     const pill = document.createElement('span');
@@ -566,18 +1224,29 @@
     pill.style.position = 'fixed';
     pill.style.zIndex = '99999';
     pill.style.margin = '0';
-    // Position the pill immediately rather than waiting for the rAF loop's
-    // first frame. Previously we used display:none + relied on the loop to
-    // reveal the pill, but on cache refresh (period change) the loop's
-    // rafLoopActive flag could already be true from a prior tick that had
-    // since drained without rescheduling, leaving newly-created pills stuck
-    // hidden with `left/top: auto`. Painting on creation makes the pill
-    // visible regardless of rAF state; the loop still runs to follow scroll.
-    positionPillToCell(el, pill);
+    // Park the pill off-screen (still display:'') BEFORE appending so we can
+    // measure its rendered width without a layout flicker. If we let
+    // positionPillToCell run first, a cell that's currently offscreen would
+    // apply `display:none` — and offsetWidth on a display:none element is 0,
+    // making the cached width useless and causing the today pill to overlap
+    // the main pill when the row later scrolls into view. The off-screen
+    // park + measure + reposition sequence guarantees a non-zero width
+    // regardless of cell visibility at creation time.
+    pill.style.left = '-99999px';
+    pill.style.top = '0';
     document.body.appendChild(pill);
+    pill._aoxWidth = pill.offsetWidth;
+    positionPillToCell(el, pill);
 
     cellToPill.set(el, pill);
     decoratedKey.set(el, key);
+
+    // Today pill is a SEPARATE position:fixed sibling tracked in
+    // cellToTodayPill. ALWAYS attempt; its own decoratedTodayKey WeakMap
+    // dedups so repeated calls are cheap. Failure paths bump lastTodayStats
+    // counters but never throw.
+    maybeRenderTodayPill(el, pill, data, key);
+
     ensureRepositionLoop();
   }
 
@@ -652,24 +1321,32 @@
         pill.remove();
         cellToPill.delete(cell);
         lastPositioned.delete(cell);
+        // Today pill is keyed by the same cell; cleanup must mirror main pill
+        // or it would leak orphaned floating pills as TikTok virtualizes rows.
+        const todayPill = cellToTodayPill.get(cell);
+        if (todayPill) {
+          todayPill.remove();
+          cellToTodayPill.delete(cell);
+          decoratedTodayKey.delete(cell);
+        }
         continue;
       }
       // Cheap prefilter using the cell's own rect: if vertical position and
       // visibility match what we last wrote, the pill is already correct.
-      // We don't need to walk ancestors here — positionPillToCell does the
-      // column-anchored layout (the slow path) only when this cheap check
-      // says something moved. This used to compute `r.right + 6` for the
-      // comparison while the actual write used `colRight + 6`, so the early
-      // exit never fired and every frame did the full ancestor walk.
+      // commitTodayPill deletes the lastPositioned entry whenever a new
+      // today pill is attached, so this exit also fires only AFTER the
+      // today pill has been synced to the row.
       const r = cell.getBoundingClientRect();
       const offscreen = r.width === 0 || r.height === 0
         || r.bottom < 0 || r.top > window.innerHeight;
       const top = Math.round(r.top + (r.height / 2) - 9);
       const prev = lastPositioned.get(cell);
       if (prev && prev.top === top && prev.hidden === offscreen && prev.cellRight === r.right) {
-        continue; // nothing changed for this pill
+        continue;
       }
       positionPillToCell(cell, pill);
+      const todayPill = cellToTodayPill.get(cell);
+      if (todayPill) positionTodayPillToCell(cell, pill, todayPill);
     }
 
     if (cellToPill.size > 0) {
@@ -924,20 +1601,74 @@
 
   function buildBannerText() {
     const ageMin = Math.round((Date.now() - lastSyncAt) / 60000);
-    return `Adjust [TikTok]: ${campaignIndex.size} campaigns / ${adsetIndex.size} ad sets / ${adIndex.size} ads · synced ${ageMin}m ago · ${sourceLabel}`;
+    const base = `Adjust [TikTok]: ${campaignIndex.size} campaigns / ${adsetIndex.size} ad sets / ${adIndex.size} ads · synced ${ageMin}m ago · ${sourceLabel}`;
+    const lines = [base];
+    // Today-pill banner lines (at most one). Priority: column-missing wins
+    // over off-date wins over currency-mismatch wins over abbreviation. Each
+    // higher-priority condition gates EVERY row, so surfacing it first avoids
+    // the user fixing a per-row issue while a global block still hides pills.
+    const t = lastTodayStats;
+    if (!t.columnFound) {
+      lines.push(`⚠ Today ROAS disabled — enable "Cost" column in this TikTok view.`);
+    } else if (t.ttDateIsToday === false) {
+      const label = t.ttDateLabel || 'unknown';
+      lines.push(`⚠ Today ROAS not computed — TikTok UI date range is "${label}". Switch to Today for live ROAS.`);
+    } else if (t.skippedCurrencyMismatch > 0 && t.pillsRendered === 0) {
+      const adj = t.adjustCurrencyExample || '?';
+      const tt = t.detectedTikTokCurrency || '?';
+      lines.push(`⚠ Today ROAS unavailable — Adjust app currency (${adj}) ≠ TikTok ad-account currency (${tt}).`);
+    } else if (t.skippedAbbreviated > 0 && t.pillsRendered === 0) {
+      lines.push(`⚠ Today ROAS disabled — disable TikTok's number abbreviation to read cost cells.`);
+    }
+    return lines.join('\n');
   }
 
   function decorateAllVisibleRows() {
     lastDecorateStats = { candidates: 0, matched: 0, resolvedByName: 0, resolvedByBridgeId: 0, stillAmbiguous: 0 };
+    lastTodayStats = createEmptyTodayStats();
+    rowYBuckets = null;
+    // Locate the Cost column + detect TikTok UI date filter once per pass.
+    // Today-pill rendering is skipped when the column isn't visible (banner
+    // surfaces guidance). Off-date → rev-only warn variant.
+    currentCostColumn = locateCostColumn();
+    if (currentCostColumn) {
+      lastTodayStats.columnFound = true;
+      lastTodayStats.columnX = Math.round(currentCostColumn.headerX);
+      lastTodayStats.columnHeaderText = currentCostColumn.headerText;
+    }
+    currentTikTokDate = detectTikTokDateInfo();
+    lastTodayStats.ttDateIsToday = currentTikTokDate.isToday;
+    lastTodayStats.ttDateLabel = currentTikTokDate.label;
+    lastTodayStats.ttDateSource = currentTikTokDate.source;
+
     dispatchBridgeScan();
     pickNameCandidates().forEach(decorateCandidate);
+
+    rowYBuckets = null; // release; rects go stale on next mutation anyway
+    currentCostColumn = null;
+    currentTikTokDate = null;
+
+    // Re-render banner after every pass so it reflects the CURRENT pass
+    // stats — not stale stats from loadData's initial showBanner call (which
+    // ran before column lookup). Severity: warn if any guidance line was
+    // appended, else ok.
+    if (lastSyncAt) {
+      const text = buildBannerText();
+      const hasWarn = text.includes('\n⚠');
+      showBanner(text, hasWarn ? 'warn' : 'ok');
+    }
   }
 
   function removeAllPills() {
     for (const [cell, pill] of cellToPill) pill.remove();
     cellToPill.clear();
+    for (const [cell, pill] of cellToTodayPill) pill.remove();
+    cellToTodayPill.clear();
     document.querySelectorAll('.adjust-pill').forEach(p => p.remove());
-    pickNameCandidates().forEach(el => decoratedKey.delete(el));
+    pickNameCandidates().forEach(el => {
+      decoratedKey.delete(el);
+      decoratedTodayKey.delete(el);
+    });
   }
 
   function scheduleDecorate() {
