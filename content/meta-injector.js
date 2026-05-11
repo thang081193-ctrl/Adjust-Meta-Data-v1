@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.4.2-F-bridge';
+  const INJECTOR_VERSION = 'v0.4.11-today-nearest-currency';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -98,6 +98,9 @@
   // dataset/class/attribute changes), so React's reconciler is unaffected.
   // Entries auto-evict when Meta removes the node from the DOM.
   const decoratedKey = new WeakMap();
+  // Parallel WeakMap for the today pill (sibling next to the main pill). Kept
+  // separate so today-pill churn does not invalidate the main pill's dedup.
+  const decoratedTodayKey = new WeakMap();
 
   // Row-Y bucket index, valid only inside one decorateAllVisibleRows() pass.
   // Built lazily on first ambiguous lookup, cleared at the end of the pass.
@@ -122,6 +125,28 @@
     resolvedByDom: 0,
     stillAmbiguous: 0,
   };
+
+  // Today-pill stats for the last decorate pass. Used by buildBannerText to
+  // surface column-missing / currency-mismatch issues, and by diagnostics.
+  let lastTodayStats = {
+    columnFound: false,
+    columnHeaderText: null,
+    columnX: null,
+    pillsRendered: 0,
+    skippedNoSpendCell: 0,
+    skippedZeroSpend: 0,
+    skippedCurrencyMismatch: 0,
+    skippedNoAdjustData: 0,
+    skippedAmbiguous: 0,
+    skippedAbbreviated: 0,
+    sampleSpend: null,
+    sampleRevToday: null,
+    detectedMetaCurrency: null,
+    adjustCurrencyExample: null,
+    sampleRowCandidates: null,
+  };
+  // Per-pass cache: { childIndex, headerX, panelRoot, headerEl } or null.
+  let currentSpendColumn = null;
 
   // Meta preloads campaign/ad structure as JSON inside <script> tags BEFORE
   // rendering the table — specifically `campaign_structure_tree` payloads,
@@ -178,6 +203,13 @@
       adByIdIndex = adBuilt.byAdId;
       lastSyncAt = cached.lastSyncAt;
       sourceLabel = cached.sourceLabel;
+
+      // Post-build: attach revenueToday + adjustCurrency onto each index entry
+      // by summing the per-row `revenueToday` field that data-source.js merged
+      // in. Kept as a separate pass so we never modify the signatures of the
+      // existing buildDirectIndex / buildAdIndex / buildAggregatedIndex /
+      // aggregateRoas functions — diff stays additive.
+      attachTodayMetrics(campaignRows, adRows);
 
       // Push the freshly-built id sets to the page-world bridge so it knows
       // which digit strings to look for on subsequent row scans.
@@ -379,6 +411,429 @@
     };
   }
 
+  // ============================================================
+  // Today pill — Meta UI spend × Adjust today revenue
+  // ============================================================
+  //
+  // Adds a SECOND pill (sibling of the main pill) showing realtime ROAS for
+  // today: numerator = Adjust gross revenue today (all cohorts), denominator
+  // = the row's "Amount spent" cell read directly from Meta Ads Manager. The
+  // existing D0/3d/7d/All pill is untouched.
+  //
+  // Why split numerator/denominator across sources:
+  //   - Meta UI shows realtime spend (single source of truth, no MMP lag).
+  //   - Adjust knows revenue from purchase events; Meta's reported revenue
+  //     is the very signal this whole extension was built to bypass.
+  //
+  // Safety: spend reading is pure textContent of Meta's existing cells (no
+  // attribute writes, no event dispatch, no React-prop walk — that's why we
+  // don't go through page-bridge here). Currency parsing is read-only.
+
+  // Header text Meta uses for the "Amount spent" column across locales.
+  // Keys are canonicalKey'd at construction. Add more locales as users
+  // surface them — failure is graceful (column-missing banner) rather than
+  // silent miscoluming.
+  const SPEND_HEADER_KEYS = new Set([
+    canonicalKey('Amount spent'),
+    canonicalKey('Số tiền đã chi'),
+    canonicalKey('Số tiền đã tiêu'),
+    canonicalKey('Montant dépensé'),
+    canonicalKey('Importe gastado'),
+    canonicalKey('Betrag ausgegeben'),
+    canonicalKey('Importo speso'),
+    canonicalKey('Bedrag besteed'),
+  ]);
+
+  // Currencies with no fractional unit. Symbol detection uses these to decide
+  // whether trailing `.` / `,` is decimal or thousands grouping.
+  const ZERO_DECIMAL_CURRENCIES = new Set(['VND', 'JPY', 'KRW', 'IDR', 'CLP']);
+
+  // Currency symbol → ISO code. Used when the cell carries only a symbol.
+  const SYMBOL_TO_ISO = {
+    '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₫': 'VND',
+    '₹': 'INR', '₩': 'KRW', '฿': 'THB', '₱': 'PHP', '₪': 'ILS',
+    '₺': 'TRY', '₽': 'RUB',
+  };
+
+  // Aggregate revenueToday + adjustCurrency from the merged rows onto each
+  // index entry that decorate-time lookups will return. Mirrors how each
+  // index keys its rows in buildDirectIndex / buildAdIndex / buildAggregatedIndex,
+  // so the same rows route to the same entries — no re-indexing.
+  //
+  // CRITICAL: buildAdIndex shares the SAME entry object across byName /
+  // byComposite / byAdId for non-collision ads. Naive multi-index bumping
+  // would triple-count the same row's revenue onto the same object. We
+  // guard with a per-row `visited` WeakSet so each unique entry object is
+  // bumped at most once per row. (buildAggregatedIndex constructs distinct
+  // objects per index so the guard is a no-op for adsets — harmless.)
+  function attachTodayMetrics(campaignRows, adRows) {
+    for (const r of campaignRows) {
+      if (!r.campaignName) continue;
+      bumpToday(campaignIndex, canonicalKey(r.campaignName), r, new WeakSet());
+    }
+    for (const r of adRows) {
+      const visited = new WeakSet();
+      if (r.adsetName) {
+        const ak = canonicalKey(r.adsetName);
+        bumpToday(adsetIndex, ak, r, visited);
+        if (r.campaignId) bumpToday(adsetCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+        if (r.adsetId) bumpToday(adsetByIdIndex, String(r.adsetId), r, visited);
+      }
+      if (r.adName) {
+        const ak = canonicalKey(r.adName);
+        bumpToday(adIndex, ak, r, visited);
+        if (r.campaignId) bumpToday(adCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+        if (r.adId) bumpToday(adByIdIndex, String(r.adId), r, visited);
+      }
+    }
+  }
+
+  function bumpToday(idx, key, row, visited) {
+    const e = idx.get(key);
+    if (!e) return;
+    if (visited.has(e)) return;
+    visited.add(e);
+    e.revenueToday = (e.revenueToday || 0) + (row.revenueToday || 0);
+    if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
+    e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
+  }
+
+  // Skip-tag list for full-DOM leaf scans. Same rationale as ensureRowYBuckets:
+  // SCRIPT/STYLE leaves carry source text that never renders; SVG-internal
+  // nodes have rects but never display row data.
+  const HEADER_SCAN_SKIP_TAGS = new Set([
+    'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE',
+    'META', 'LINK', 'TITLE', 'HEAD',
+    'SVG', 'PATH', 'CIRCLE', 'RECT', 'POLYGON', 'G', 'DEFS', 'USE',
+  ]);
+
+  // Locate the Meta "Amount spent" header cell once per decorate pass.
+  // Returns { headerEl, headerX } on success, null otherwise. The header X
+  // mid-pixel is the column anchor used to find each row's spend cell.
+  //
+  // We deliberately match on header TEXT rather than column index because
+  // Meta's table is split into a frozen-left and scrollable-right panel
+  // whose DOM trees aren't siblings; child-indexed walks across that split
+  // are brittle. The Y-bucket lookup the existing injector already uses
+  // gracefully handles cross-panel cells via shared Y, and X-matching the
+  // column gives the right cell in the right panel.
+  //
+  // Scan scope: every leaf element, not just `div.ellipsis`. Header text is
+  // short and doesn't need truncation, so Meta renders it WITHOUT the
+  // ellipsis utility class — the data-cell selector misses it. Same scan
+  // pattern ensureRowYBuckets uses (full leaf walk minus skip tags).
+  function locateAmountSpentColumn() {
+    let bestHeader = null;
+    let bestY = Infinity;
+    for (const el of document.querySelectorAll('*')) {
+      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
+      if (el.children.length > 0) continue; // leaf only
+      const raw = el.textContent || '';
+      if (!raw || raw.length > 60) continue; // headers are short
+      const k = canonicalKey(raw);
+      let matched = SPEND_HEADER_KEYS.has(k);
+      if (!matched && raw.match(/[.…]+$/)) {
+        // Header may be truncated at narrow column widths ("Amount sp…").
+        const prefix = k.replace(/[.…\s]+$/, '');
+        if (prefix.length >= 6) {
+          for (const hk of SPEND_HEADER_KEYS) {
+            if (hk.startsWith(prefix)) { matched = true; break; }
+          }
+        }
+      }
+      if (!matched) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height === 0 || r.top < 0) continue;
+      // Header rows sit at the top of the table; pick the topmost match.
+      if (r.top < bestY) { bestY = r.top; bestHeader = el; }
+    }
+    if (!bestHeader) return null;
+    // Walk up from the text leaf to find the column header CELL container.
+    // The text leaf alone may be narrow (e.g. "Amount spent" text is left-
+    // aligned in a wider cell). The cell container's X range is what
+    // matters for matching data cells (which may be right-aligned numbers
+    // in the same column). Heuristic: prefer the widest ancestor under
+    // ~400px wide and ~80px tall, within a few levels up.
+    let cellAncestor = bestHeader;
+    let cellRect = bestHeader.getBoundingClientRect();
+    let node = bestHeader.parentElement;
+    for (let i = 0; i < 5 && node && node !== document.body; i++, node = node.parentElement) {
+      const r = node.getBoundingClientRect();
+      if (r.height === 0) continue;
+      if (r.height > 80) break;
+      if (r.width > 400) break;
+      if (r.width > cellRect.width) {
+        cellAncestor = node;
+        cellRect = r;
+      }
+    }
+    return {
+      headerEl: cellAncestor,
+      headerLeft: cellRect.left,
+      headerRight: cellRect.right,
+      headerX: (cellRect.left + cellRect.right) / 2,
+      headerWidth: cellRect.width,
+      headerText: (bestHeader.textContent || '').trim().slice(0, 40),
+    };
+  }
+
+  // Read this row's spend cell text. Returns the raw text (caller parses).
+  // Strategy: among same-row Y-bucket cells whose text passes the currency
+  // filter, pick the one whose X mid is NEAREST to the column header's X.
+  // No threshold — the closest currency cell to the Amount-spent column
+  // header IS the spend cell by definition. Threshold-based filters proved
+  // too fragile across header/data alignment differences and column-walk-up
+  // ambiguity.
+  function findSpendCellText(nameEl) {
+    if (!currentSpendColumn) return null;
+    const rowRange = getRowYRange(nameEl);
+    const buckets = ensureRowYBuckets();
+    const rowMid = (rowRange.top + rowRange.bottom) / 2;
+    const rowMidKey = Math.round(rowMid / ROW_BUCKET_PX);
+    const halfHeight = (rowRange.bottom - rowRange.top) / 2;
+    const bucketSpan = Math.max(1, Math.ceil(halfHeight / ROW_BUCKET_PX));
+
+    const headerX = currentSpendColumn.headerX;
+
+    let best = null;
+    let bestDist = Infinity;
+    const candidatesForDiag = [];
+    for (let dk = -bucketSpan; dk <= bucketSpan; dk++) {
+      const bucket = buckets.get(rowMidKey + dk);
+      if (!bucket) continue;
+      for (const el of bucket) {
+        if (el === nameEl) continue;
+        const r = el.getBoundingClientRect();
+        if (r.height === 0 || r.width === 0) continue;
+        const mid = (r.top + r.bottom) / 2;
+        if (mid < rowRange.top || mid > rowRange.bottom) continue;
+        const txt = (el.textContent || '').trim();
+        if (!txt) continue;
+        if (!looksLikeCurrency(txt)) continue;
+        const cellMidX = (r.left + r.right) / 2;
+        const dist = Math.abs(cellMidX - headerX);
+        // Capture the first row's same-row candidates so logDomDiagnostics
+        // can dump them. Helps diagnose "spend never reads" without DOM
+        // round-tripping.
+        if (lastTodayStats.sampleRowCandidates == null) {
+          candidatesForDiag.push({ x: Math.round(cellMidX), text: txt.slice(0, 30), dist: Math.round(dist) });
+        }
+        if (dist < bestDist) { best = txt; bestDist = dist; }
+      }
+    }
+    if (lastTodayStats.sampleRowCandidates == null && candidatesForDiag.length > 0) {
+      lastTodayStats.sampleRowCandidates = candidatesForDiag.sort((a, b) => a.x - b.x).slice(0, 12);
+    }
+    return best;
+  }
+
+  // Plausibility test: does this cell text look like a money value? Loose by
+  // design — final parsing happens in parseCurrencyCell.
+  function looksLikeCurrency(txt) {
+    if (/^[–—-]$/.test(txt)) return true; // em-dash empty cell
+    // Must contain a digit and either a currency symbol, ISO code, or
+    // thousands/decimal separator. Reject pure percent / pure integer < 4
+    // digits (likely a count column).
+    if (!/\d/.test(txt)) return false;
+    if (/%$/.test(txt)) return false;
+    if (/[\$€£¥₫₹₩฿₱₪₺₽]/.test(txt)) return true;
+    if (/\b(USD|EUR|GBP|JPY|VND|INR|KRW|THB|PHP|ILS|TRY|RUB|AUD|CAD|MXN|BRL|CHF|SEK|NOK|DKK|PLN|TWD|HKD|SGD|MYR|IDR|CNY|NZD)\b/i.test(txt)) return true;
+    // Bare number with thousands grouping or decimal — accept if it's wide
+    // enough to plausibly be money rather than a count.
+    if (/\d[.,]\d/.test(txt) && txt.length >= 4) return true;
+    return false;
+  }
+
+  // Parse Meta UI currency cell text. Returns { value, currency, parsed }:
+  //   value    — number, possibly negative, or null when not parseable.
+  //   currency — ISO 3-letter code (best-effort), or null if undetectable.
+  //   parsed   — false for abbreviations ($1.2K), empty/dash cells, or
+  //              unsupported numeral systems. Caller must handle.
+  //
+  // Format support:
+  //   US-style "$1,234.56" "$0.05" — comma thousands, dot decimal.
+  //   EU-style "1.234,56 €" "€ 1.234,56" — dot thousands, comma decimal.
+  //   No-decimal "1.234.567 ₫" "¥1,234" — every separator is thousands.
+  //   Negative "-$1.23" "($1.23)" "−$1.23" (U+2212).
+  //   ISO suffix "1,234.56 USD" "1.234,56 EUR".
+  function parseCurrencyCell(text) {
+    if (!text) return { value: null, currency: null, parsed: false };
+    const trimmed = text.trim();
+    if (!trimmed || /^[–—-]$/.test(trimmed)) {
+      return { value: null, currency: null, parsed: false };
+    }
+    // Reject abbreviated values (K / M / B). Banner advises user to disable.
+    if (/\d[\s]?[KMB]\b/i.test(trimmed)) {
+      return { value: null, currency: null, parsed: false, abbreviated: true };
+    }
+    // Reject non-ASCII numeral systems for v1.
+    if (/[٠-٩۰-۹०-९]/.test(trimmed)) {
+      return { value: null, currency: null, parsed: false };
+    }
+
+    // Detect currency by symbol or ISO code, before stripping anything.
+    let currency = null;
+    for (const ch of trimmed) {
+      if (SYMBOL_TO_ISO[ch]) { currency = SYMBOL_TO_ISO[ch]; break; }
+    }
+    if (!currency) {
+      const iso = trimmed.match(/\b([A-Z]{3})\b/);
+      if (iso) currency = iso[1];
+    }
+
+    // Negativity: leading `-`, leading `−` (U+2212), or wrapped in parens.
+    let negative = false;
+    let cleaned = trimmed;
+    if (/^\(.*\)$/.test(cleaned)) { negative = true; cleaned = cleaned.slice(1, -1); }
+    if (/^[-−]/.test(cleaned)) { negative = true; cleaned = cleaned.replace(/^[-−]/, ''); }
+
+    // Strip currency symbols, ISO codes, whitespace (incl. NBSP / narrow NBSP).
+    cleaned = cleaned
+      .replace(/[\$€£¥₫₹₩฿₱₪₺₽]/g, '')
+      .replace(/\b[A-Z]{3}\b/g, '')
+      .replace(/[   \s]/g, '')
+      .trim();
+
+    if (!/^[\d.,]+$/.test(cleaned)) {
+      return { value: null, currency, parsed: false };
+    }
+
+    // Decide separator role. Zero-decimal currencies treat ALL separators as
+    // thousands. Otherwise: the rightmost separator is decimal if it's
+    // followed by exactly 1–2 digits AND there is no later separator.
+    const isZeroDecimal = currency && ZERO_DECIMAL_CURRENCIES.has(currency);
+    let numericStr;
+    if (isZeroDecimal) {
+      numericStr = cleaned.replace(/[.,]/g, '');
+    } else {
+      const lastDot = cleaned.lastIndexOf('.');
+      const lastComma = cleaned.lastIndexOf(',');
+      const lastSep = Math.max(lastDot, lastComma);
+      const decimalChar = lastSep === lastDot ? '.' : ',';
+      const fractionLen = lastSep >= 0 ? cleaned.length - lastSep - 1 : -1;
+      if (lastSep >= 0 && fractionLen >= 1 && fractionLen <= 2) {
+        // Treat lastSep as decimal point, every OTHER separator as thousands.
+        const intPart = cleaned.slice(0, lastSep).replace(/[.,]/g, '');
+        const fracPart = cleaned.slice(lastSep + 1);
+        numericStr = `${intPart}.${fracPart}`;
+      } else {
+        // No decimal — every separator is thousands.
+        numericStr = cleaned.replace(/[.,]/g, '');
+      }
+    }
+
+    const value = parseFloat(numericStr);
+    if (!Number.isFinite(value)) return { value: null, currency, parsed: false };
+    return { value: negative ? -value : value, currency, parsed: true };
+  }
+
+  // Render the today pill next to the main pill. ALWAYS renders when the
+  // Amount-spent column is found and the row is not ambiguous — even when
+  // revenue or spend is missing/zero, the pill shows `rev/spend` so the user
+  // can SEE the pipeline state instead of guessing why nothing appeared.
+  // Skip cases that bump counters but don't render: ambiguous row, column
+  // missing, abbreviated cell (can't parse), currency mismatch.
+  function maybeRenderTodayPill(nameEl, mainPill, data, mainKey) {
+    if (!data || data.ambiguous) { lastTodayStats.skippedAmbiguous++; return; }
+    if (!currentSpendColumn) return; // banner handles user messaging
+
+    const rev = (data.revenueToday == null) ? null : data.revenueToday;
+
+    const spendText = findSpendCellText(nameEl);
+    let spend = null;
+    let metaCcy = null;
+    let spendUnreadable = false;
+    if (spendText != null) {
+      const parsed = parseCurrencyCell(spendText);
+      if (parsed.abbreviated) {
+        lastTodayStats.skippedAbbreviated++;
+        spendUnreadable = true;
+      } else if (parsed.parsed && parsed.value != null) {
+        spend = parsed.value;
+        metaCcy = parsed.currency;
+      } else {
+        spendUnreadable = true;
+      }
+    }
+
+    if (lastTodayStats.sampleSpend == null && spend != null) lastTodayStats.sampleSpend = spend;
+    if (lastTodayStats.detectedMetaCurrency == null && metaCcy) lastTodayStats.detectedMetaCurrency = metaCcy;
+    if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
+    const adjCcy = data.adjustCurrency;
+    if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
+    if (spend == null && !spendUnreadable && spendText == null) lastTodayStats.skippedNoSpendCell++;
+
+    const currencyMismatch = metaCcy && adjCcy && metaCcy !== adjCcy;
+
+    // Dedup key includes everything that drives render content.
+    const todayKey = `${mainKey}|rev:${rev}|spend:${spend}|m:${metaCcy || ''}|a:${adjCcy || ''}|mm:${currencyMismatch}`;
+    if (decoratedTodayKey.get(nameEl) === todayKey) return;
+
+    const possibleStale = mainPill.nextElementSibling;
+    if (possibleStale?.classList?.contains('adjust-pill-today') ||
+        possibleStale?.classList?.contains('adjust-pill-today-mismatch')) {
+      possibleStale.remove();
+    }
+
+    const todayPill = document.createElement('span');
+
+    if (currencyMismatch) {
+      todayPill.className = 'adjust-pill adjust-pill-today-mismatch';
+      todayPill.textContent = `Today: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)} (${adjCcy}→${metaCcy})`;
+      todayPill.title =
+        `Today ROAS unavailable — cross-currency.\n` +
+        `Adjust app revenue (${adjCcy}): ${formatMoneyOrDash(rev)}\n` +
+        `Meta ad-account spend (${metaCcy}): ${formatMoneyOrDash(spend)}\n` +
+        `Refusing to divide across currencies (would mislead).`;
+      lastTodayStats.skippedCurrencyMismatch++;
+    } else {
+      todayPill.className = 'adjust-pill adjust-pill-today';
+      todayPill.textContent = '';
+      todayPill.appendChild(document.createTextNode(
+        `Today: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`
+      ));
+      if (rev != null && spend != null && spend > 0) {
+        const roas = rev / spend;
+        todayPill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < 0.60) valSpan.className = 'adjust-rv-red';
+        else if (roas > 1.00) valSpan.className = 'adjust-rv-green';
+        todayPill.appendChild(valSpan);
+      }
+      todayPill.title = formatTodayTooltip(rev, spend, metaCcy || adjCcy || '?', adjCcy, data);
+      lastTodayStats.pillsRendered++;
+    }
+
+    mainPill.parentNode.insertBefore(todayPill, mainPill.nextSibling);
+    decoratedTodayKey.set(nameEl, todayKey);
+  }
+
+  function formatMoneyOrDash(n) {
+    if (n == null || !Number.isFinite(n)) return '–';
+    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function formatTodayTooltip(rev, spend, displayCcy, adjCcy, data) {
+    const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+    const lines = [
+      `Today realtime ROAS`,
+      `Rev (Adjust today${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoney(rev)}`,
+      `Spend (Meta UI${displayCcy ? `, ${displayCcy}` : ''}): ${formatMoney(spend)}`,
+    ];
+    if (ageMin != null) lines.push(`Adjust sync age: ${ageMin}m`);
+    if (!data.todayRowExisted) {
+      lines.push(`Note: no cohort data for this row (new today?)`);
+    }
+    return lines.join('\n');
+  }
+
+  function formatMoney(n) {
+    if (n == null || !Number.isFinite(n)) return '–';
+    // Two-decimal display; rounding happens here only.
+    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
   function logDomDiagnostics() {
     const candidates = document.querySelectorAll(NAME_CANDIDATE_SELECTOR);
     let firstMatch = null;
@@ -437,6 +892,7 @@
       urlScopedCampaignIds: scope ? [...scope] : null,
       lastDecoratePass: { ...lastDecorateStats },
       bridgeProbe,
+      today: { ...lastTodayStats },
     });
   }
 
@@ -497,28 +953,46 @@
       campaignIndex.get(key);
     if (!data) return;
 
-    // Already decorated for this exact key? Self-healing dedup via WeakMap:
-    // if Meta replaces el, its WeakMap entry auto-clears and we re-decorate.
-    if (decoratedKey.get(el) === key) return;
-
-    // Stale pill (key changed because the row was reused for another
-    // campaign) — remove the old one before adding the new.
-    const stalePill = el.nextElementSibling;
-    if (stalePill?.classList?.contains('adjust-pill')) {
-      stalePill.remove();
+    // Self-healing dedup via WeakMap: if Meta replaces el, its WeakMap entry
+    // auto-clears and we re-decorate. NOTE: today pill has an INDEPENDENT
+    // dedup map (decoratedTodayKey) and must be allowed to render/refresh
+    // on every pass even when the main pill is already current — column
+    // header may not have been visible on the first pass.
+    let pill;
+    const mainCurrent = decoratedKey.get(el) === key;
+    if (mainCurrent) {
+      // Reuse the existing main pill as the today-pill anchor. el.nextSibling
+      // is the main pill (today pill, if present, lives at pill.nextSibling).
+      const sibling = el.nextElementSibling;
+      if (sibling?.classList?.contains('adjust-pill') &&
+          !sibling.classList.contains('adjust-pill-today') &&
+          !sibling.classList.contains('adjust-pill-today-mismatch')) {
+        pill = sibling;
+      }
+    }
+    if (!pill) {
+      // First decoration for this key, or main pill was removed. Build fresh.
+      const stalePill = el.nextElementSibling;
+      if (stalePill?.classList?.contains('adjust-pill')) {
+        stalePill.remove();
+      }
+      pill = document.createElement('span');
+      if (data.ambiguous) {
+        pill.className = 'adjust-pill adjust-pill-ambiguous';
+        pill.title = formatAmbiguousTooltip(data);
+      } else {
+        pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
+        pill.title = formatTooltip(data);
+      }
+      fillPillSegments(pill, data.roas);
+      el.parentNode.insertBefore(pill, el.nextSibling);
+      decoratedKey.set(el, key);
     }
 
-    const pill = document.createElement('span');
-    if (data.ambiguous) {
-      pill.className = 'adjust-pill adjust-pill-ambiguous';
-      pill.title = formatAmbiguousTooltip(data);
-    } else {
-      pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
-      pill.title = formatTooltip(data);
-    }
-    fillPillSegments(pill, data.roas);
-    el.parentNode.insertBefore(pill, el.nextSibling);
-    decoratedKey.set(el, key);
+    // Today pill is a SEPARATE sibling inserted after the main pill. ALWAYS
+    // attempt; its own decoratedTodayKey WeakMap dedups so repeated calls
+    // are cheap. Failure paths bump lastTodayStats counters but never throw.
+    maybeRenderTodayPill(el, pill, data, key);
   }
 
   // Resolve an ambiguous index entry to a single (campaignId, name) match
@@ -1050,19 +1524,40 @@
     // Reset stats and Y-buckets at start of pass; the bucket index will be
     // built lazily on the first ambiguous lookup and reused for the rest.
     lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByAdjustId: 0, resolvedByMetaPreload: 0, resolvedByDom: 0, stillAmbiguous: 0 };
+    lastTodayStats = {
+      columnFound: false, columnHeaderText: null, columnX: null,
+      pillsRendered: 0, skippedNoSpendCell: 0, skippedZeroSpend: 0,
+      skippedCurrencyMismatch: 0, skippedNoAdjustData: 0,
+      skippedAmbiguous: 0, skippedAbbreviated: 0,
+      sampleSpend: null, sampleRevToday: null,
+      detectedMetaCurrency: null, adjustCurrencyExample: null,
+      sampleRowCandidates: null,
+    };
     rowYBuckets = null;
+    // Locate the Amount-spent column once per pass. Today-pill rendering is
+    // skipped if the column isn't visible.
+    currentSpendColumn = locateAmountSpentColumn();
+    if (currentSpendColumn) {
+      lastTodayStats.columnFound = true;
+      lastTodayStats.columnX = Math.round(currentSpendColumn.headerX);
+      lastTodayStats.columnHeaderText = currentSpendColumn.headerText;
+    }
     // Refresh the page-world bridge's row-id table so findEntryViaAdjustId
     // sees the current viewport. Synchronous: by the time dispatchEvent
     // returns, the bridge's listener has finished writing the data node.
     dispatchBridgeScan();
     document.querySelectorAll(NAME_CANDIDATE_SELECTOR).forEach(decorateCandidate);
     rowYBuckets = null; // release; rects go stale on next mutation anyway
+    currentSpendColumn = null;
 
-    // Surface unresolved-ambiguity in the banner so the user sees what to do.
-    // We only re-render the banner on a post-load decorate pass when the data
-    // is fresh; the loadData flow already set the banner once before us.
-    if (lastSyncAt && lastDecorateStats.stillAmbiguous > 0) {
-      showBanner(buildBannerText(), 'warn');
+    // Re-render banner after every pass so it reflects the CURRENT pass
+    // stats — not stale stats from loadData's initial showBanner call (which
+    // ran before this pass collected its real column-found / pillsRendered
+    // numbers). Severity: warn if any guidance line was appended, else ok.
+    if (lastSyncAt) {
+      const text = buildBannerText();
+      const hasWarn = text.includes('\n⚠');
+      showBanner(text, hasWarn ? 'warn' : 'ok');
     }
   }
 
@@ -1076,6 +1571,7 @@
     // any ellipsis div currently in the DOM.
     document.querySelectorAll(NAME_CANDIDATE_SELECTOR).forEach(el => {
       decoratedKey.delete(el);
+      decoratedTodayKey.delete(el);
     });
   }
 
@@ -1132,12 +1628,26 @@
   function buildBannerText() {
     const ageMin = Math.round((Date.now() - lastSyncAt) / 60000);
     const base = `Adjust data: ${campaignIndex.size} campaigns / ${adsetIndex.size} ad sets / ${adIndex.size} ads · synced ${ageMin}m ago · ${sourceLabel}`;
+    const lines = [base];
     const s = lastDecorateStats;
     if (s.stillAmbiguous > 0) {
       // Tell the user exactly what to enable so the per-row pill becomes accurate.
-      return `${base}\n⚠ ${s.stillAmbiguous} row(s) showing aggregate ROAS — enable "Campaign name" or "Campaign ID" column to disambiguate.`;
+      lines.push(`⚠ ${s.stillAmbiguous} row(s) showing aggregate ROAS — enable "Campaign name" or "Campaign ID" column to disambiguate.`);
     }
-    return base;
+    // Today-pill banner lines (at most one). Priority: column-missing wins
+    // over currency-mismatch wins over abbreviation, since column-missing
+    // affects EVERY row while the others are per-row.
+    const t = lastTodayStats;
+    if (!t.columnFound) {
+      lines.push(`⚠ Today ROAS disabled — enable "Amount spent" column in this Meta view.`);
+    } else if (t.skippedCurrencyMismatch > 0 && t.pillsRendered === 0) {
+      const adj = t.adjustCurrencyExample || '?';
+      const meta = t.detectedMetaCurrency || '?';
+      lines.push(`⚠ Today ROAS unavailable — Adjust app currency (${adj}) ≠ Meta ad-account currency (${meta}).`);
+    } else if (t.skippedAbbreviated > 0 && t.pillsRendered === 0) {
+      lines.push(`⚠ Today ROAS disabled — disable Meta's number abbreviation (e.g. $1.2K) to read spend cells.`);
+    }
+    return lines.join('\n');
   }
 
   // ---- Observer ----
