@@ -2,7 +2,8 @@
 // Adapter pattern. Today: pulls direct from Adjust API.
 // Later (when JM-AM exits soak): swap to JmAmDataSource without touching anything else.
 
-import { fetchCampaignROAS } from './adjust-client.js';
+import { fetchCampaignROAS, fetchTodayGrossRevenue } from './adjust-client.js';
+import { canonicalKey } from './matcher.js';
 
 /**
  * Common interface every data source must implement.
@@ -18,12 +19,27 @@ export class AdjustDirectDataSource {
   }
 
   async fetchAll() {
-    return fetchCampaignROAS({
-      apiToken: this.apiToken,
-      utcOffset: this.utcOffset,
-      datePeriod: this.datePeriod,
-      appTokens: this.appTokens,
-    });
+    // Parallel: existing cohort pipeline + new today-revenue pipeline. The
+    // today fetch is allowed to fail without taking down the cohort pills —
+    // the today pill simply won't render. This keeps the existing user
+    // experience intact if Adjust adds/changes the today endpoint shape.
+    const [cohortRows, todayRows] = await Promise.all([
+      fetchCampaignROAS({
+        apiToken: this.apiToken,
+        utcOffset: this.utcOffset,
+        datePeriod: this.datePeriod,
+        appTokens: this.appTokens,
+      }),
+      fetchTodayGrossRevenue({
+        apiToken: this.apiToken,
+        utcOffset: this.utcOffset,
+        appTokens: this.appTokens,
+      }).catch(err => {
+        console.warn('[Adjust Overlay] today-revenue fetch failed:', err.message);
+        return [];
+      }),
+    ]);
+    return mergeTodayInto(cohortRows, todayRows);
   }
 
   describe() {
@@ -31,6 +47,84 @@ export class AdjustDirectDataSource {
     // so there's nothing app-specific to identify the source by.
     return 'Adjust Reporting v2 (Meta + TikTok)';
   }
+}
+
+// Attach revenueToday + currency from todayRows onto matching cohortRows.
+// Match priority: Meta ID (campaign / adset / ad) when both sides carry it,
+// then canonical name as fallback. Today-only rows (ads that ran today but
+// have no cohort row in the cohort fetch's wider window) are appended with
+// roas fields = null — covers brand-new ads launched today.
+//
+// Output rows always carry: revenueToday (number, 0 if no match),
+// todayRowExisted (bool), adjustCurrency (string|null). Cache-shape addition
+// is backwards-compatible — readers that don't know about the new fields
+// behave exactly as before.
+function mergeTodayInto(cohortRows, todayRows) {
+  const idIndex = new Map();
+  const nameIndex = new Map();
+  for (const t of todayRows) {
+    const idKey = todayIdKey(t);
+    if (idKey) idIndex.set(idKey, t);
+    const nameKey = todayNameKey(t);
+    if (nameKey && !nameIndex.has(nameKey)) nameIndex.set(nameKey, t);
+  }
+
+  const matched = new Set();
+  const out = [];
+  for (const c of cohortRows) {
+    const idKey = todayIdKey(c);
+    const nameKey = todayNameKey(c);
+    const match = (idKey && idIndex.get(idKey)) || (nameKey && nameIndex.get(nameKey)) || null;
+    if (match) matched.add(match);
+    out.push({
+      ...c,
+      revenueToday: match?.revenueToday ?? 0,
+      todayRowExisted: !!match,
+      adjustCurrency: match?.currency ?? null,
+    });
+  }
+
+  // Today-only rows (no cohort counterpart): append with cohort fields nulled.
+  // matcher.js's canonicalKey is applied indirectly via todayNameKey, so the
+  // injector's index builders will still key these by their canonical names.
+  for (const t of todayRows) {
+    if (matched.has(t)) continue;
+    out.push({
+      level: t.level,
+      campaignName: t.campaignName,
+      adsetName: t.adsetName,
+      adName: t.adName,
+      campaignId: t.campaignId,
+      adsetId: t.adsetId,
+      adId: t.adId,
+      network: t.network,
+      cost: null,
+      cohortAllRevenue: null,
+      installs: null,
+      roas: { d0: null, d3: null, d7: null, allTime: null },
+      revenueToday: t.revenueToday ?? 0,
+      todayRowExisted: true,
+      adjustCurrency: t.currency || null,
+    });
+  }
+  return out;
+}
+
+function todayIdKey(row) {
+  if (row.level === 'ad' && row.adId) return `ad::${row.adId}`;
+  if (row.level === 'ad' && row.adsetId) return `adset::${row.adsetId}`;
+  if (row.campaignId) return `${row.level}::camp::${row.campaignId}::` +
+    `${canonicalKey(row.adName || row.adsetName || row.campaignName || '')}`;
+  return null;
+}
+
+function todayNameKey(row) {
+  if (row.level === 'campaign') return `campaign::${canonicalKey(row.campaignName || '')}`;
+  // ad-level row: key by ad name; adset is implicit. Name-only matches risk
+  // collisions for ads with duplicate names across campaigns — but in that
+  // case the ID-key path above already resolved the canonical one; this is
+  // a fallback only when ID is missing on both sides.
+  return `ad::${canonicalKey(row.adName || '')}`;
 }
 
 /**

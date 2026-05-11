@@ -31,6 +31,11 @@
 .adjust-pill .adjust-rv-red   { color: #d32f2f; font-weight: 800; }
 .adjust-pill .adjust-rv-green { color: #1b8a3a; font-weight: 800; }
 
+/* Today pill (separate sibling): Meta UI spend × Adjust today revenue. */
+.adjust-pill-today          { background: #eaf3ff; color: #0b3d8c; border-color: #b8d1ff; }
+.adjust-pill-today-mismatch { background: #fff3e0; color: #6a3a00; border-color: #ffd9a0; }
+.adjust-pill-today-mismatch::before { content: "⚠ "; }
+
 #adjust-overlay-banner {
   position: fixed;
   bottom: 16px;

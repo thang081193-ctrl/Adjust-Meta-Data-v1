@@ -152,6 +152,122 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
   return json.rows || [];
 }
 
+// Realtime "Today" revenue, event-date attribution (NOT cohort). Used by the
+// Today pill alongside the existing D0/3d/7d/All cohort pills. We ask Adjust
+// for `revenue` instead of `cohort_*_revenue` so the number includes every
+// purchase event fired today regardless of when the user installed — which is
+// the denominator-correct match for Meta's "Amount spent today".
+//
+// Separated from fetchCampaignROAS so the existing cohort pipeline is untouched
+// and a failure in this fetch degrades gracefully (caller catches and the
+// today pill simply doesn't render).
+//
+// VERIFICATION NOTE: response shape (rows[].revenue, rows[].currency) is the
+// documented Reporting v2 shape but specific account/app combinations may
+// return either a `currency` field or an `app_currency` field; parser below
+// accepts both. If a real account returns neither, currency-mismatch logic in
+// the injector falls back to symbol-only detection from the Meta UI cell.
+export async function fetchTodayGrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
+  const [campaignRows, adRows] = await Promise.all([
+    fetchTodayAtLevel({
+      apiToken, utcOffset, appTokens,
+      dimensions: 'channel,campaign_network',
+    }),
+    fetchTodayAtLevel({
+      apiToken, utcOffset, appTokens,
+      dimensions: 'channel,campaign_network,adgroup_network,creative_network',
+    }),
+  ]);
+  const out = [];
+  for (const row of campaignRows) out.push(toTodayRow(row, 'campaign'));
+  for (const row of adRows) out.push(toTodayRow(row, 'ad'));
+  return out;
+}
+
+async function fetchTodayAtLevel({ apiToken, utcOffset, dimensions, appTokens }) {
+  const params = new URLSearchParams({
+    format_dates: 'false',
+    full_data: 'true',
+    readable_names: 'false',
+    ad_spend_mode: 'network',
+    attribution_source: 'first',
+    attribution_type: 'all',
+    channel_id__in: NETWORK_CHANNEL_IDS.join(','),
+    date_period: 'today',
+    dimensions,
+    fingerprint_status: 'all',
+    include_attr_dependency: 'true',
+    digital_turbine_mode: 'digital_turbine',
+    ironsource_mode: 'ironsource',
+    limit: '10000',
+    // `revenue` (IAP event-date) + `ad_revenue` (IAA event-date). User's apps
+    // are IAA-style; Datascape's metric picker exposes a "Ad revenue (cohort)"
+    // column, confirming `ad_revenue` exists. toTodayRow sums whichever come
+    // back per row.
+    // Verified 2026-05-11:
+    //  - `revenue` returns rows:[] for IAA apps (IAP only).
+    //  - `currency` is not a valid metric ("Unsupported metric: currency").
+    //  - `all_revenue` also returns empty.
+    //  - `network_revenue` is not supported ("network event doesn't exist or
+    //    was renamed").
+    metrics: 'revenue,ad_revenue',
+    reattributed: 'all',
+    sandbox: 'false',
+    sdk_signature_enforcement_status: 'all',
+    sort: '-ad_revenue',
+    utc_offset: utcOffset,
+  });
+  if (appTokens) {
+    const cleaned = String(appTokens).trim();
+    if (cleaned) params.set('app_token__in', cleaned);
+  }
+
+  const res = await fetch(`${ADJUST_BASE}?${params}`, {
+    method: 'GET',
+    credentials: 'omit',
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      Accept: 'application/json',
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(
+      `Adjust today fetch failed: ${res.status} ${res.statusText}` +
+        (body ? ` — ${body.slice(0, 200)}` : '')
+    );
+  }
+  const json = await res.json();
+  return json.rows || [];
+}
+
+function toTodayRow(row, level) {
+  const dep = row.attr_dependency || {};
+  // Tolerate any revenue-named field Adjust returns. `all_revenue` is the
+  // intended event-date total; we also fall through to `network_revenue`
+  // (IAA-only) and `revenue` (IAP-only) in case the account's data shape
+  // differs. Sum when multiple are present so partial metric availability
+  // never silently drops data.
+  let revenueToday = 0;
+  let saw = false;
+  for (const key of ['all_revenue', 'network_revenue', 'ad_revenue', 'revenue']) {
+    const v = parseNum(row[key]);
+    if (v != null) { revenueToday += v; saw = true; }
+  }
+  return {
+    level,
+    campaignName: row.campaign_network,
+    adsetName: row.adgroup_network || null,
+    adName: row.creative_network || null,
+    campaignId: dep.campaign_id_network || null,
+    adsetId: dep.adgroup_id_network || null,
+    adId: dep.creative_id_network || null,
+    network: row.channel,
+    revenueToday: saw ? revenueToday : null,
+    currency: row.currency || row.app_currency || null,
+  };
+}
+
 function toRow(row, level) {
   const cost = parseNum(row.cost);
   const cohortAllRevenue = parseNum(row.cohort_all_revenue);
