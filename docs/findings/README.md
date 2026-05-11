@@ -21,7 +21,11 @@ To re-load these into a Claude Code session's memory on a new machine, copy the 
 
 ## Active follow-ups
 
-- [Today-pill Meta UI date detection — implemented, pending verification](project_today_pill_date_filter_followup.md) — Detection logic shipped 2026-05-11 in injector v0.5.0. Off-date renders dashed-amber warn pill with rev only. Awaits user test on real Meta accounts.
+- [TikTok Today data pill — handoff for next session](project_tiktok_today_pill_handoff.md) — Meta has Today pill working; TikTok doesn't yet. Today rev data already in cache. Needs column locator, spend-cell finder, fixed-position pill render, URL date detector. Last feature for parity.
+
+## Resolved
+
+- [Today-pill Meta UI date detection](project_today_pill_date_filter_followup.md) — Shipped 2026-05-11 in injector v0.5.1. Off-date renders dashed-amber warn pill. Verified on real Meta accounts.
 
 ## Diagnostics
 
