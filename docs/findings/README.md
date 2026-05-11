@@ -1,13 +1,25 @@
 # Findings
 
-Reusable observations about Meta Ads Manager / Adjust behavior that the codebase relies on. Each finding documents what was observed, why it matters, and how to apply it — so future work doesn't re-derive the same constraints from scratch.
+Reusable observations about Meta Ads Manager / Adjust behavior, plus collaboration preferences and active follow-ups, that the codebase and working style rely on. Each finding documents what was observed, why it matters, and how to apply it — so future work doesn't re-derive the same constraints from scratch.
 
 To re-load these into a Claude Code session's memory on a new machine, copy the contents into `~/.claude/projects/<project-hash>/memory/` and add a one-line pointer in that directory's `MEMORY.md`.
 
-## Index
+## Technical findings
 
 - [Meta only preloads visible columns](meta_column_preload.md) — Meta preload + React props only have campaign-id info for currently enabled columns; ambiguity needs Campaign name/ID column on.
+- [Reading the Meta "Amount spent" cell per row](meta_spend_column.md) — Column locator strategy (header text + walk-up to cell container), nearest-currency-neighbor spend reader, locale-aware currency parser, cross-currency refusal.
 - [Page-world bridge for reading React props](page_world_bridge.md) — Chrome ISOLATED-world content scripts cannot see `__reactProps`/`__reactFiber` expandos page JS attached to DOM elements; needs a second `world: "MAIN"` content script bridging via custom events.
+- [Adjust v2 IAA metric is `ad_revenue`](adjust_iaa_metric_name.md) — `network_revenue` / `all_revenue` rejected or silently empty; `revenue` covers IAP only. Request `metrics=revenue,ad_revenue` for IAA apps.
+
+## Collaboration preferences
+
+- [List reload steps, don't re-question them](feedback_skip_reload_steps.md) — Include reload/F5 in test plan; trust the user ran them, don't loop back.
+- [Always render pipeline-state UI](feedback_show_pipeline_state.md) — Show placeholders (`Today: –/0.76`) instead of hiding; hidden UI is indistinguishable from broken UI.
+- [Force-refresh popup after Adjust-fetch code changes](feedback_force_refresh_after_code_change.md) — 5-min cache survives extension reload; only Force-refresh button invalidates it.
+
+## Active follow-ups
+
+- [Today-pill needs Meta UI date filter detection](project_today_pill_date_filter_followup.md) — Spend cell reflects Meta UI's active period; pill only correct when Meta UI on Today. Detection from URL params not yet implemented.
 
 ## Diagnostics
 
