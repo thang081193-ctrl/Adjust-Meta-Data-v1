@@ -220,18 +220,10 @@
     return null;
   }
 
+  // Thin wrapper: shared/fetchColorThresholds is pure (returns new object);
+  // we own the local `colorThresholds` variable, so we assign the result here.
   async function loadColorThresholds() {
-    try {
-      const { colorThresholds: stored } = await chrome.storage.local.get('colorThresholds');
-      const t = stored?.tiktok;
-      if (t) {
-        colorThresholds = {
-          pause: typeof t.pause === 'number' ? t.pause : colorThresholds.pause,
-          red:   typeof t.red   === 'number' ? t.red   : colorThresholds.red,
-          green: typeof t.green === 'number' ? t.green : colorThresholds.green,
-        };
-      }
-    } catch { /* keep defaults */ }
+    colorThresholds = await fetchColorThresholds('tiktok', colorThresholds);
   }
 
   // ---- Sync data from background ----
@@ -875,14 +867,6 @@
     }
   }
 
-  function todayLocalIsoDate() {
-    const d = new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  }
-
   function formatMoneyOrDash(n) {
     if (n == null || !Number.isFinite(n)) return '–';
     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1216,7 +1200,7 @@
       pill.className = 'adjust-pill adjust-pill-ambiguous';
       pill.title = formatAmbiguousTooltip(data);
     } else {
-      pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
+      pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas, colorThresholds)}`;
       pill.title = formatTooltip(data);
     }
     fillPillSegments(pill, data.roas);
@@ -1415,17 +1399,6 @@
   }
 
   // ---- Pill helpers (kept compatible with content/meta-injector.css) ----
-  function classifyForColor(roas) {
-    // Whole-pill background only escalates to red when d7 is below the
-    // user-configured pause threshold (default 30% — "unacceptable"). For
-    // anything above that, the pill stays neutral and per-segment coloring
-    // (see fillPillSegments) carries the granular signal.
-    const primary = roas.d7 ?? roas.allTime;
-    if (primary == null) return 'unknown';
-    if (primary < colorThresholds.pause) return 'pause';
-    return 'hold';
-  }
-
   function pct(x) {
     return x == null ? '–' : `${(x * 100).toFixed(0)}%`;
   }
@@ -1488,116 +1461,8 @@
   }
 
   // ---- Banner ----
-  // Banner is a small draggable badge that toggles into a details panel on
-  // click. Position persists to localStorage so the user keeps it where they
-  // moved it. showBanner() only updates content + status color; the DOM and
-  // event wiring is built once on first call.
-  function showBanner(text, level) {
-    let banner = document.getElementById('adjust-overlay-banner');
-    if (!banner) banner = createBanner();
-    banner.classList.remove('adjust-banner-ok', 'adjust-banner-warn', 'adjust-banner-error');
-    banner.classList.add(`adjust-banner-${level}`);
-    const panel = banner.querySelector('.adjust-banner-panel');
-    if (panel) panel.textContent = text;
-    banner.title = text;
-  }
-
-  function createBanner() {
-    const banner = document.createElement('div');
-    banner.id = 'adjust-overlay-banner';
-    banner.classList.add('adjust-banner-collapsed');
-
-    const badge = document.createElement('span');
-    badge.className = 'adjust-banner-badge';
-    badge.textContent = 'A';
-
-    const panel = document.createElement('div');
-    panel.className = 'adjust-banner-panel';
-
-    const close = document.createElement('span');
-    close.className = 'adjust-banner-close';
-    close.textContent = '×';
-    close.title = 'Collapse';
-
-    banner.appendChild(badge);
-    banner.appendChild(panel);
-    banner.appendChild(close);
-
-    restoreBannerPosition(banner);
-    attachBannerInteractions(banner, close);
-    document.body.appendChild(banner);
-    return banner;
-  }
-
-  function restoreBannerPosition(banner) {
-    try {
-      const pos = JSON.parse(localStorage.getItem('adjust-banner-pos') || 'null');
-      if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
-        banner.style.left = pos.left + 'px';
-        banner.style.top = pos.top + 'px';
-        banner.style.right = 'auto';
-        banner.style.bottom = 'auto';
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Distinguish click vs drag via a 3px movement threshold. Below threshold
-  // → toggle expanded/collapsed. Above → reposition the banner and persist
-  // the new coordinates so reload restores them.
-  function attachBannerInteractions(banner, closeEl) {
-    let dragging = false;
-    let pendingClick = false;
-    let dragStartX = 0, dragStartY = 0, initialLeft = 0, initialTop = 0;
-
-    banner.addEventListener('mousedown', (e) => {
-      if (e.target === closeEl) {
-        banner.classList.remove('adjust-banner-expanded');
-        banner.classList.add('adjust-banner-collapsed');
-        e.stopPropagation();
-        return;
-      }
-      pendingClick = true;
-      dragging = false;
-      dragStartX = e.clientX;
-      dragStartY = e.clientY;
-      const rect = banner.getBoundingClientRect();
-      initialLeft = rect.left;
-      initialTop = rect.top;
-      e.preventDefault();
-
-      const onMove = (ev) => {
-        const dx = ev.clientX - dragStartX;
-        const dy = ev.clientY - dragStartY;
-        if (!dragging && Math.hypot(dx, dy) > 3) {
-          dragging = true;
-          pendingClick = false;
-        }
-        if (dragging) {
-          banner.style.left = Math.max(0, initialLeft + dx) + 'px';
-          banner.style.top = Math.max(0, initialTop + dy) + 'px';
-          banner.style.right = 'auto';
-          banner.style.bottom = 'auto';
-        }
-      };
-      const onUp = () => {
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-        if (dragging) {
-          const r = banner.getBoundingClientRect();
-          try {
-            localStorage.setItem('adjust-banner-pos', JSON.stringify({ left: r.left, top: r.top }));
-          } catch { /* ignore quota errors */ }
-        } else if (pendingClick) {
-          banner.classList.toggle('adjust-banner-expanded');
-          banner.classList.toggle('adjust-banner-collapsed');
-        }
-        pendingClick = false;
-        dragging = false;
-      };
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
-    });
-  }
+  // showBanner / createBanner / restoreBannerPosition / attachBannerInteractions
+  // are defined in content/shared.js (loaded before this file via manifest).
 
   function buildBannerText() {
     const ageMin = Math.round((Date.now() - lastSyncAt) / 60000);

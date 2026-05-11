@@ -42,7 +42,7 @@
       "matches": [
         "https://adsmanager.facebook.com/adsmanager/*"
       ],
-      "js": ["content/meta-injector.js"],
+      "js": ["content/shared.js", "content/meta-injector.js"],
       "css": ["content/meta-injector.css"],
       "run_at": "document_idle"
     },
@@ -58,7 +58,7 @@
       "matches": [
         "https://ads.tiktok.com/i18n/manage/*"
       ],
-      "js": ["content/tiktok-injector.js"],
+      "js": ["content/shared.js", "content/tiktok-injector.js"],
       "css": ["content/meta-injector.css"],
       "run_at": "document_idle"
     }
