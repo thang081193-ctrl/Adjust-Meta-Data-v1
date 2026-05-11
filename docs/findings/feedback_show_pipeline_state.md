@@ -12,7 +12,7 @@ When designing pills/widgets that show a computed metric (ROAS, ratio, %, etc.),
 
 **How to apply:**
 - For the Today pill specifically: render `Today: ${rev}/${spend}` always, even when one or both are `–`. Add the ROAS `(NN%)` only when both are present and spend > 0.
-- Counters in diagnostics still fire (`skippedZeroSpend`, `skippedNoAdjustData`) for debugging, but they no longer gate rendering.
+- Counters that USED to gate render (zero-spend / no-Adjust-data) are removed entirely — the render always proceeds and the missing side shows as `–`.
 - Only truly skip render when: ambiguous row (today not meaningful on aggregate), or the column locator failed (nothing to anchor against).
 - Currency mismatch is a special case — still render but show both numbers + the mismatch direction (`Today: 5.20/100,000 (USD→VND)`) so the user understands why the % is omitted.
 

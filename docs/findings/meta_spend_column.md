@@ -91,7 +91,7 @@ The column locator is O(N) over all `div.ellipsis` elements once per pass (~40â€
 `logDomDiagnostics()` now logs a `today` block on every pass with:
 
 - `columnFound`, `columnHeaderText`, `columnX`
-- `pillsRendered`, `skippedNoSpendCell`, `skippedZeroSpend`, `skippedCurrencyMismatch`, `skippedNoAdjustData`, `skippedAmbiguous`, `skippedAbbreviated`
+- `pillsRendered`, `skippedNoSpendCell`, `skippedCurrencyMismatch`, `skippedAmbiguous`, `skippedAbbreviated`
 - `sampleSpend`, `sampleRevToday`, `detectedMetaCurrency`, `adjustCurrencyExample`
 
 When triaging "Today pills don't appear": check `columnFound` first, then `skippedNoSpendCell` (the X-tolerance may be off on the user's layout) and `skippedCurrencyMismatch`.

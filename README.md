@@ -48,8 +48,6 @@ Thresholds are in `src/decision-engine.js` → `DEFAULT_THRESHOLDS`. Tune in cod
 
 `src/matcher.js` solves the "copy-paste from Adjust to Meta search returns nothing" bug. Adjust UI emits non-breaking spaces (U+00A0), en-dashes (U+2013), and zero-width chars. Meta search does exact substring match, so even one invisible char misses. The matcher normalizes both sides before comparing.
 
-`diagnoseHiddenChars()` exposes which traps a given string contains — useful for a "why didn't this match?" debug panel.
-
 ## Setup
 
 1. Get Adjust user token: Adjust dashboard → Account → Personal access tokens.
