@@ -98,6 +98,7 @@ When triaging "Today pills don't appear": check `columnFound` first, then `skipp
 
 ## Known limitations
 
+- **Meta UI date filter MUST be set to "Today" for the pill to be meaningful.** The spend cell value reflects whatever Meta date filter is currently active. If the user has Meta UI on "Yesterday" or "Last 7 days", the spend cell shows that period's spend, but the today-pill's numerator is always Adjust's TODAY revenue — dividing them produces a meaningless ratio. **Follow-up needed:** detect Meta UI date filter from URL params (`date_preset=today` or `date=YYYY-MM-DD_YYYY-MM-DD` matching today's date) and either (a) render the pill only when Meta filter = Today, or (b) render a warning variant when it's not (e.g. `⚠ Today rev: $X.XX (Meta UI on <date>, switch to Today for ROAS)`).
 - Cache TTL for today revenue is the same 5 min as cohort data. Users will see numerator update every 5 min while denominator updates every render. Tooltip surfaces `Adjust sync age` so the user can judge staleness. If lag bites, split the cache.
 - UTC boundary: `date_period=today` evaluates against the user's `utcOffset` setting; Meta's spend is in the ad-account timezone, which may differ. Around midnight in either zone, the pill can be briefly off. Document and live with it for v1.
 - Horizontal scroll inside the table: the column anchor X is captured per pass. If the user scrolls the table horizontally between MutationObserver ticks, the next decorate pass re-anchors — no caching across passes. Spurious silent reads remain unlikely but not impossible.
