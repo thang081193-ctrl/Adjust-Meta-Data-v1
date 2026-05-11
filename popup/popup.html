@@ -29,6 +29,13 @@
   details { margin-top: 8px; }
   textarea { width: 100%; height: 60px; font-family: ui-monospace, monospace; font-size: 11px; }
   label { font-size: 12px; }
+
+  .thresh-table { width: 100%; font-size: 12px; border-collapse: collapse; margin: 6px 0; }
+  .thresh-table th, .thresh-table td { padding: 3px 4px; text-align: left; }
+  .thresh-table th { font-weight: 600; color: #555; }
+  .thresh-table td:first-child { color: #555; }
+  .thresh-table input { width: 48px; padding: 2px 4px; font-size: 11px; }
+  .thresh-hint { font-size: 11px; color: #777; margin: 4px 0 8px; }
 </style>
 </head>
 <body>
@@ -80,6 +87,38 @@
       </label>
     </div>
     <button id="saveCfg">Save config</button>
+  </details>
+
+  <details>
+    <summary>Color thresholds</summary>
+    <div class="thresh-hint">
+      Pill background goes red only when d7 ROAS &lt; <em>Pill red</em>. Each
+      D-segment colors itself: &lt; <em>Value red</em> → red, &gt;
+      <em>Value green</em> → green. Values in %.
+    </div>
+    <table class="thresh-table">
+      <thead>
+        <tr><th></th><th>Meta %</th><th>TikTok %</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Pill red if d7 below</td>
+          <td><input id="metaPause" type="number" min="0" max="500" /></td>
+          <td><input id="tiktokPause" type="number" min="0" max="500" /></td>
+        </tr>
+        <tr>
+          <td>Value red below</td>
+          <td><input id="metaRed" type="number" min="0" max="500" /></td>
+          <td><input id="tiktokRed" type="number" min="0" max="500" /></td>
+        </tr>
+        <tr>
+          <td>Value green above</td>
+          <td><input id="metaGreen" type="number" min="0" max="500" /></td>
+          <td><input id="tiktokGreen" type="number" min="0" max="500" /></td>
+        </tr>
+      </tbody>
+    </table>
+    <button id="saveThresholds">Save thresholds</button>
   </details>
 
   <script src="popup.js" type="module"></script>

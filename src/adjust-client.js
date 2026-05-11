@@ -29,6 +29,10 @@ const ADJUST_BASE = 'https://automate.adjust.com/reports-service/report';
 const NETWORK_CHANNEL_IDS = [
   'partner_34',    // Facebook (Meta Ads Manager)
   'partner_1678',  // TikTok for Business
+  '2337',          // TikTok new integration channel (captured from dashboard
+                   // URL 2026-05-08 — sent without 'partner_' prefix, contains
+                   // newer trackers `1z*`/`20*+` that hold install/revenue
+                   // data for the post-cutoff TikTok integration).
 ];
 
 /**
@@ -149,7 +153,7 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
   }
 
   const json = await res.json();
-  return json.rows || [];
+  return json?.rows || [];
 }
 
 // Realtime "Today" revenue, event-date attribution (NOT cohort). Used by the

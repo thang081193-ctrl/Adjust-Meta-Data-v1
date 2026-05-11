@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.5.1-today-meta-date-preset-suffix';
+  const INJECTOR_VERSION = 'v0.6.0-today-date-detect+color-thresholds';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -90,6 +90,10 @@
   let adsetByIdIndex = new Map();
   let lastSyncAt = null;
   let sourceLabel = '';
+
+  // Color thresholds — overridable per-platform from popup Settings. Defaults
+  // mirror what the popup writes when the user hasn't customized yet.
+  let colorThresholds = { pause: 0.30, red: 0.60, green: 1.00 };
 
   let bodyObserver = null;
   let decorateTimer = null;
@@ -177,6 +181,20 @@
     parsedAt: 0,
     urlFingerprint: '',
   };
+
+  async function loadColorThresholds() {
+    try {
+      const { colorThresholds: stored } = await chrome.storage.local.get('colorThresholds');
+      const t = stored?.meta;
+      if (t) {
+        colorThresholds = {
+          pause: typeof t.pause === 'number' ? t.pause : colorThresholds.pause,
+          red:   typeof t.red   === 'number' ? t.red   : colorThresholds.red,
+          green: typeof t.green === 'number' ? t.green : colorThresholds.green,
+        };
+      }
+    } catch { /* keep defaults */ }
+  }
 
   // ---- Sync data from background ----
   async function loadData() {
@@ -1634,8 +1652,8 @@
     const valSpan = document.createElement('span');
     valSpan.textContent = pct(value);
     if (value != null) {
-      if (value < 0.60) valSpan.className = 'adjust-rv-red';
-      else if (value > 1.00) valSpan.className = 'adjust-rv-green';
+      if (value < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+      else if (value > colorThresholds.green) valSpan.className = 'adjust-rv-green';
     }
     parent.appendChild(valSpan);
   }
@@ -1716,11 +1734,13 @@
   }
 
   function classifyForColor(roas) {
-    const { d3, d7 } = roas;
-    if (d7 == null) return 'unknown';
-    // d3 may not exist on every Adjust account; require d7 only for coloring.
-    if ((d3 == null || d3 < 0.20) && d7 < 0.30) return 'pause';
-    if ((d3 == null || d3 > 1.00) && d7 > 0.80) return 'scale';
+    // Whole-pill background only escalates to red when d7 is below the
+    // user-configured pause threshold (default 30% — "unacceptable"). For
+    // anything above that, the pill stays neutral and per-segment coloring
+    // (see appendSegment) carries the granular signal.
+    const primary = roas.d7 ?? roas.allTime;
+    if (primary == null) return 'unknown';
+    if (primary < colorThresholds.pause) return 'pause';
     return 'hold';
   }
 
@@ -1745,15 +1765,115 @@
   }
 
   // ---- Banner ----
+  // Banner is a small draggable badge that toggles into a details panel on
+  // click. Position persists to localStorage so the user keeps it where they
+  // moved it. showBanner() only updates content + status color; the DOM and
+  // event wiring is built once on first call.
   function showBanner(text, level) {
     let banner = document.getElementById('adjust-overlay-banner');
-    if (!banner) {
-      banner = document.createElement('div');
-      banner.id = 'adjust-overlay-banner';
-      document.body.appendChild(banner);
-    }
-    banner.className = `adjust-banner adjust-banner-${level}`;
-    banner.textContent = text;
+    if (!banner) banner = createBanner();
+    banner.classList.remove('adjust-banner-ok', 'adjust-banner-warn', 'adjust-banner-error');
+    banner.classList.add(`adjust-banner-${level}`);
+    const panel = banner.querySelector('.adjust-banner-panel');
+    if (panel) panel.textContent = text;
+    banner.title = text;
+  }
+
+  function createBanner() {
+    const banner = document.createElement('div');
+    banner.id = 'adjust-overlay-banner';
+    banner.classList.add('adjust-banner-collapsed');
+
+    const badge = document.createElement('span');
+    badge.className = 'adjust-banner-badge';
+    badge.textContent = 'A';
+
+    const panel = document.createElement('div');
+    panel.className = 'adjust-banner-panel';
+
+    const close = document.createElement('span');
+    close.className = 'adjust-banner-close';
+    close.textContent = '×';
+    close.title = 'Collapse';
+
+    banner.appendChild(badge);
+    banner.appendChild(panel);
+    banner.appendChild(close);
+
+    restoreBannerPosition(banner);
+    attachBannerInteractions(banner, close);
+    document.body.appendChild(banner);
+    return banner;
+  }
+
+  function restoreBannerPosition(banner) {
+    try {
+      const pos = JSON.parse(localStorage.getItem('adjust-banner-pos') || 'null');
+      if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+        banner.style.left = pos.left + 'px';
+        banner.style.top = pos.top + 'px';
+        banner.style.right = 'auto';
+        banner.style.bottom = 'auto';
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Distinguish click vs drag via a 3px movement threshold. Below threshold
+  // → toggle expanded/collapsed. Above → reposition the banner and persist
+  // the new coordinates so reload restores them.
+  function attachBannerInteractions(banner, closeEl) {
+    let dragging = false;
+    let pendingClick = false;
+    let dragStartX = 0, dragStartY = 0, initialLeft = 0, initialTop = 0;
+
+    banner.addEventListener('mousedown', (e) => {
+      if (e.target === closeEl) {
+        banner.classList.remove('adjust-banner-expanded');
+        banner.classList.add('adjust-banner-collapsed');
+        e.stopPropagation();
+        return;
+      }
+      pendingClick = true;
+      dragging = false;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      const rect = banner.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+      e.preventDefault();
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - dragStartX;
+        const dy = ev.clientY - dragStartY;
+        if (!dragging && Math.hypot(dx, dy) > 3) {
+          dragging = true;
+          pendingClick = false;
+        }
+        if (dragging) {
+          banner.style.left = Math.max(0, initialLeft + dx) + 'px';
+          banner.style.top = Math.max(0, initialTop + dy) + 'px';
+          banner.style.right = 'auto';
+          banner.style.bottom = 'auto';
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        if (dragging) {
+          const r = banner.getBoundingClientRect();
+          try {
+            localStorage.setItem('adjust-banner-pos', JSON.stringify({ left: r.left, top: r.top }));
+          } catch { /* ignore quota errors */ }
+        } else if (pendingClick) {
+          banner.classList.toggle('adjust-banner-expanded');
+          banner.classList.toggle('adjust-banner-collapsed');
+        }
+        pendingClick = false;
+        dragging = false;
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
   }
 
   function buildBannerText() {
@@ -1807,8 +1927,14 @@
   // popup — which keeps the extension's permissions minimal (no `tabs` perm,
   // no host_permissions for facebook.com) and removes one moving part.
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.campaignDataCache) {
+    if (area !== 'local') return;
+    if (changes.campaignDataCache) {
       loadData();
+    } else if (changes.colorThresholds) {
+      loadColorThresholds().then(() => {
+        removeAllPills();
+        decorateAllVisibleRows();
+      });
     }
   });
 
@@ -1821,6 +1947,7 @@
     scheduleDecorate();
   });
 
-  // Initial.
-  loadData();
+  // Initial. Load thresholds first so the very first decoration uses
+  // user-configured colors rather than briefly painting with defaults.
+  loadColorThresholds().then(() => loadData());
 })();
