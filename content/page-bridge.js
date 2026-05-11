@@ -43,7 +43,7 @@
 (function () {
   'use strict';
 
-  const BRIDGE_VERSION = 'v0.1.0';
+  const BRIDGE_VERSION = 'v0.2.0-combined-walks';
   const DATA_NODE_ID = 'aox-bridge-data';
 
   // Same skip list rationale as content/meta-injector.js: keep walk scoped
@@ -75,43 +75,50 @@
     return bestNode;
   }
 
-  function findIdInValue(value, lookupSet, depth, seen) {
+  // Walks `value` recursively looking for digit strings that match either
+  // lookup set. Returns { adId, adsetId } as soon as both are found, or
+  // exhausts the tree. Combining the two probes into one walk halves prop-
+  // tree traversal cost vs. running findIdInValue twice independently.
+  function findIdsInValue(value, adSet, adsetSet, found, depth, seen) {
     depth = depth || 0;
     seen = seen || new WeakSet();
-    if (depth > 10 || value == null) return null;
+    if (depth > 10 || value == null) return;
+    if (found.adId && found.adsetId) return;
     if (typeof value === 'string') {
       const matches = value.match(/\d{15,19}/g);
-      if (!matches) return null;
+      if (!matches) return;
       for (const id of matches) {
-        if (lookupSet.has(id)) return id;
+        if (!found.adId && adSet.has(id)) found.adId = id;
+        if (!found.adsetId && adsetSet.has(id)) found.adsetId = id;
+        if (found.adId && found.adsetId) return;
       }
-      return null;
+      return;
     }
-    if (typeof value !== 'object') return null;
-    if (seen.has(value)) return null;
+    if (typeof value !== 'object') return;
+    if (seen.has(value)) return;
     seen.add(value);
     if (Array.isArray(value)) {
       for (const v of value) {
-        const r = findIdInValue(v, lookupSet, depth + 1, seen);
-        if (r) return r;
+        findIdsInValue(v, adSet, adsetSet, found, depth + 1, seen);
+        if (found.adId && found.adsetId) return;
       }
-      return null;
+      return;
     }
     for (const k of Object.keys(value)) {
       if (SKIP_FIBER_FIELDS.has(k)) continue;
       try {
-        const r = findIdInValue(value[k], lookupSet, depth + 1, seen);
-        if (r) return r;
+        findIdsInValue(value[k], adSet, adsetSet, found, depth + 1, seen);
+        if (found.adId && found.adsetId) return;
       } catch {}
     }
-    return null;
   }
 
-  function findIdInRowProps(nameEl, lookupSet) {
-    if (lookupSet.size === 0) return null;
+  function findIdsInRowProps(nameEl, adSet, adsetSet) {
+    if (adSet.size === 0 && adsetSet.size === 0) return { adId: null, adsetId: null };
     const root = findRowAncestor(nameEl);
-    if (!root || root === document.body) return null;
+    if (!root || root === document.body) return { adId: null, adsetId: null };
 
+    const found = { adId: null, adsetId: null };
     const stack = [root];
     let scanned = 0;
     const MAX_SCAN = 300;
@@ -123,12 +130,12 @@
         if (!propKey.startsWith('__react')) continue;
         const v = el[propKey];
         if (!v || typeof v !== 'object') continue;
-        const id = findIdInValue(v, lookupSet);
-        if (id) return id;
+        findIdsInValue(v, adSet, adsetSet, found);
+        if (found.adId && found.adsetId) return found;
       }
       if (el.children) for (const c of el.children) stack.push(c);
     }
-    return null;
+    return found;
   }
 
   function ensureDataNode() {
@@ -156,8 +163,7 @@
       const text = (el.textContent || '').trim();
       if (!text || text.length < 5 || text.length > 200) continue;
       scanCount++;
-      const adId = findIdInRowProps(el, knownAdIds);
-      const adsetId = findIdInRowProps(el, knownAdsetIds);
+      const { adId, adsetId } = findIdsInRowProps(el, knownAdIds, knownAdsetIds);
       if (!adId && !adsetId) continue;
       const rect = el.getBoundingClientRect();
       results.push({

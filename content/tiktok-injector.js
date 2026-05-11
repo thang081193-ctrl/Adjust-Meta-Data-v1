@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.1.4-tt';
+  const INJECTOR_VERSION = 'v0.2.0-tt-perf-raf-fix+col-cache';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -492,9 +492,26 @@
         ad: adIndex.size,
         adById: adByIdIndex.size,
       },
+      // Sample of indexed keys so we can compare vs the DOM textContent and
+      // diagnose name-normalization mismatches without re-walking the whole
+      // index. Filtered by current candidate's first 8 chars when possible
+      // (narrow signal beats a random slice of 5).
+      sampleCampaignKeys: pickSampleKeys(campaignIndex, firstUnmatchedSample),
+      sampleAdsetKeys:    pickSampleKeys(adsetIndex,    firstUnmatchedSample),
+      sampleAdKeys:       pickSampleKeys(adIndex,       firstUnmatchedSample),
       lastDecoratePass: { ...lastDecorateStats },
       bridgeProbe,
     });
+  }
+
+  function pickSampleKeys(map, hint) {
+    const all = [...map.keys()];
+    if (hint && hint.length >= 6) {
+      const probe = canonicalKey(hint).slice(0, 8);
+      const matches = all.filter(k => k.startsWith(probe));
+      if (matches.length) return matches.slice(0, 5);
+    }
+    return all.slice(0, 5);
   }
 
   // ---- Decorate one candidate ----
@@ -564,6 +581,12 @@
     ensureRepositionLoop();
   }
 
+  // Cache the column ancestor per leaf cell. DOM structure for a row is
+  // stable for the life of the cell, so re-walking 8 ancestors with
+  // getBoundingClientRect on every rAF tick is wasted work. WeakMap means
+  // entries auto-evict when TikTok virtualizes the cell out of the DOM.
+  const cellColumnCache = new WeakMap();
+
   function positionPillToCell(cell, pill) {
     const r = cell.getBoundingClientRect();
     const offscreen = r.width === 0 || r.height === 0
@@ -572,7 +595,7 @@
     // so pills line up vertically across rows regardless of name truncation
     // length. Vertical: still keyed off the leaf cell so each pill matches
     // its own row.
-    const column = findColumnAncestor(cell);
+    const column = getColumnAncestor(cell);
     const colRight = column ? column.getBoundingClientRect().right : r.right;
     const left = Math.round(colRight + 6);
     const top = Math.round(r.top + (r.height / 2) - 9);
@@ -583,7 +606,17 @@
       pill.style.left = left + 'px';
       pill.style.top = top + 'px';
     }
-    lastPositioned.set(cell, { left, top, hidden: offscreen });
+    // Store cell's own rect.right alongside the column-aligned left so the
+    // rAF early-exit can re-validate cheaply without re-walking ancestors.
+    lastPositioned.set(cell, { left, top, hidden: offscreen, cellRight: r.right });
+  }
+
+  function getColumnAncestor(cell) {
+    let column = cellColumnCache.get(cell);
+    if (column && column.isConnected) return column;
+    column = findColumnAncestor(cell);
+    if (column) cellColumnCache.set(cell, column);
+    return column;
   }
 
   // Walk up from the leaf name link to its enclosing column cell. Heuristic:
@@ -621,13 +654,19 @@
         lastPositioned.delete(cell);
         continue;
       }
+      // Cheap prefilter using the cell's own rect: if vertical position and
+      // visibility match what we last wrote, the pill is already correct.
+      // We don't need to walk ancestors here — positionPillToCell does the
+      // column-anchored layout (the slow path) only when this cheap check
+      // says something moved. This used to compute `r.right + 6` for the
+      // comparison while the actual write used `colRight + 6`, so the early
+      // exit never fired and every frame did the full ancestor walk.
       const r = cell.getBoundingClientRect();
       const offscreen = r.width === 0 || r.height === 0
         || r.bottom < 0 || r.top > window.innerHeight;
-      const left = Math.round(r.right + 6);
       const top = Math.round(r.top + (r.height / 2) - 9);
       const prev = lastPositioned.get(cell);
-      if (prev && prev.left === left && prev.top === top && prev.hidden === offscreen) {
+      if (prev && prev.top === top && prev.hidden === offscreen && prev.cellRight === r.right) {
         continue; // nothing changed for this pill
       }
       positionPillToCell(cell, pill);

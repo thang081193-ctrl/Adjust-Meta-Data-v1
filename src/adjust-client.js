@@ -18,6 +18,24 @@
 
 const ADJUST_BASE = 'https://automate.adjust.com/reports-service/report';
 
+// Adjust occasionally takes 30+ seconds for large multi-app reports; cap at
+// 60s so a hung server doesn't leave the popup's Force-refresh button stuck
+// disabled forever. AbortSignal.timeout (Chrome 103+) gives us cancellation
+// without manual setTimeout/clear bookkeeping.
+const FETCH_TIMEOUT_MS = 60_000;
+
+function adjustFetch(url, apiToken) {
+  return fetch(url, {
+    method: 'GET',
+    credentials: 'omit',
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+}
+
 // Adjust channel ids per ad network. Verified from the dashboard URL's
 // `channel_id__in` param. We pass both in a single comma-separated request so
 // one Adjust call returns rows for every network the extension supports — the
@@ -135,14 +153,15 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
   // a previous Adjust login) gets sent alongside our Bearer token, and Adjust
   // rejects the request with "It is impossible to check account ownership!"
   // because the cookie identifies user A while the token identifies user B.
-  const res = await fetch(url, {
-    method: 'GET',
-    credentials: 'omit',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      Accept: 'application/json',
-    },
-  });
+  let res;
+  try {
+    res = await adjustFetch(url, apiToken);
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new Error(`Adjust API timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
+    }
+    throw err;
+  }
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -226,14 +245,15 @@ async function fetchTodayAtLevel({ apiToken, utcOffset, dimensions, appTokens })
     if (cleaned) params.set('app_token__in', cleaned);
   }
 
-  const res = await fetch(`${ADJUST_BASE}?${params}`, {
-    method: 'GET',
-    credentials: 'omit',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      Accept: 'application/json',
-    },
-  });
+  let res;
+  try {
+    res = await adjustFetch(`${ADJUST_BASE}?${params}`, apiToken);
+  } catch (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new Error(`Adjust today fetch timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
+    }
+    throw err;
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(
@@ -242,7 +262,7 @@ async function fetchTodayAtLevel({ apiToken, utcOffset, dimensions, appTokens })
     );
   }
   const json = await res.json();
-  return json.rows || [];
+  return json?.rows || [];
 }
 
 function toTodayRow(row, level) {

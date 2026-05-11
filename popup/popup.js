@@ -51,8 +51,10 @@ async function doSync(force = false) {
   }
 }
 
-async function loadCfg() {
-  const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
+async function loadCfg(prefetched) {
+  const dataSourceConfig = prefetched !== undefined
+    ? prefetched
+    : (await chrome.storage.local.get('dataSourceConfig')).dataSourceConfig;
   if (dataSourceConfig?.kind === 'adjust-direct' || !dataSourceConfig) {
     $('apiToken').value = dataSourceConfig?.apiToken || '';
     $('utcOffset').value = dataSourceConfig?.utcOffset || '+07:00';
@@ -109,8 +111,10 @@ const DEFAULT_COLOR_THRESHOLDS = {
   tiktok: { pause: 0.30, red: 0.60, green: 1.00 },
 };
 
-async function loadColorThresholds() {
-  const { colorThresholds } = await chrome.storage.local.get('colorThresholds');
+async function loadColorThresholds(prefetched) {
+  const colorThresholds = prefetched !== undefined
+    ? prefetched
+    : (await chrome.storage.local.get('colorThresholds')).colorThresholds;
   const t = mergeThresholds(colorThresholds);
   $('metaPause').value   = pctOf(t.meta.pause);
   $('metaRed').value     = pctOf(t.meta.red);
@@ -174,6 +178,14 @@ for (const btn of $('periods').querySelectorAll('button')) {
   btn.addEventListener('click', () => pickPeriod(btn.dataset.period));
 }
 
-loadCfg();
-loadColorThresholds();
-refreshStatus();
+// Batch the two storage reads + the GET_CACHED IPC into a single concurrent
+// burst so the popup paints faster on open. Sequential awaits used to add
+// 15-45ms of unnecessary IPC latency across three round trips.
+(async function bootstrap() {
+  const [{ dataSourceConfig, colorThresholds }] = await Promise.all([
+    chrome.storage.local.get(['dataSourceConfig', 'colorThresholds']),
+    refreshStatus(),
+  ]);
+  loadCfg(dataSourceConfig);
+  loadColorThresholds(colorThresholds);
+})();

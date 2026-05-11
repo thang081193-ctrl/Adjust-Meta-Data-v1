@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const BRIDGE_VERSION = 'v0.1.1-tt';
+  const BRIDGE_VERSION = 'v0.2.0-tt-combined-walks';
   const DATA_NODE_ID = 'aox-tt-bridge-data';
 
   // KsLink is TikTok's link-text component used for the row name cells in
@@ -48,47 +48,57 @@
   let knownAdsetIds = new Set();
   let knownCampIds = new Set();
 
-  function findIdInValue(value, lookupSet, depth, seen) {
+  // Walks `value` recursively looking for digit strings that match any of
+  // the three lookup sets. Mutates `found` in place and short-circuits as
+  // soon as all three slots are filled. Combining the three probes into one
+  // walk cuts prop-tree traversal cost ~3x vs running findIdInValue per set.
+  function findIdsInValue(value, sets, found, depth, seen) {
     depth = depth || 0;
     seen = seen || new WeakSet();
-    if (depth > 10 || value == null) return null;
+    if (depth > 10 || value == null) return;
+    if (found.adId && found.adsetId && found.campId) return;
     if (typeof value === 'string') {
       const matches = value.match(/\d{15,19}/g);
-      if (!matches) return null;
+      if (!matches) return;
       for (const id of matches) {
-        if (lookupSet.has(id)) return id;
+        if (!found.adId    && sets.adSet.has(id))    found.adId = id;
+        if (!found.adsetId && sets.adsetSet.has(id)) found.adsetId = id;
+        if (!found.campId  && sets.campSet.has(id))  found.campId = id;
+        if (found.adId && found.adsetId && found.campId) return;
       }
-      return null;
+      return;
     }
-    if (typeof value !== 'object') return null;
-    if (seen.has(value)) return null;
+    if (typeof value !== 'object') return;
+    if (seen.has(value)) return;
     seen.add(value);
     if (Array.isArray(value)) {
       for (const v of value) {
-        const r = findIdInValue(v, lookupSet, depth + 1, seen);
-        if (r) return r;
+        findIdsInValue(v, sets, found, depth + 1, seen);
+        if (found.adId && found.adsetId && found.campId) return;
       }
-      return null;
+      return;
     }
     for (const k of Object.keys(value)) {
       try {
-        const r = findIdInValue(value[k], lookupSet, depth + 1, seen);
-        if (r) return r;
+        findIdsInValue(value[k], sets, found, depth + 1, seen);
+        if (found.adId && found.adsetId && found.campId) return;
       } catch {}
     }
-    return null;
   }
 
-  function findIdInOwnProps(el, lookupSet) {
-    if (lookupSet.size === 0) return null;
+  function findIdsInOwnProps(el, sets) {
+    const found = { adId: null, adsetId: null, campId: null };
+    if (sets.adSet.size === 0 && sets.adsetSet.size === 0 && sets.campSet.size === 0) {
+      return found;
+    }
     for (const k of Object.keys(el)) {
       if (!k.startsWith('__react')) continue;
       const v = el[k];
       if (!v || typeof v !== 'object') continue;
-      const id = findIdInValue(v, lookupSet);
-      if (id) return id;
+      findIdsInValue(v, sets, found);
+      if (found.adId && found.adsetId && found.campId) return found;
     }
-    return null;
+    return found;
   }
 
   function ensureDataNode() {
@@ -114,14 +124,13 @@
     let scanCount = 0;
     let hitCount = 0;
 
+    const sets = { adSet: knownAdIds, adsetSet: knownAdsetIds, campSet: knownCampIds };
     for (const el of document.querySelectorAll(NAME_CELL_SELECTOR)) {
       const text = (el.textContent || '').trim();
       if (!text || text.length < 5 || text.length > 200) continue;
       scanCount++;
 
-      const adId = findIdInOwnProps(el, knownAdIds);
-      const adsetId = findIdInOwnProps(el, knownAdsetIds);
-      const campId = findIdInOwnProps(el, knownCampIds);
+      const { adId, adsetId, campId } = findIdsInOwnProps(el, sets);
       if (!adId && !adsetId && !campId) continue;
 
       const rect = el.getBoundingClientRect();
