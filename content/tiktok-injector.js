@@ -96,6 +96,10 @@
   let lastSyncAt = null;
   let sourceLabel = '';
 
+  // Color thresholds — overridable per-platform from popup Settings. Defaults
+  // mirror what the popup writes when the user hasn't customized yet.
+  let colorThresholds = { pause: 0.30, red: 0.60, green: 1.00 };
+
   let bodyObserver = null;
   let decorateTimer = null;
   const decoratedKey = new WeakMap();
@@ -176,6 +180,20 @@
     if (path.includes('/manage/adgroup')) return 'adset';
     if (path.includes('/manage/campaign')) return 'campaign';
     return null;
+  }
+
+  async function loadColorThresholds() {
+    try {
+      const { colorThresholds: stored } = await chrome.storage.local.get('colorThresholds');
+      const t = stored?.tiktok;
+      if (t) {
+        colorThresholds = {
+          pause: typeof t.pause === 'number' ? t.pause : colorThresholds.pause,
+          red:   typeof t.red   === 'number' ? t.red   : colorThresholds.red,
+          green: typeof t.green === 'number' ? t.green : colorThresholds.green,
+        };
+      }
+    } catch { /* keep defaults */ }
   }
 
   // ---- Sync data from background ----
@@ -531,12 +549,55 @@
     pill.style.position = 'fixed';
     pill.style.zIndex = '99999';
     pill.style.margin = '0';
-    pill.style.display = 'none'; // first frame of rAF loop will reveal it
+    // Position the pill immediately rather than waiting for the rAF loop's
+    // first frame. Previously we used display:none + relied on the loop to
+    // reveal the pill, but on cache refresh (period change) the loop's
+    // rafLoopActive flag could already be true from a prior tick that had
+    // since drained without rescheduling, leaving newly-created pills stuck
+    // hidden with `left/top: auto`. Painting on creation makes the pill
+    // visible regardless of rAF state; the loop still runs to follow scroll.
+    positionPillToCell(el, pill);
     document.body.appendChild(pill);
 
     cellToPill.set(el, pill);
     decoratedKey.set(el, key);
     ensureRepositionLoop();
+  }
+
+  function positionPillToCell(cell, pill) {
+    const r = cell.getBoundingClientRect();
+    const offscreen = r.width === 0 || r.height === 0
+      || r.bottom < 0 || r.top > window.innerHeight;
+    // Horizontal: align to the name column's right edge, not the leaf link's,
+    // so pills line up vertically across rows regardless of name truncation
+    // length. Vertical: still keyed off the leaf cell so each pill matches
+    // its own row.
+    const column = findColumnAncestor(cell);
+    const colRight = column ? column.getBoundingClientRect().right : r.right;
+    const left = Math.round(colRight + 6);
+    const top = Math.round(r.top + (r.height / 2) - 9);
+    if (offscreen) {
+      pill.style.display = 'none';
+    } else {
+      pill.style.display = '';
+      pill.style.left = left + 'px';
+      pill.style.top = top + 'px';
+    }
+    lastPositioned.set(cell, { left, top, hidden: offscreen });
+  }
+
+  // Walk up from the leaf name link to its enclosing column cell. Heuristic:
+  // first ancestor noticeably wider than the leaf and short enough to be a
+  // single-row cell. Returns the leaf as fallback if no good match is found.
+  function findColumnAncestor(cell) {
+    const cellW = cell.getBoundingClientRect().width;
+    let n = cell.parentElement;
+    for (let i = 0; i < 8 && n; i++) {
+      const r = n.getBoundingClientRect();
+      if (r.width >= cellW + 40 && r.height > 0 && r.height < 200) return n;
+      n = n.parentElement;
+    }
+    return cell;
   }
 
   // TikTok's `<ks-virtual-table>` scrolls by mutating row transforms instead
@@ -569,14 +630,7 @@
       if (prev && prev.left === left && prev.top === top && prev.hidden === offscreen) {
         continue; // nothing changed for this pill
       }
-      if (offscreen) {
-        pill.style.display = 'none';
-      } else {
-        pill.style.display = '';
-        pill.style.left = left + 'px';
-        pill.style.top = top + 'px';
-      }
-      lastPositioned.set(cell, { left, top, hidden: offscreen });
+      positionPillToCell(cell, pill);
     }
 
     if (cellToPill.size > 0) {
@@ -646,10 +700,13 @@
 
   // ---- Pill helpers (kept compatible with content/meta-injector.css) ----
   function classifyForColor(roas) {
-    const { d3, d7 } = roas;
-    if (d7 == null) return 'unknown';
-    if ((d3 == null || d3 < 0.20) && d7 < 0.30) return 'pause';
-    if ((d3 == null || d3 > 1.00) && d7 > 0.80) return 'scale';
+    // Whole-pill background only escalates to red when d7 is below the
+    // user-configured pause threshold (default 30% — "unacceptable"). For
+    // anything above that, the pill stays neutral and per-segment coloring
+    // (see fillPillSegments) carries the granular signal.
+    const primary = roas.d7 ?? roas.allTime;
+    if (primary == null) return 'unknown';
+    if (primary < colorThresholds.pause) return 'pause';
     return 'hold';
   }
 
@@ -673,6 +730,14 @@
       const valSpan = document.createElement('span');
       valSpan.className = 'adjust-pill-value';
       valSpan.textContent = pct(seg.value);
+      // Per-segment coloring: each value lights up by its own threshold so
+      // the user sees granular signal even when the overall pill stays
+      // neutral. Whole-pill background only escalates to red on bad signal
+      // (see classifyForColor) — green-whole-pill is intentionally absent.
+      if (seg.value != null) {
+        if (seg.value < colorThresholds.red) valSpan.classList.add('adjust-rv-red');
+        else if (seg.value > colorThresholds.green) valSpan.classList.add('adjust-rv-green');
+      }
       span.appendChild(labelSpan);
       span.appendChild(valSpan);
       parent.appendChild(span);
@@ -707,15 +772,115 @@
   }
 
   // ---- Banner ----
+  // Banner is a small draggable badge that toggles into a details panel on
+  // click. Position persists to localStorage so the user keeps it where they
+  // moved it. showBanner() only updates content + status color; the DOM and
+  // event wiring is built once on first call.
   function showBanner(text, level) {
     let banner = document.getElementById('adjust-overlay-banner');
-    if (!banner) {
-      banner = document.createElement('div');
-      banner.id = 'adjust-overlay-banner';
-      document.body.appendChild(banner);
-    }
-    banner.className = `adjust-banner adjust-banner-${level}`;
-    banner.textContent = text;
+    if (!banner) banner = createBanner();
+    banner.classList.remove('adjust-banner-ok', 'adjust-banner-warn', 'adjust-banner-error');
+    banner.classList.add(`adjust-banner-${level}`);
+    const panel = banner.querySelector('.adjust-banner-panel');
+    if (panel) panel.textContent = text;
+    banner.title = text;
+  }
+
+  function createBanner() {
+    const banner = document.createElement('div');
+    banner.id = 'adjust-overlay-banner';
+    banner.classList.add('adjust-banner-collapsed');
+
+    const badge = document.createElement('span');
+    badge.className = 'adjust-banner-badge';
+    badge.textContent = 'A';
+
+    const panel = document.createElement('div');
+    panel.className = 'adjust-banner-panel';
+
+    const close = document.createElement('span');
+    close.className = 'adjust-banner-close';
+    close.textContent = '×';
+    close.title = 'Collapse';
+
+    banner.appendChild(badge);
+    banner.appendChild(panel);
+    banner.appendChild(close);
+
+    restoreBannerPosition(banner);
+    attachBannerInteractions(banner, close);
+    document.body.appendChild(banner);
+    return banner;
+  }
+
+  function restoreBannerPosition(banner) {
+    try {
+      const pos = JSON.parse(localStorage.getItem('adjust-banner-pos') || 'null');
+      if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+        banner.style.left = pos.left + 'px';
+        banner.style.top = pos.top + 'px';
+        banner.style.right = 'auto';
+        banner.style.bottom = 'auto';
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Distinguish click vs drag via a 3px movement threshold. Below threshold
+  // → toggle expanded/collapsed. Above → reposition the banner and persist
+  // the new coordinates so reload restores them.
+  function attachBannerInteractions(banner, closeEl) {
+    let dragging = false;
+    let pendingClick = false;
+    let dragStartX = 0, dragStartY = 0, initialLeft = 0, initialTop = 0;
+
+    banner.addEventListener('mousedown', (e) => {
+      if (e.target === closeEl) {
+        banner.classList.remove('adjust-banner-expanded');
+        banner.classList.add('adjust-banner-collapsed');
+        e.stopPropagation();
+        return;
+      }
+      pendingClick = true;
+      dragging = false;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      const rect = banner.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+      e.preventDefault();
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - dragStartX;
+        const dy = ev.clientY - dragStartY;
+        if (!dragging && Math.hypot(dx, dy) > 3) {
+          dragging = true;
+          pendingClick = false;
+        }
+        if (dragging) {
+          banner.style.left = Math.max(0, initialLeft + dx) + 'px';
+          banner.style.top = Math.max(0, initialTop + dy) + 'px';
+          banner.style.right = 'auto';
+          banner.style.bottom = 'auto';
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        if (dragging) {
+          const r = banner.getBoundingClientRect();
+          try {
+            localStorage.setItem('adjust-banner-pos', JSON.stringify({ left: r.left, top: r.top }));
+          } catch { /* ignore quota errors */ }
+        } else if (pendingClick) {
+          banner.classList.toggle('adjust-banner-expanded');
+          banner.classList.toggle('adjust-banner-collapsed');
+        }
+        pendingClick = false;
+        dragging = false;
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
   }
 
   function buildBannerText() {
@@ -751,7 +916,9 @@
   }
 
   // ---- Init ----
-  loadData();
+  // Load thresholds first so the very first decoration uses user-configured
+  // colors rather than briefly painting with defaults and re-painting.
+  loadColorThresholds().then(() => loadData());
 
   // Safety net: TikTok loads its table 2-10 seconds after document_idle on
   // slow networks, and MutationObserver sometimes misses the initial paint
@@ -777,8 +944,20 @@
     }
   }, RETRY_INTERVAL_MS);
 
-  // Re-sync when the popup pushes a fresh sync.
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.type === 'CACHE_UPDATED') loadData();
+  // Re-load whenever background writes a new cache. Subscribing to
+  // chrome.storage.onChanged means the popup doesn't need tabs/messaging
+  // permissions to push us refreshes — same pattern as meta-injector.
+  // Threshold changes also trigger a re-decorate so saved values take effect
+  // without a page reload.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes.campaignDataCache) {
+      loadData();
+    } else if (changes.colorThresholds) {
+      loadColorThresholds().then(() => {
+        removeAllPills();
+        decorateAllVisibleRows();
+      });
+    }
   });
 })();

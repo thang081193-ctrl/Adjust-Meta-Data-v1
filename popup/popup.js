@@ -98,13 +98,82 @@ async function pickPeriod(period) {
   doSync(true);
 }
 
+// ---- Color thresholds (per-platform) ----
+// Stored as decimals (0.30 = 30%) under chrome.storage.local.colorThresholds.
+// Pill background turns red when d7 < pause. Each segment value gets red text
+// when below `red` or green text when above `green`. Defaults are tuned for
+// app-marketing ROAS where d7 < 30% is "stop bleeding", 30-60% is acceptable
+// while ramping, 60-99% is hold, 100%+ is breakeven/scale.
+const DEFAULT_COLOR_THRESHOLDS = {
+  meta:   { pause: 0.30, red: 0.60, green: 1.00 },
+  tiktok: { pause: 0.30, red: 0.60, green: 1.00 },
+};
+
+async function loadColorThresholds() {
+  const { colorThresholds } = await chrome.storage.local.get('colorThresholds');
+  const t = mergeThresholds(colorThresholds);
+  $('metaPause').value   = pctOf(t.meta.pause);
+  $('metaRed').value     = pctOf(t.meta.red);
+  $('metaGreen').value   = pctOf(t.meta.green);
+  $('tiktokPause').value = pctOf(t.tiktok.pause);
+  $('tiktokRed').value   = pctOf(t.tiktok.red);
+  $('tiktokGreen').value = pctOf(t.tiktok.green);
+}
+
+async function saveColorThresholds() {
+  const cfg = {
+    meta: {
+      pause: pctParse($('metaPause').value),
+      red:   pctParse($('metaRed').value),
+      green: pctParse($('metaGreen').value),
+    },
+    tiktok: {
+      pause: pctParse($('tiktokPause').value),
+      red:   pctParse($('tiktokRed').value),
+      green: pctParse($('tiktokGreen').value),
+    },
+  };
+  await chrome.storage.local.set({ colorThresholds: cfg });
+  $('status').textContent = 'Color thresholds saved.';
+}
+
+function mergeThresholds(stored) {
+  const m = stored?.meta || {};
+  const t = stored?.tiktok || {};
+  return {
+    meta: {
+      pause: numOr(m.pause, DEFAULT_COLOR_THRESHOLDS.meta.pause),
+      red:   numOr(m.red,   DEFAULT_COLOR_THRESHOLDS.meta.red),
+      green: numOr(m.green, DEFAULT_COLOR_THRESHOLDS.meta.green),
+    },
+    tiktok: {
+      pause: numOr(t.pause, DEFAULT_COLOR_THRESHOLDS.tiktok.pause),
+      red:   numOr(t.red,   DEFAULT_COLOR_THRESHOLDS.tiktok.red),
+      green: numOr(t.green, DEFAULT_COLOR_THRESHOLDS.tiktok.green),
+    },
+  };
+}
+
+function numOr(v, fallback) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+function pctOf(decimal) {
+  return Math.round(decimal * 100).toString();
+}
+function pctParse(raw) {
+  const n = parseFloat(raw);
+  return Number.isFinite(n) ? Math.max(0, n) / 100 : 0;
+}
+
 $('sync').addEventListener('click', () => doSync(false));
 $('forceSync').addEventListener('click', () => doSync(true));
 $('saveCfg').addEventListener('click', saveCfg);
+$('saveThresholds').addEventListener('click', saveColorThresholds);
 
 for (const btn of $('periods').querySelectorAll('button')) {
   btn.addEventListener('click', () => pickPeriod(btn.dataset.period));
 }
 
 loadCfg();
+loadColorThresholds();
 refreshStatus();

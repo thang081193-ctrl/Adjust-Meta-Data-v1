@@ -36,20 +36,64 @@
 .adjust-pill-today-mismatch { background: #fff3e0; color: #6a3a00; border-color: #ffd9a0; }
 .adjust-pill-today-mismatch::before { content: "⚠ "; }
 
+/* Banner = small draggable badge that expands into a details panel on click.
+   Default position is bottom-right; once the user drags it, the new position
+   is saved to localStorage and restored across reloads. */
 #adjust-overlay-banner {
   position: fixed;
   bottom: 16px;
   right: 16px;
   z-index: 99999;
-  padding: 8px 12px;
-  border-radius: 6px;
   font-size: 12px;
   font-family: -apple-system, system-ui, sans-serif;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-  max-width: 320px;
-  white-space: pre-line;
+  border: 1px solid transparent;
+  user-select: none;
+  cursor: grab;
+}
+#adjust-overlay-banner:active { cursor: grabbing; }
+
+#adjust-overlay-banner.adjust-banner-collapsed {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 0;
+}
+#adjust-overlay-banner.adjust-banner-collapsed .adjust-banner-panel,
+#adjust-overlay-banner.adjust-banner-collapsed .adjust-banner-close {
+  display: none;
 }
 
-.adjust-banner-ok    { background: #e8f5e9; color: #1b5e20; border: 1px solid #b8e0bb; }
-.adjust-banner-warn  { background: #fff3e0; color: #6a3a00; border: 1px solid #ffd9a0; }
-.adjust-banner-error { background: #fee;    color: #b00020; border: 1px solid #f8c8c8; }
+#adjust-overlay-banner.adjust-banner-expanded {
+  padding: 8px 24px 8px 12px;
+  border-radius: 6px;
+  max-width: 360px;
+  position: fixed;
+}
+#adjust-overlay-banner.adjust-banner-expanded .adjust-banner-badge {
+  display: none;
+}
+#adjust-overlay-banner .adjust-banner-panel {
+  white-space: pre-line;
+}
+#adjust-overlay-banner .adjust-banner-close {
+  position: absolute;
+  top: 2px;
+  right: 6px;
+  cursor: pointer;
+  padding: 0 4px;
+  font-weight: 700;
+  opacity: 0.5;
+  font-size: 14px;
+  line-height: 1;
+}
+#adjust-overlay-banner .adjust-banner-close:hover { opacity: 1; }
+
+.adjust-banner-ok    { background: #e8f5e9; color: #1b5e20; border-color: #b8e0bb; }
+.adjust-banner-warn  { background: #fff3e0; color: #6a3a00; border-color: #ffd9a0; }
+.adjust-banner-error { background: #fee;    color: #b00020; border-color: #f8c8c8; }
