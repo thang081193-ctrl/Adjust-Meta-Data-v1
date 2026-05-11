@@ -10,6 +10,8 @@ To re-load these into a Claude Code session's memory on a new machine, copy the 
 - [Reading the Meta "Amount spent" cell per row](meta_spend_column.md) — Column locator strategy (header text + walk-up to cell container), nearest-currency-neighbor spend reader, locale-aware currency parser, cross-currency refusal.
 - [Page-world bridge for reading React props](page_world_bridge.md) — Chrome ISOLATED-world content scripts cannot see `__reactProps`/`__reactFiber` expandos page JS attached to DOM elements; needs a second `world: "MAIN"` content script bridging via custom events.
 - [Adjust v2 IAA metric is `ad_revenue`](adjust_iaa_metric_name.md) — `network_revenue` / `all_revenue` rejected or silently empty; `revenue` covers IAP only. Request `metrics=revenue,ad_revenue` for IAA apps.
+- [Meta URL `date` param encodes preset as comma suffix](meta_url_date_param_format.md) — `date=<range>,<preset>` when user clicks a preset chip; the range can be stale, the suffix is the truth. Required parsing logic for any date-filter detection.
+- [Today pill ≠ Adjust UI "All revenue (cohort)"](today_pill_vs_adjust_ui_metric_diff.md) — pill uses event-date `revenue+ad_revenue` to match Meta's event-date spend; Adjust UI default is cohort. Numbers won't match for established apps and that's by design.
 
 ## Collaboration preferences
 
@@ -19,7 +21,7 @@ To re-load these into a Claude Code session's memory on a new machine, copy the 
 
 ## Active follow-ups
 
-- [Today-pill needs Meta UI date filter detection](project_today_pill_date_filter_followup.md) — Spend cell reflects Meta UI's active period; pill only correct when Meta UI on Today. Detection from URL params not yet implemented.
+- [Today-pill Meta UI date detection — implemented, pending verification](project_today_pill_date_filter_followup.md) — Detection logic shipped 2026-05-11 in injector v0.5.0. Off-date renders dashed-amber warn pill with rev only. Awaits user test on real Meta accounts.
 
 ## Diagnostics
 

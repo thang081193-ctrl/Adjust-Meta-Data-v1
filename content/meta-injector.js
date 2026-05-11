@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.4.11-today-nearest-currency';
+  const INJECTOR_VERSION = 'v0.5.1-today-meta-date-preset-suffix';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -133,20 +133,30 @@
     columnHeaderText: null,
     columnX: null,
     pillsRendered: 0,
+    pillsRenderedOffDate: 0,
     skippedNoSpendCell: 0,
     skippedZeroSpend: 0,
     skippedCurrencyMismatch: 0,
     skippedNoAdjustData: 0,
     skippedAmbiguous: 0,
     skippedAbbreviated: 0,
+    skippedOffDate: 0,
     sampleSpend: null,
     sampleRevToday: null,
     detectedMetaCurrency: null,
     adjustCurrencyExample: null,
     sampleRowCandidates: null,
+    metaDateIsToday: null,
+    metaDateLabel: null,
+    metaDateSource: null,
   };
   // Per-pass cache: { childIndex, headerX, panelRoot, headerEl } or null.
   let currentSpendColumn = null;
+  // Per-pass cache for the Meta UI date filter detection (URL-driven). The
+  // today-pill ratio is only meaningful when Meta UI's date picker = Today —
+  // the spend cell value reflects whatever range the user has active. Detected
+  // from URL params at decorate-pass start; see detectMetaUiDateInfo().
+  let currentMetaDate = null;
 
   // Meta preloads campaign/ad structure as JSON inside <script> tags BEFORE
   // rendering the table — specifically `campaign_structure_tree` payloads,
@@ -727,6 +737,77 @@
     return { value: negative ? -value : value, currency, parsed: true };
   }
 
+  // Detect whether Meta UI's date filter is set to "Today". The spend cell
+  // value reflects this filter, so the today-pill ratio (Adjust today rev /
+  // Meta spend) is only meaningful when the filter = Today. When it isn't,
+  // the render path falls back to a warn variant showing rev only.
+  //
+  // Returns: { isToday: bool, label: string, source: 'preset'|'range+preset'|'range'|'absent'|'error' }
+  // - source='preset'        : URL has date_preset=...
+  // - source='range+preset'  : URL has date=YYYY-MM-DD_YYYY-MM-DD,<preset>
+  //                            (Meta appends the preset keyword to the range
+  //                            when the user clicks a preset like "Today" —
+  //                            the suffix is the source of truth, not the
+  //                            date range, which can be stale from before the
+  //                            user clicked the preset)
+  // - source='range'         : URL has bare date=YYYY-MM-DD_YYYY-MM-DD (custom range)
+  // - source='absent'        : neither param present (Meta default is unknowable client-side)
+  // - source='error'         : URLSearchParams threw
+  // When source='absent' we conservatively report isToday=false so we never
+  // silently divide by some other date's spend; user clicks Today to opt in.
+  function detectMetaUiDateInfo() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const preset = params.get('date_preset');
+      if (preset) {
+        return { isToday: preset === 'today', label: preset, source: 'preset' };
+      }
+      const range = params.get('date');
+      if (range) {
+        // Meta encodes the picker as `<dateRange>` optionally followed by
+        // `,<preset>` when the user clicked a preset chip (Today, Yesterday,
+        // Last 7 days, Maximum, etc). Observed 2026-05-11: clicking "Today"
+        // produced `date=2026-05-07_2026-05-08,today` where the date portion
+        // was a stale range and `today` was the active preset. The suffix
+        // wins — that's what Meta's UI shows in the picker label.
+        const commaIdx = range.indexOf(',');
+        if (commaIdx !== -1) {
+          const presetSuffix = range.slice(commaIdx + 1).trim();
+          if (presetSuffix) {
+            return {
+              isToday: presetSuffix === 'today',
+              label: presetSuffix,
+              source: 'range+preset',
+            };
+          }
+        }
+        const datePart = commaIdx === -1 ? range : range.slice(0, commaIdx);
+        const m = datePart.match(/^(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})$/);
+        if (m) {
+          const start = m[1], end = m[2];
+          const todayStr = todayLocalIsoDate();
+          if (start === todayStr && end === todayStr) {
+            return { isToday: true, label: 'today', source: 'range' };
+          }
+          const label = start === end ? start : `${start}…${end}`;
+          return { isToday: false, label, source: 'range' };
+        }
+        return { isToday: false, label: range, source: 'range' };
+      }
+      return { isToday: false, label: 'unknown', source: 'absent' };
+    } catch {
+      return { isToday: false, label: 'unknown', source: 'error' };
+    }
+  }
+
+  function todayLocalIsoDate() {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
   // Render the today pill next to the main pill. ALWAYS renders when the
   // Amount-spent column is found and the row is not ambiguous — even when
   // revenue or spend is missing/zero, the pill shows `rev/spend` so the user
@@ -738,6 +819,45 @@
     if (!currentSpendColumn) return; // banner handles user messaging
 
     const rev = (data.revenueToday == null) ? null : data.revenueToday;
+    const adjCcy = data.adjustCurrency;
+
+    // Off-date variant: Meta UI is not on Today, so the spend cell isn't
+    // today's spend and dividing would mislead. Render rev-only warn pill so
+    // the pipeline-state-visible rule still holds (user can see Adjust side
+    // is alive). Skip the spend-cell read entirely — its value is correct for
+    // some other date range and reading it would only confuse diagnostics.
+    if (currentMetaDate && !currentMetaDate.isToday) {
+      const todayKey = `${mainKey}|offdate:${currentMetaDate.label}|rev:${rev}|a:${adjCcy || ''}`;
+      if (decoratedTodayKey.get(nameEl) === todayKey) return;
+
+      const possibleStale = mainPill.nextElementSibling;
+      if (possibleStale?.classList?.contains('adjust-pill-today') ||
+          possibleStale?.classList?.contains('adjust-pill-today-mismatch') ||
+          possibleStale?.classList?.contains('adjust-pill-today-offdate')) {
+        possibleStale.remove();
+      }
+
+      const todayPill = document.createElement('span');
+      todayPill.className = 'adjust-pill adjust-pill-today-offdate';
+      todayPill.textContent =
+        `Today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)} ` +
+        `(Meta on ${currentMetaDate.label})`;
+      todayPill.title =
+        `Today ROAS not computed — Meta UI date filter is "${currentMetaDate.label}".\n` +
+        `Spend cell reflects that range, not today's spend, so dividing would mislead.\n` +
+        `Switch Meta UI date picker to "Today" for live ROAS.\n` +
+        (rev != null
+          ? `Adjust today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)}`
+          : `Adjust has no revenue for this row today yet.`);
+
+      mainPill.parentNode.insertBefore(todayPill, mainPill.nextSibling);
+      decoratedTodayKey.set(nameEl, todayKey);
+      lastTodayStats.pillsRenderedOffDate++;
+      lastTodayStats.skippedOffDate++;
+      if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
+      if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
+      return;
+    }
 
     const spendText = findSpendCellText(nameEl);
     let spend = null;
@@ -759,7 +879,6 @@
     if (lastTodayStats.sampleSpend == null && spend != null) lastTodayStats.sampleSpend = spend;
     if (lastTodayStats.detectedMetaCurrency == null && metaCcy) lastTodayStats.detectedMetaCurrency = metaCcy;
     if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
-    const adjCcy = data.adjustCurrency;
     if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
     if (spend == null && !spendUnreadable && spendText == null) lastTodayStats.skippedNoSpendCell++;
 
@@ -771,7 +890,8 @@
 
     const possibleStale = mainPill.nextElementSibling;
     if (possibleStale?.classList?.contains('adjust-pill-today') ||
-        possibleStale?.classList?.contains('adjust-pill-today-mismatch')) {
+        possibleStale?.classList?.contains('adjust-pill-today-mismatch') ||
+        possibleStale?.classList?.contains('adjust-pill-today-offdate')) {
       possibleStale.remove();
     }
 
@@ -1526,12 +1646,15 @@
     lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByAdjustId: 0, resolvedByMetaPreload: 0, resolvedByDom: 0, stillAmbiguous: 0 };
     lastTodayStats = {
       columnFound: false, columnHeaderText: null, columnX: null,
-      pillsRendered: 0, skippedNoSpendCell: 0, skippedZeroSpend: 0,
+      pillsRendered: 0, pillsRenderedOffDate: 0,
+      skippedNoSpendCell: 0, skippedZeroSpend: 0,
       skippedCurrencyMismatch: 0, skippedNoAdjustData: 0,
       skippedAmbiguous: 0, skippedAbbreviated: 0,
+      skippedOffDate: 0,
       sampleSpend: null, sampleRevToday: null,
       detectedMetaCurrency: null, adjustCurrencyExample: null,
       sampleRowCandidates: null,
+      metaDateIsToday: null, metaDateLabel: null, metaDateSource: null,
     };
     rowYBuckets = null;
     // Locate the Amount-spent column once per pass. Today-pill rendering is
@@ -1542,6 +1665,13 @@
       lastTodayStats.columnX = Math.round(currentSpendColumn.headerX);
       lastTodayStats.columnHeaderText = currentSpendColumn.headerText;
     }
+    // Detect Meta UI's date filter once per pass. When not Today, the today
+    // pill renders a warn variant (rev only) instead of dividing by spend
+    // that reflects some other date range.
+    currentMetaDate = detectMetaUiDateInfo();
+    lastTodayStats.metaDateIsToday = currentMetaDate.isToday;
+    lastTodayStats.metaDateLabel = currentMetaDate.label;
+    lastTodayStats.metaDateSource = currentMetaDate.source;
     // Refresh the page-world bridge's row-id table so findEntryViaAdjustId
     // sees the current viewport. Synchronous: by the time dispatchEvent
     // returns, the bridge's listener has finished writing the data node.
@@ -1549,6 +1679,7 @@
     document.querySelectorAll(NAME_CANDIDATE_SELECTOR).forEach(decorateCandidate);
     rowYBuckets = null; // release; rects go stale on next mutation anyway
     currentSpendColumn = null;
+    currentMetaDate = null;
 
     // Re-render banner after every pass so it reflects the CURRENT pass
     // stats — not stale stats from loadData's initial showBanner call (which
@@ -1635,11 +1766,15 @@
       lines.push(`⚠ ${s.stillAmbiguous} row(s) showing aggregate ROAS — enable "Campaign name" or "Campaign ID" column to disambiguate.`);
     }
     // Today-pill banner lines (at most one). Priority: column-missing wins
-    // over currency-mismatch wins over abbreviation, since column-missing
-    // affects EVERY row while the others are per-row.
+    // over off-date wins over currency-mismatch wins over abbreviation. Each
+    // higher-priority condition gates EVERY row, so surfacing it first avoids
+    // the user fixing a per-row issue while a global block still hides pills.
     const t = lastTodayStats;
     if (!t.columnFound) {
       lines.push(`⚠ Today ROAS disabled — enable "Amount spent" column in this Meta view.`);
+    } else if (t.metaDateIsToday === false) {
+      const label = t.metaDateLabel || 'unknown';
+      lines.push(`⚠ Today ROAS not computed — Meta UI date filter is "${label}". Switch to Today for live ROAS.`);
     } else if (t.skippedCurrencyMismatch > 0 && t.pillsRendered === 0) {
       const adj = t.adjustCurrencyExample || '?';
       const meta = t.detectedMetaCurrency || '?';
@@ -1675,6 +1810,15 @@
     if (area === 'local' && changes.campaignDataCache) {
       loadData();
     }
+  });
+
+  // SPA URL changes: Meta's date picker pushes a new URL via history.pushState
+  // (no popstate fires) AND re-renders the table — the body MutationObserver
+  // already catches that path. popstate covers browser back/forward, where the
+  // URL changes but the table may not always emit a child mutation in time.
+  // We listen passively and just re-decorate; URL is re-read at pass start.
+  window.addEventListener('popstate', () => {
+    scheduleDecorate();
   });
 
   // Initial.

@@ -35,6 +35,10 @@
 .adjust-pill-today          { background: #eaf3ff; color: #0b3d8c; border-color: #b8d1ff; }
 .adjust-pill-today-mismatch { background: #fff3e0; color: #6a3a00; border-color: #ffd9a0; }
 .adjust-pill-today-mismatch::before { content: "⚠ "; }
+/* Off-date variant: Meta UI date picker is not on Today, so dividing by the
+   visible spend cell would mislead. Renders rev only with a date label. */
+.adjust-pill-today-offdate  { background: #fff3e0; color: #6a3a00; border: 1px dashed #d9a300; }
+.adjust-pill-today-offdate::before { content: "⚠ "; }
 
 #adjust-overlay-banner {
   position: fixed;
