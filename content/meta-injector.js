@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.6.1-perf-bridge-combined-walks';
+  const INJECTOR_VERSION = 'v0.6.2-column-virt-aware';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -138,6 +138,7 @@
     columnX: null,
     pillsRendered: 0,
     pillsRenderedOffDate: 0,
+    pillsRenderedOffColumn: 0,
     skippedNoSpendCell: 0,
     skippedCurrencyMismatch: 0,
     skippedAmbiguous: 0,
@@ -814,6 +815,17 @@
   // can SEE the pipeline state instead of guessing why nothing appeared.
   // Skip cases that bump counters but don't render: ambiguous row, column
   // missing, abbreviated cell (can't parse), currency mismatch.
+  // True if the Amount-spent column header is currently within the horizontal
+  // viewport. Meta Ads Manager horizontally-virtualizes data cells — row cells
+  // for off-screen columns are not in the DOM, so findSpendCellText would
+  // return null and (worse) a prior pass's pill text would persist as stale.
+  // We treat header-offscreen as a distinct state and render a warn variant.
+  function isSpendColumnInViewport() {
+    if (!currentSpendColumn?.headerEl) return false;
+    const r = currentSpendColumn.headerEl.getBoundingClientRect();
+    return r.width > 0 && r.right > 0 && r.left < window.innerWidth;
+  }
+
   function maybeRenderTodayPill(nameEl, mainPill, data, mainKey) {
     if (!data || data.ambiguous) { lastTodayStats.skippedAmbiguous++; return; }
     if (!currentSpendColumn) return; // banner handles user messaging
@@ -833,7 +845,8 @@
       const possibleStale = mainPill.nextElementSibling;
       if (possibleStale?.classList?.contains('adjust-pill-today') ||
           possibleStale?.classList?.contains('adjust-pill-today-mismatch') ||
-          possibleStale?.classList?.contains('adjust-pill-today-offdate')) {
+          possibleStale?.classList?.contains('adjust-pill-today-offdate') ||
+          possibleStale?.classList?.contains('adjust-pill-today-offcolumn')) {
         possibleStale.remove();
       }
 
@@ -854,6 +867,47 @@
       decoratedTodayKey.set(nameEl, todayKey);
       lastTodayStats.pillsRenderedOffDate++;
       lastTodayStats.skippedOffDate++;
+      if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
+      if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
+      return;
+    }
+
+    // Off-column variant: Meta horizontally-virtualizes cells, so when the
+    // Amount-spent column is scrolled out of view the row cell doesn't exist
+    // in DOM and the spend read would silently fail (leaving a stale pill
+    // from a prior pass — observed 2026-05-12: pill shows old `$0.40` for a
+    // row whose actual spend is `$2.17`, only refreshes when user scrolls the
+    // column back into view). Render a rev-only warn pill with an actionable
+    // prompt instead.
+    if (!isSpendColumnInViewport()) {
+      const todayKey = `${mainKey}|offcol|rev:${rev}|a:${adjCcy || ''}`;
+      if (decoratedTodayKey.get(nameEl) === todayKey) return;
+
+      const possibleStale = mainPill.nextElementSibling;
+      if (possibleStale?.classList?.contains('adjust-pill-today') ||
+          possibleStale?.classList?.contains('adjust-pill-today-mismatch') ||
+          possibleStale?.classList?.contains('adjust-pill-today-offdate') ||
+          possibleStale?.classList?.contains('adjust-pill-today-offcolumn')) {
+        possibleStale.remove();
+      }
+
+      const todayPill = document.createElement('span');
+      todayPill.className = 'adjust-pill adjust-pill-today-offcolumn';
+      todayPill.textContent =
+        `Today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)} ` +
+        `(scroll Amount spent into view)`;
+      todayPill.title =
+        `Today ROAS not computed — the Amount spent column is scrolled out of the\n` +
+        `horizontal viewport. Meta only renders row cells for columns currently\n` +
+        `visible, so spend can't be read. Scroll horizontally to bring the\n` +
+        `"Amount spent" column back into view and the pill will refresh.\n` +
+        (rev != null
+          ? `Adjust today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)}`
+          : `Adjust has no revenue for this row today yet.`);
+
+      mainPill.parentNode.insertBefore(todayPill, mainPill.nextSibling);
+      decoratedTodayKey.set(nameEl, todayKey);
+      lastTodayStats.pillsRenderedOffColumn++;
       if (lastTodayStats.sampleRevToday == null && rev != null) lastTodayStats.sampleRevToday = rev;
       if (!lastTodayStats.adjustCurrencyExample && adjCcy) lastTodayStats.adjustCurrencyExample = adjCcy;
       return;
@@ -891,7 +945,8 @@
     const possibleStale = mainPill.nextElementSibling;
     if (possibleStale?.classList?.contains('adjust-pill-today') ||
         possibleStale?.classList?.contains('adjust-pill-today-mismatch') ||
-        possibleStale?.classList?.contains('adjust-pill-today-offdate')) {
+        possibleStale?.classList?.contains('adjust-pill-today-offdate') ||
+        possibleStale?.classList?.contains('adjust-pill-today-offcolumn')) {
       possibleStale.remove();
     }
 
@@ -1646,7 +1701,7 @@
     lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByAdjustId: 0, resolvedByMetaPreload: 0, resolvedByDom: 0, stillAmbiguous: 0 };
     lastTodayStats = {
       columnFound: false, columnHeaderText: null, columnX: null,
-      pillsRendered: 0, pillsRenderedOffDate: 0,
+      pillsRendered: 0, pillsRenderedOffDate: 0, pillsRenderedOffColumn: 0,
       skippedNoSpendCell: 0, skippedCurrencyMismatch: 0,
       skippedAmbiguous: 0, skippedAbbreviated: 0,
       skippedOffDate: 0,

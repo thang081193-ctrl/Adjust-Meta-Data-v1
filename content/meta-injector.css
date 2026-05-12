@@ -39,6 +39,11 @@
    visible spend cell would mislead. Renders rev only with a date label. */
 .adjust-pill-today-offdate  { background: #fff3e0; color: #6a3a00; border: 1px dashed #d9a300; }
 .adjust-pill-today-offdate::before { content: "⚠ "; }
+/* Off-column variant: Meta horizontally-virtualizes data cells; when the
+   Amount spent column is scrolled out of view, its row cells aren't in the
+   DOM so spend can't be read. Same warn styling as off-date. */
+.adjust-pill-today-offcolumn { background: #fff3e0; color: #6a3a00; border: 1px dashed #d9a300; }
+.adjust-pill-today-offcolumn::before { content: "⚠ "; }
 
 /* Banner = small draggable badge that expands into a details panel on click.
    Default position is bottom-right; once the user drags it, the new position
