@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.3.5-tt-today-pill-width-cache-fix';
+  const INJECTOR_VERSION = 'v0.3.6-tt-kstable-scope';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -582,7 +582,8 @@
     //      columns can hold a "Cost" label that wins on Y alone. We score
     //      candidates by currency-cells-below-X (step 2) instead of trusting
     //      Y order.
-    const tableScope = document.querySelector('ks-virtual-table')
+    const tableScope = document.querySelector('[class~="KsTable"]')
+      || document.querySelector('ks-virtual-table')
       || document.querySelector('[class*="ks-table"]')
       || document.body;
 
@@ -686,7 +687,8 @@
   function ensureRowYBuckets() {
     if (rowYBuckets) return rowYBuckets;
     rowYBuckets = new Map();
-    const tableScope = document.querySelector('ks-virtual-table')
+    const tableScope = document.querySelector('[class~="KsTable"]')
+      || document.querySelector('ks-virtual-table')
       || document.querySelector('[class*="ks-table"]')
       || document.body;
     for (const el of tableScope.querySelectorAll('*')) {
