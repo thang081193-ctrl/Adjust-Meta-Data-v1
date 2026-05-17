@@ -1,0 +1,12 @@
+# Local development secrets. Copy this to .dev.vars and fill in.
+# .dev.vars is gitignored — never commit real values.
+# In production these go via `wrangler secret put`, not in this file.
+
+ADJUST_API_TOKEN="paste-adjust-admin-token-here"
+
+# Sign JWTs. Generate with: openssl rand -hex 32
+JWT_SECRET="paste-32-byte-random-hex-here"
+
+# All 8 IAA app tokens. Server uses this map; user records in KV reference
+# keys (e.g. "decoai") rather than hardcoded tokens.
+APP_TOKENS_JSON='{"decoai":"...","ai_tutor":"...","chartlens":"...","chatbot":"...","chatify":"...","gen_art":"...","plantsmart":"...","tradebuddy":"..."}'

@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/icons/32.png">
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; width: 360px; margin: 0; padding: 12px; }
+  h3 { margin: 0 0 8px; font-size: 14px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+  button.primary { background: #1877f2; color: #fff; border-color: #1877f2; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+
+  .status { font-size: 12px; color: #666; margin: 6px 0; }
+
+  .periods { display: flex; gap: 4px; flex-wrap: wrap; margin: 8px 0; }
+  .periods button { flex: 1; min-width: 60px; padding: 6px 8px; font-size: 11px; }
+  .periods button.active {
+    background: #00C566; color: #fff; border-color: #00C566; font-weight: 600;
+  }
+
+  .group { margin: 6px 0; padding: 6px; border-radius: 4px; font-size: 12px; }
+  .group-pause { background: #fee; color: #b00020; }
+  .group-scale { background: #e8f5e9; color: #1b5e20; }
+  .group-hold  { background: #f5f5f5; color: #424242; }
+  .group-noisy { background: #fff3e0; color: #6a3a00; }
+
+  .err { color: #b00020; font-size: 12px; margin: 6px 0; }
+  details { margin-top: 8px; }
+  label { font-size: 12px; }
+
+  .thresh-table { width: 100%; font-size: 12px; border-collapse: collapse; margin: 6px 0; }
+  .thresh-table th, .thresh-table td { padding: 3px 4px; text-align: left; }
+  .thresh-table th { font-weight: 600; color: #555; }
+  .thresh-table td:first-child { color: #555; }
+  .thresh-table input { width: 48px; padding: 2px 4px; font-size: 11px; }
+  .thresh-hint { font-size: 11px; color: #777; margin: 4px 0 8px; }
+
+  /* Build banner — always visible at the top so user never confuses the
+     SECURE build with the local v0.3.0 build that loads side-by-side */
+  .build-banner {
+    background: linear-gradient(90deg, #00C566 0%, #00a956 100%);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    padding: 6px 8px;
+    margin: -12px -12px 12px -12px;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+    border-bottom: 2px solid #008c47;
+  }
+  .build-banner small { font-weight: 500; opacity: 0.9; text-transform: none; letter-spacing: 0; }
+
+  /* Login UI */
+  .login-panel { padding: 6px 0; }
+  .login-panel input { width: 100%; padding: 6px 8px; font-size: 12px;
+    border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+  .login-panel .row { margin: 8px 0; }
+  .who-bar { display: flex; justify-content: space-between; align-items: center;
+    font-size: 11px; color: #666; padding: 4px 6px; background: #f5f5f5;
+    border-radius: 4px; margin-bottom: 8px; }
+  .who-bar a { color: #1877f2; cursor: pointer; text-decoration: none; }
+  .who-bar a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <div class="build-banner">
+    JM Stu - Dataview
+    <br><small>UA distribution · <span id="bannerUaName">&lt;Tên UA&gt;</span></small>
+  </div>
+  <h3>Adjust ROAS Overlay</h3>
+
+  <!-- Login UI: shown when no JWT in storage -->
+  <div id="loginPanel" class="login-panel" style="display:none">
+    <div class="row">
+      <label style="width:100%">
+        Email:<br>
+        <input id="loginEmail" type="email" placeholder="you@jellymedia.vn" autocomplete="username" />
+      </label>
+    </div>
+    <div class="row">
+      <label style="width:100%">
+        Password:<br>
+        <input id="loginPwd" type="password" placeholder="••••••••" autocomplete="current-password" />
+      </label>
+    </div>
+    <div class="row">
+      <button id="loginBtn" class="primary" style="flex:1">Sign in</button>
+    </div>
+    <div id="loginError" class="err" style="display:none"></div>
+  </div>
+
+  <!-- Main UI: shown when logged in -->
+  <div id="mainPanel" style="display:none">
+    <div class="who-bar">
+      <span id="whoLabel">…</span>
+      <a id="logoutBtn">Logout</a>
+    </div>
+
+    <div class="status" id="status">Loading…</div>
+
+    <div class="periods" id="periods" role="group" aria-label="Date period">
+      <button data-period="yesterday">Yesterday</button>
+      <button data-period="rolling3">Last 3d</button>
+      <button data-period="rolling7">Last 7d</button>
+      <button data-period="rolling30">Last 30d</button>
+      <button data-period="last_month">Last month</button>
+    </div>
+
+    <div class="row">
+      <button id="sync" class="primary">Sync (cached if fresh)</button>
+      <button id="forceSync">Force refresh</button>
+    </div>
+
+    <div id="error" class="err" style="display:none"></div>
+
+    <div id="groups"></div>
+
+    <details>
+      <summary>Color thresholds</summary>
+      <div class="thresh-hint">
+        Pill background goes red only when d7 ROAS &lt; <em>Pill red</em>. Each
+        D-segment colors itself: &lt; <em>Value red</em> → red, &gt;
+        <em>Value green</em> → green. Values in %.
+      </div>
+      <table class="thresh-table">
+        <thead>
+          <tr><th></th><th>Meta %</th><th>TikTok %</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Pill red if d7 below</td>
+            <td><input id="metaPause" type="number" min="0" max="500" /></td>
+            <td><input id="tiktokPause" type="number" min="0" max="500" /></td>
+          </tr>
+          <tr>
+            <td>Value red below</td>
+            <td><input id="metaRed" type="number" min="0" max="500" /></td>
+            <td><input id="tiktokRed" type="number" min="0" max="500" /></td>
+          </tr>
+          <tr>
+            <td>Value green above</td>
+            <td><input id="metaGreen" type="number" min="0" max="500" /></td>
+            <td><input id="tiktokGreen" type="number" min="0" max="500" /></td>
+          </tr>
+        </tbody>
+      </table>
+      <button id="saveThresholds">Save thresholds</button>
+    </details>
+  </div>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

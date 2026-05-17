@@ -6,3 +6,8 @@ node_modules/
 .vscode/
 .idea/
 .claude/settings.local.json
+
+# v2-secure worker
+v2-secure/worker/.dev.vars
+v2-secure/worker/.wrangler/
+v2-secure/extension/dist/

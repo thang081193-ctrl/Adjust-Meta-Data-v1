@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+dist/
+.env
+
+# Seed payloads (contain password hashes — sensitive)
+.user-*.json
+
+# Test output captures from manual curl tests
+roas-*.json
+today.json
+login.json

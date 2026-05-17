@@ -1,0 +1,40 @@
+# Cloudflare Worker config.
+#
+# After `wrangler login`, run these once to provision storage:
+#   wrangler kv:namespace create USERS         # paste returned id below
+#   wrangler kv:namespace create CACHE         # paste returned id below
+#   wrangler kv:namespace create AUDIT         # paste returned id below
+#
+# Then set secrets (NEVER commit these):
+#   wrangler secret put ADJUST_API_TOKEN       # paste your Adjust admin token
+#   wrangler secret put JWT_SECRET             # paste a 32+ random string
+#   wrangler secret put APP_TOKENS_JSON        # paste JSON map (see .dev.vars.example)
+#
+# Local dev: copy .dev.vars.example → .dev.vars and fill in.
+
+name = "adjust-roas-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Optional custom domain. Comment out the routes block below to use the
+# default workers.dev URL (https://adjust-roas-proxy.<account>.workers.dev).
+# [[routes]]
+# pattern = "proxy.jellymedia.vn/*"
+# zone_name = "jellymedia.vn"
+# custom_domain = true
+
+[[kv_namespaces]]
+binding = "USERS"
+id = "be154eaea5cb4afaa60f4f2f9c625b4b"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "c3107b6bd93042c58029abd3a0b2f7a8"
+
+[[kv_namespaces]]
+binding = "AUDIT"
+id = "a22c1499ce404c31ac23fa11e2bcc4d2"
+
+[observability]
+enabled = true
