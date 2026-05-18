@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Adjust → Meta ROAS Overlay",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "Pull accurate multi-window ROAS from Adjust and overlay onto Meta Ads Manager and TikTok Ads Manager UIs for decision support.",
   "permissions": [
     "storage"

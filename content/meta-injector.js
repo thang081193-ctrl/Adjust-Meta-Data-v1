@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.6.1-perf-bridge-combined-walks';
+  const INJECTOR_VERSION = 'v0.7.1-idkey-namespace';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -209,19 +209,25 @@
         return;
       }
 
-      // Cached rows come at two levels: 'campaign' (one row per campaign,
-      // pulled directly with dimensions=campaign_network) and 'ad' (one row
-      // per ad, pulled with all four dimensions). Campaign names are unique
-      // per account so campaignIndex never collides. Ad names and ad set names
-      // routinely repeat across campaigns (e.g. "MVideo 2003" reused in 20
-      // campaigns), so for those we also build composite (campaignId::name)
-      // indexes — used when the user has drilled into a specific campaign and
-      // Meta's URL exposes ?selected_campaign_ids=ID.
+      // Cached rows come at three levels: 'campaign' (one row per campaign,
+      // pulled directly with dimensions=campaign_network), 'adset' (one row
+      // per adset, pulled with dimensions=campaign_network,adgroup_network),
+      // and 'ad' (one row per ad, pulled with all four dimensions). Campaign
+      // names are unique per account so campaignIndex never collides. Ad
+      // names and ad set names routinely repeat across campaigns (e.g.
+      // "MVideo 2003" reused in 20 campaigns), so for those we also build
+      // composite (campaignId::name) indexes — used when the user has drilled
+      // into a specific campaign and Meta's URL exposes ?selected_campaign_ids=ID.
       const campaignRows = cached.campaigns.filter(r => r.level === 'campaign');
+      const adsetRows = cached.campaigns.filter(r => r.level === 'adset');
       const adRows = cached.campaigns.filter(r => r.level === 'ad');
 
       campaignIndex = buildDirectIndex(campaignRows, r => r.campaignName);
-      const adsetBuilt = buildAggregatedIndex(adRows, r => r.adsetName, r => r.adsetId);
+      // Adset index built from adset-level Adjust rows directly — one row per
+      // adset, no creative-level rollup. This eliminates the attribution-shadow
+      // double-count bug where a stale today-row with creative_id_network=null
+      // gets summed alongside the resolved creative_id row.
+      const adsetBuilt = buildAggregatedIndex(adsetRows, r => r.adsetName, r => r.adsetId);
       adsetIndex = adsetBuilt.byName;
       adsetCompositeIndex = adsetBuilt.byComposite;
       adsetByIdIndex = adsetBuilt.byId;
@@ -237,7 +243,7 @@
       // in. Kept as a separate pass so we never modify the signatures of the
       // existing buildDirectIndex / buildAdIndex / buildAggregatedIndex /
       // aggregateRoas functions — diff stays additive.
-      attachTodayMetrics(campaignRows, adRows);
+      attachTodayMetrics(campaignRows, adsetRows, adRows);
 
       // Push the freshly-built id sets to the page-world bridge so it knows
       // which digit strings to look for on subsequent row scans.
@@ -340,11 +346,13 @@
     return { byName, byComposite, byAdId };
   }
 
-  // Aggregated index for ad sets (API doesn't return adset-level rows; we
-  // roll ads up by adsetName). Same composite-key disambiguation as ads —
-  // adset names can repeat across campaigns ("2003 Italy" in 8 campaigns).
-  // When `getId` is provided, also builds a direct ID lookup (Adjust's
-  // adgroup_id_network → Meta adset_id) for name-free disambiguation.
+  // Aggregated index for ad sets. As of the adset-level Adjust fetch, rows
+  // arrive at adset granularity directly (one row per adset) — but this
+  // builder still groups by canonical adsetName so cross-campaign name
+  // collisions ("2003 Italy" in 8 campaigns) get marked ambiguous and
+  // resolved via the page-bridge ID lookup. When `getId` is provided, also
+  // builds a direct ID lookup (Adjust's adgroup_id_network → Meta adset_id)
+  // for name-free disambiguation.
   function buildAggregatedIndex(rows, getName, getId) {
     const byName = new Map();
     const byComposite = new Map();
@@ -494,25 +502,30 @@
   // guard with a per-row `visited` WeakSet so each unique entry object is
   // bumped at most once per row. (buildAggregatedIndex constructs distinct
   // objects per index so the guard is a no-op for adsets — harmless.)
-  function attachTodayMetrics(campaignRows, adRows) {
+  function attachTodayMetrics(campaignRows, adsetRows, adRows) {
     for (const r of campaignRows) {
       if (!r.campaignName) continue;
       bumpToday(campaignIndex, canonicalKey(r.campaignName), r, new WeakSet());
     }
-    for (const r of adRows) {
+    // Adset today metrics come from adset-level Adjust rows directly. We do
+    // NOT sum ad-level rows into adsetIndex here — that produced inflated
+    // totals when Adjust returned creative_id=null shadow rows during
+    // real-time attribution finalization.
+    for (const r of adsetRows) {
+      if (!r.adsetName) continue;
       const visited = new WeakSet();
-      if (r.adsetName) {
-        const ak = canonicalKey(r.adsetName);
-        bumpToday(adsetIndex, ak, r, visited);
-        if (r.campaignId) bumpToday(adsetCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
-        if (r.adsetId) bumpToday(adsetByIdIndex, String(r.adsetId), r, visited);
-      }
-      if (r.adName) {
-        const ak = canonicalKey(r.adName);
-        bumpToday(adIndex, ak, r, visited);
-        if (r.campaignId) bumpToday(adCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
-        if (r.adId) bumpToday(adByIdIndex, String(r.adId), r, visited);
-      }
+      const ak = canonicalKey(r.adsetName);
+      bumpToday(adsetIndex, ak, r, visited);
+      if (r.campaignId) bumpToday(adsetCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+      if (r.adsetId) bumpToday(adsetByIdIndex, String(r.adsetId), r, visited);
+    }
+    for (const r of adRows) {
+      if (!r.adName) continue;
+      const visited = new WeakSet();
+      const ak = canonicalKey(r.adName);
+      bumpToday(adIndex, ak, r, visited);
+      if (r.campaignId) bumpToday(adCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+      if (r.adId) bumpToday(adByIdIndex, String(r.adId), r, visited);
     }
   }
 

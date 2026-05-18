@@ -85,10 +85,20 @@ export async function fetchCampaignROAS({
 }) {
   const resolvedPeriod = expandDatePeriod(datePeriod);
 
-  const [campaignRows, adRows] = await Promise.all([
+  const [campaignRows, adsetRows, adRows] = await Promise.all([
     fetchAtLevel({
       apiToken, utcOffset, datePeriod: resolvedPeriod, appTokens,
       dimensions: 'channel,campaign_network',
+    }),
+    // Adset-level direct fetch — separate from ad-level roll-up. Avoids
+    // creative_id_network attribution shadows: when Adjust occasionally
+    // returns a duplicate ad-level row with creative_id_network=null during
+    // real-time attribution finalization, naive sum-of-ad-rows inflates the
+    // adset total vs. what Datascape's adset-view shows. Direct adset query
+    // (without creative dim) returns a single canonical row per adset.
+    fetchAtLevel({
+      apiToken, utcOffset, datePeriod: resolvedPeriod, appTokens,
+      dimensions: 'channel,campaign_network,adgroup_network',
     }),
     fetchAtLevel({
       apiToken, utcOffset, datePeriod: resolvedPeriod, appTokens,
@@ -98,6 +108,7 @@ export async function fetchCampaignROAS({
 
   const out = [];
   for (const row of campaignRows) out.push(toRow(row, 'campaign'));
+  for (const row of adsetRows) out.push(toRow(row, 'adset'));
   for (const row of adRows) out.push(toRow(row, 'ad'));
   return out;
 }
@@ -191,10 +202,15 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
 // accepts both. If a real account returns neither, currency-mismatch logic in
 // the injector falls back to symbol-only detection from the Meta UI cell.
 export async function fetchTodayGrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
-  const [campaignRows, adRows] = await Promise.all([
+  const [campaignRows, adsetRows, adRows] = await Promise.all([
     fetchTodayAtLevel({
       apiToken, utcOffset, appTokens,
       dimensions: 'channel,campaign_network',
+    }),
+    // Adset-level direct fetch — see comment in fetchCampaignROAS.
+    fetchTodayAtLevel({
+      apiToken, utcOffset, appTokens,
+      dimensions: 'channel,campaign_network,adgroup_network',
     }),
     fetchTodayAtLevel({
       apiToken, utcOffset, appTokens,
@@ -203,6 +219,7 @@ export async function fetchTodayGrossRevenue({ apiToken, utcOffset = '+07:00', a
   ]);
   const out = [];
   for (const row of campaignRows) out.push(toTodayRow(row, 'campaign'));
+  for (const row of adsetRows) out.push(toTodayRow(row, 'adset'));
   for (const row of adRows) out.push(toTodayRow(row, 'ad'));
   return out;
 }

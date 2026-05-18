@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.3.6-tt-kstable-scope';
+  const INJECTOR_VERSION = 'v0.4.1-tt-idkey-namespace';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -252,12 +252,19 @@
       const allRows = (cached.campaigns || []);
       const tiktokRows = allRows.filter(r => (r.network || '').startsWith(TIKTOK_NETWORK_PREFIX));
       const campaignRows = tiktokRows.filter(r => r.level === 'campaign');
+      const adsetRows = tiktokRows.filter(r => r.level === 'adset');
       const adRows = tiktokRows.filter(r => r.level === 'ad');
 
       campaignIndex = buildDirectIndex(campaignRows, r => r.campaignName);
       campByIdIndex = buildIdIndex(campaignRows, r => r.campaignId, r => r.campaignName);
 
-      const adsetBuilt = buildAggregatedIndex(adRows, r => r.adsetName, r => r.adsetId);
+      // Adset index built from adset-level Adjust rows directly — one row per
+      // adset, no creative-level rollup. This eliminates the attribution-shadow
+      // double-count bug where a stale today-row with creative_id_network=null
+      // gets summed alongside the resolved creative_id row.
+      // buildAggregatedIndex still groups by canonical adsetName so cross-app
+      // collisions are marked ambiguous and resolved via the bridge.
+      const adsetBuilt = buildAggregatedIndex(adsetRows, r => r.adsetName, r => r.adsetId);
       adsetIndex = adsetBuilt.byName;
       adsetCompositeIndex = adsetBuilt.byComposite;
       adsetByIdIndex = adsetBuilt.byId;
@@ -274,7 +281,7 @@
       // entry by summing the per-row `revenueToday` field that data-source.js
       // merged in. Kept as a separate pass so we never modify the signatures
       // of the existing index builders — diff stays additive.
-      attachTodayMetrics(campaignRows, adRows);
+      attachTodayMetrics(campaignRows, adsetRows, adRows);
 
       dispatchBridgeKnownIds();
 
@@ -531,27 +538,32 @@
   // would triple-count the same row's revenue onto the same object. We guard
   // with a per-row `visited` WeakSet so each unique entry is bumped at most
   // once per row.
-  function attachTodayMetrics(campaignRows, adRows) {
+  function attachTodayMetrics(campaignRows, adsetRows, adRows) {
     for (const r of campaignRows) {
       if (!r.campaignName) continue;
       const visited = new WeakSet();
       bumpToday(campaignIndex, canonicalKey(r.campaignName), r, visited);
       if (r.campaignId) bumpToday(campByIdIndex, String(r.campaignId), r, visited);
     }
-    for (const r of adRows) {
+    // Adset today metrics come from adset-level Adjust rows directly. We do
+    // NOT sum ad-level rows into adsetIndex here — that produced inflated
+    // totals when Adjust returned creative_id=null shadow rows during
+    // real-time attribution finalization (see docs/findings/adjust_today_shadow_row.md).
+    for (const r of adsetRows) {
+      if (!r.adsetName) continue;
       const visited = new WeakSet();
-      if (r.adsetName) {
-        const ak = canonicalKey(r.adsetName);
-        bumpToday(adsetIndex, ak, r, visited);
-        if (r.campaignId) bumpToday(adsetCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
-        if (r.adsetId) bumpToday(adsetByIdIndex, String(r.adsetId), r, visited);
-      }
-      if (r.adName) {
-        const ak = canonicalKey(r.adName);
-        bumpToday(adIndex, ak, r, visited);
-        if (r.campaignId) bumpToday(adCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
-        if (r.adId) bumpToday(adByIdIndex, String(r.adId), r, visited);
-      }
+      const ak = canonicalKey(r.adsetName);
+      bumpToday(adsetIndex, ak, r, visited);
+      if (r.campaignId) bumpToday(adsetCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+      if (r.adsetId) bumpToday(adsetByIdIndex, String(r.adsetId), r, visited);
+    }
+    for (const r of adRows) {
+      if (!r.adName) continue;
+      const visited = new WeakSet();
+      const ak = canonicalKey(r.adName);
+      bumpToday(adIndex, ak, r, visited);
+      if (r.campaignId) bumpToday(adCompositeIndex, `${r.campaignId}::${ak}`, r, visited);
+      if (r.adId) bumpToday(adByIdIndex, String(r.adId), r, visited);
     }
   }
 

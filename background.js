@@ -11,6 +11,13 @@ import { createDataSource } from './src/data-source.js';
 
 const TTL_MS = 5 * 60 * 1000;
 const CACHE_KEY = 'campaignDataCache';
+// Bump when cache shape changes incompatibly. Readers without this version
+// or with an older version discard their cache and force a fresh sync.
+// v2: introduced level='adset' rows from direct Adjust adset-level fetch.
+// v3: fixed todayIdKey collision between ad-level shadow rows and adset-level
+//     rows that caused adsetByIdIndex to be bumped twice (cohort row + orphan
+//     row both keyed by adsetId), producing inflated pill revenue.
+const CACHE_SCHEMA_VERSION = 3;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Async pattern: return true to keep channel open.
@@ -49,6 +56,7 @@ async function forceSync() {
   // Let exceptions propagate - caller will see error, no stale fallback.
   const campaigns = await source.fetchAll();
   const stored = {
+    schemaVersion: CACHE_SCHEMA_VERSION,
     campaigns,
     lastSyncAt: Date.now(),
     sourceLabel: source.describe(),
@@ -59,9 +67,16 @@ async function forceSync() {
 
 // Returns null when no data, otherwise the cache payload enriched with
 // ageMs + isStale so callers don't need a second round-trip to compute freshness.
+// Caches from a previous extension version (missing schemaVersion or older
+// than current) are discarded — caller treats this as "no data" and triggers
+// a fresh sync, ensuring users don't see stale rollup-era numbers after update.
 async function getCached() {
   const { [CACHE_KEY]: cached } = await chrome.storage.local.get(CACHE_KEY);
   if (!cached) return null;
+  if ((cached.schemaVersion || 0) < CACHE_SCHEMA_VERSION) {
+    await chrome.storage.local.remove(CACHE_KEY);
+    return null;
+  }
   const ageMs = Date.now() - cached.lastSyncAt;
   return { ...cached, ageMs, isStale: ageMs > TTL_MS };
 }
