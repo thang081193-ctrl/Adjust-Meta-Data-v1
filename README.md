@@ -2,6 +2,30 @@
 
 Chrome extension that pulls accurate multi-window ROAS from Adjust and overlays it onto Meta Ads Manager rows for decision support.
 
+---
+
+## Two independent builds — pick the right branch
+
+This repo ships **TWO independent variants** that must never be merged. Pick the branch matching your role:
+
+| Build | Branch | Pull command | Audience | Auth |
+|---|---|---|---|---|
+| **Local (dev)** | `main` | `git checkout main` | Personal use — daily dev, debugging, free to upgrade | None; Adjust token in popup Settings |
+| **Secure (UA team)** | `v2-secure` | `git fetch && git checkout v2-secure` | Remote UA team — stable, security-hardened | Email + password → JWT → Cloudflare Worker proxy; Adjust token lives server-side only |
+
+### What you get on each branch
+
+- **`main`** — Repo root contains the extension files (`manifest.json`, `popup/`, `content/`, `src/`, `background.js`). Direct Adjust API calls. Configurable via popup Settings.
+- **`v2-secure`** — Adds a `v2-secure/` folder containing both the proxy-gated Chrome extension (`v2-secure/extension/`) and the Cloudflare Worker proxy (`v2-secure/worker/`). See `v2-secure/README.md` after checkout for full setup, deploy, and onboarding instructions. The local v0.3.x files at repo root remain unchanged on this branch, so the secure build loads side-by-side with the local build in Chrome under distinct extension IDs.
+
+### Why two builds, no merge
+
+The UA team is remote and not fully trusted to hold Adjust admin credentials. `v2-secure` proxies everything through a Cloudflare Worker so credentials can be rotated server-side and individual users revoked (per-user records in KV, server-enforced app scope, 90-day audit log). The local build doesn't need any of that overhead — only the developer runs it on a trusted machine, and the simpler direct-API path makes daily iteration faster.
+
+**Hard rule**: do NOT generalize the two under a build flag, do NOT auto-backport fixes between branches. A bugfix in `main` applies to local only; security work in `v2-secure` stays on `v2-secure`. Meta/TikTok DOM updates usually need to land in both, but as **separate commits** on each branch.
+
+---
+
 ## Why this exists
 
 Meta's reported revenue/ROAS lags and skews vs MMP truth. This extension surfaces Adjust's accurate numbers (D0 / 3-day / 7-day / all-time) directly inside the Meta Ads Manager UI so you can review and act with reliable data — without alt-tabbing.
