@@ -112,7 +112,15 @@ function mergeTodayInto(cohortRows, todayRows) {
 
 function todayIdKey(row) {
   if (row.level === 'ad' && row.adId) return `ad::${row.adId}`;
-  if (row.level === 'ad' && row.adsetId) return `adset::${row.adsetId}`;
+  if (row.level === 'adset' && row.adsetId) return `adset::${row.adsetId}`;
+  // NOTE: ad-level rows with adId=null MUST NOT fall back to
+  // `adset::${adsetId}` — that namespace is owned by adset-level rows, and
+  // a shadow ad-row (creative_id_network=null) would clobber the legitimate
+  // adset-level today row in idIndex, making the cohort adset row match the
+  // shadow's revenue while the real adset today row gets orphan-appended.
+  // Net effect: both rows end up in cache with same adsetId, both get summed
+  // into adsetByIdIndex, pill displays double-counted revenue. Verified
+  // 2026-05-18. See docs/findings/adjust_today_shadow_row.md.
   if (row.campaignId) return `${row.level}::camp::${row.campaignId}::` +
     `${canonicalKey(row.adName || row.adsetName || row.campaignName || '')}`;
   return null;
@@ -120,6 +128,7 @@ function todayIdKey(row) {
 
 function todayNameKey(row) {
   if (row.level === 'campaign') return `campaign::${canonicalKey(row.campaignName || '')}`;
+  if (row.level === 'adset') return `adset::${canonicalKey(row.adsetName || '')}`;
   // ad-level row: key by ad name; adset is implicit. Name-only matches risk
   // collisions for ads with duplicate names across campaigns — but in that
   // case the ID-key path above already resolved the canonical one; this is
