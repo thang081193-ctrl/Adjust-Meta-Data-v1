@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.7.1-idkey-namespace';
+  const INJECTOR_VERSION = 'v0.7.2-spend-anchor-right-edge';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -136,6 +136,7 @@
     columnFound: false,
     columnHeaderText: null,
     columnX: null,
+    columnRight: null,
     pillsRendered: 0,
     pillsRenderedOffDate: 0,
     skippedNoSpendCell: 0,
@@ -634,7 +635,16 @@
     const halfHeight = (rowRange.bottom - rowRange.top) / 2;
     const bucketSpan = Math.max(1, Math.ceil(halfHeight / ROW_BUCKET_PX));
 
-    const headerX = currentSpendColumn.headerX;
+    // Anchor on the header's RIGHT edge, compared to each candidate's RIGHT
+    // edge, instead of center-to-center. Financial-table numbers are right-
+    // aligned within their column; header text is left-aligned but the cell
+    // container's right edge sits at the same column right edge as the
+    // numbers. Center-to-center failed when walk-up captured a 2-column
+    // ancestor (Cost-per-result + Amount-spent), placing headerX exactly
+    // between the two columns and picking the wrong one. Right-edge anchoring
+    // is robust regardless of whether the captured ancestor is the column
+    // itself or a wider container ending at the same right edge.
+    const headerRight = currentSpendColumn.headerRight;
 
     let best = null;
     let bestDist = Infinity;
@@ -652,12 +662,18 @@
         if (!txt) continue;
         if (!looksLikeCurrency(txt)) continue;
         const cellMidX = (r.left + r.right) / 2;
-        const dist = Math.abs(cellMidX - headerX);
+        const cellRight = r.right;
+        const dist = Math.abs(cellRight - headerRight);
         // Capture the first row's same-row candidates so logDomDiagnostics
         // can dump them. Helps diagnose "spend never reads" without DOM
         // round-tripping.
         if (lastTodayStats.sampleRowCandidates == null) {
-          candidatesForDiag.push({ x: Math.round(cellMidX), text: txt.slice(0, 30), dist: Math.round(dist) });
+          candidatesForDiag.push({
+            x: Math.round(cellMidX),
+            right: Math.round(cellRight),
+            text: txt.slice(0, 30),
+            dist: Math.round(dist),
+          });
         }
         if (dist < bestDist) { best = txt; bestDist = dist; }
       }
@@ -1676,7 +1692,7 @@
     // built lazily on the first ambiguous lookup and reused for the rest.
     lastDecorateStats = { ambiguous: 0, resolvedByScope: 0, resolvedByAdjustId: 0, resolvedByMetaPreload: 0, resolvedByDom: 0, stillAmbiguous: 0 };
     lastTodayStats = {
-      columnFound: false, columnHeaderText: null, columnX: null,
+      columnFound: false, columnHeaderText: null, columnX: null, columnRight: null,
       pillsRendered: 0, pillsRenderedOffDate: 0,
       skippedNoSpendCell: 0, skippedZeroSpend: 0,
       skippedCurrencyMismatch: 0, skippedNoAdjustData: 0,
@@ -1694,6 +1710,7 @@
     if (currentSpendColumn) {
       lastTodayStats.columnFound = true;
       lastTodayStats.columnX = Math.round(currentSpendColumn.headerX);
+      lastTodayStats.columnRight = Math.round(currentSpendColumn.headerRight);
       lastTodayStats.columnHeaderText = currentSpendColumn.headerText;
     }
     // Detect Meta UI's date filter once per pass. When not Today, the today
