@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.7.2-spend-anchor-right-edge';
+  const INJECTOR_VERSION = 'v0.7.3-pill-anchor-guard';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -897,6 +897,7 @@
           ? `Adjust today rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)}`
           : `Adjust has no revenue for this row today yet.`);
 
+      todayPill.dataset.aoxKey = mainKey;
       mainPill.parentNode.insertBefore(todayPill, mainPill.nextSibling);
       decoratedTodayKey.set(nameEl, todayKey);
       lastTodayStats.pillsRenderedOffDate++;
@@ -972,6 +973,7 @@
       lastTodayStats.pillsRendered++;
     }
 
+    todayPill.dataset.aoxKey = mainKey;
     mainPill.parentNode.insertBefore(todayPill, mainPill.nextSibling);
     decoratedTodayKey.set(nameEl, todayKey);
   }
@@ -1110,6 +1112,11 @@
     const rawName = el.textContent || '';
     if (rawName.length < 5 || rawName.length > 300) return;
     const key = canonicalKey(rawName);
+    // Virtualization guard — see clearForeignPills. Meta recycles row DOM
+    // nodes on scroll, so a pill anchored here may belong to the campaign this
+    // node PREVIOUSLY displayed. Drop any such mismatched pill before we read
+    // or repaint anything, so a row never shows another campaign's numbers.
+    clearForeignPills(el, key);
     // Try most specific first (ad), then ad set, then campaign. Meta's three
     // tabs only ever render one of these names per row, so collisions across
     // levels (same string used as both a campaign name and an ad name) are
@@ -1152,6 +1159,7 @@
         pill.title = formatTooltip(data);
       }
       fillPillSegments(pill, data.roas);
+      pill.dataset.aoxKey = key;
       el.parentNode.insertBefore(pill, el.nextSibling);
       decoratedKey.set(el, key);
     }
@@ -1160,6 +1168,40 @@
     // attempt; its own decoratedTodayKey WeakMap dedups so repeated calls
     // are cheap. Failure paths bump lastTodayStats counters but never throw.
     maybeRenderTodayPill(el, pill, data, key);
+  }
+
+  // Remove pills currently anchored to `el` that do NOT belong to `key`.
+  //
+  // Why this exists: pills are plain <span> siblings inserted next to Meta's
+  // <div.ellipsis> name cell. Meta's table is virtualized — it recycles the
+  // SAME DOM node for different rows as the user scrolls, swapping only the
+  // node's text. React doesn't manage our pills, so a recycled node keeps the
+  // previous campaign's pill, which then displays the wrong campaign's ROAS /
+  // today revenue on this row. Every pill we create is stamped with the
+  // canonical key of the row it was built for (dataset.aoxKey); here we drop
+  // any adjacent pill whose stamp != the node's CURRENT key.
+  //
+  // Runs at the top of decorateCandidate on EVERY pass, including before the
+  // `if (!data) return` early-out — otherwise a node recycled onto a campaign
+  // with no Adjust match would early-return and leave the stale pill stuck
+  // permanently (the previous bug: "Scale 0405" row showed "Video2903" data).
+  function clearForeignPills(el, key) {
+    let n = el.nextElementSibling;
+    let removed = false;
+    while (n && n.classList && n.classList.contains('adjust-pill')) {
+      const next = n.nextElementSibling;
+      if (n.dataset.aoxKey !== key) {
+        n.remove();
+        removed = true;
+      }
+      n = next;
+    }
+    if (removed) {
+      // Force a clean rebuild on this pass — the dedup WeakMaps may still claim
+      // this node is decorated for the now-removed (foreign) key.
+      decoratedKey.delete(el);
+      decoratedTodayKey.delete(el);
+    }
   }
 
   // Resolve an ambiguous index entry to a single (campaignId, name) match
