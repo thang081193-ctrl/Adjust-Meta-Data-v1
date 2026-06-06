@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.4.3-tt-cold-cache-retry';
+  const INJECTOR_VERSION = 'v0.4.7-tt-pill-lineup';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -1077,7 +1077,12 @@
       if (mainWidth > 0) mainPill._aoxWidth = mainWidth;
     }
     let leftAnchor;
-    if (cached && !cached.hidden && mainWidth > 0) {
+    if (mainPillAnchorX != null && maxMainPillWidth > 0) {
+      // Fixed slot: every Today pill starts at the same x (main column anchor +
+      // widest main pill + gap), so the Today pills line up in one straight
+      // column that never collides with the main-pill column.
+      leftAnchor = mainPillAnchorX + maxMainPillWidth + 6;
+    } else if (cached && !cached.hidden && mainWidth > 0) {
       leftAnchor = cached.left + mainWidth + 4;
     } else {
       const column = getColumnAncestor(cell);
@@ -1171,6 +1176,11 @@
       lastDecoratePass: { ...lastDecorateStats },
       bridgeProbe,
       today: { ...lastTodayStats },
+      // Checklog for the straight-column layout: anchorX is the shared left x
+      // every main pill snaps to; slot is the reserved main-pill width the
+      // Today column clears. If pills look staggered again, check these are
+      // stable across rows instead of re-deriving the layout from scratch.
+      pillLayout: { anchorX: mainPillAnchorX, slot: maxMainPillWidth },
     });
   }
 
@@ -1209,15 +1219,29 @@
     lastDecorateStats.matched++;
 
     if (decoratedKey.get(el) === key) {
-      // Same cell + same content — main pill is up to date. Today pill has
-      // its own independent dedup map (decoratedTodayKey) and MUST still be
+      // Same cell + same content — main pill SHOULD be up to date. Today pill
+      // has its own independent dedup map (decoratedTodayKey) and MUST still be
       // attempted: column header may not have been visible on the first pass,
-      // or the date filter may have flipped. The rAF loop is already (or
-      // about to be) tracking pill positions; nothing else to do for main.
+      // or the date filter may have flipped. The rAF loop is already (or about
+      // to be) tracking pill positions; nothing else to do for main.
       const existingPill = cellToPill.get(el);
-      if (existingPill) maybeRenderTodayPill(el, existingPill, data, key);
-      ensureRepositionLoop();
-      return;
+      if (existingPill) {
+        maybeRenderTodayPill(el, existingPill, data, key);
+        ensureRepositionLoop();
+        return;
+      }
+      // decoratedKey says up-to-date but the main pill is gone. removeAllPills()
+      // can only clear decoratedKey for cells that are candidates AT THAT MOMENT
+      // (a WeakMap can't be enumerated), so if this cell was transiently absent
+      // from pickNameCandidates() during a virtualization recycle, its pill got
+      // removed while this flag stayed set. Fall through to recreate instead of
+      // trusting the stale flag and leaving the top rows permanently blank.
+      lastDecorateStats.selfHealed++;
+      console.debug(
+        `%c[AOX-TT]%c self-heal: recreated missing pill for "${rawName.slice(0, 40)}"`,
+        'background:#0066ff;color:#fff;padding:1px 4px;border-radius:3px',
+        'color:#0066ff'
+      );
     }
 
     // Cell got reassigned to a different campaign (virtualization recycle):
@@ -1261,6 +1285,9 @@
     pill.style.top = '0';
     document.body.appendChild(pill);
     pill._aoxWidth = pill.offsetWidth;
+    // Track the widest main pill so the Today pill column gets a fixed slot
+    // wide enough to clear every main pill — keeps both columns straight.
+    if (pill._aoxWidth > maxMainPillWidth) maxMainPillWidth = pill._aoxWidth;
     positionPillToCell(el, pill);
 
     cellToPill.set(el, pill);
@@ -1281,17 +1308,48 @@
   // entries auto-evict when TikTok virtualizes the cell out of the DOM.
   const cellColumnCache = new WeakMap();
 
+  // Single table-wide anchors so every pill lines up in one straight vertical
+  // column instead of staggering by each row's own column-ancestor right edge
+  // (the per-cell heuristic returns slightly different ancestors row to row).
+  // Recomputed once per decorate pass; the rAF loop reuses them so the column
+  // stays put on vertical scroll. maxMainPillWidth only grows, reserving a
+  // fixed slot for the main pill so the Today pill column never overlaps it.
+  let mainPillAnchorX = null;
+  let maxMainPillWidth = 0;
+
+  // Median (not max) of the visible name cells' column right edges: robust to
+  // the occasional row where findColumnAncestor walks up to an over-wide
+  // wrapper, which a max would let drag every pill far to the right.
+  function computeMainPillAnchorX() {
+    const rights = [];
+    for (const cell of pickNameCandidates()) {
+      const r = cell.getBoundingClientRect();
+      if (r.height === 0 || r.bottom < 0 || r.top > window.innerHeight) continue;
+      const column = getColumnAncestor(cell);
+      rights.push(column ? column.getBoundingClientRect().right : r.right);
+    }
+    if (rights.length === 0) return null;
+    rights.sort((a, b) => a - b);
+    const mid = rights[Math.floor(rights.length / 2)];
+    return Math.round(mid + 6);
+  }
+
   function positionPillToCell(cell, pill) {
     const r = cell.getBoundingClientRect();
     const offscreen = r.width === 0 || r.height === 0
       || r.bottom < 0 || r.top > window.innerHeight;
-    // Horizontal: align to the name column's right edge, not the leaf link's,
-    // so pills line up vertically across rows regardless of name truncation
-    // length. Vertical: still keyed off the leaf cell so each pill matches
-    // its own row.
-    const column = getColumnAncestor(cell);
-    const colRight = column ? column.getBoundingClientRect().right : r.right;
-    const left = Math.round(colRight + 6);
+    // Horizontal: anchor every main pill to the SAME table-wide x so they form
+    // one straight vertical column. Fall back to this cell's own column right
+    // edge only before the first pass computes the shared anchor. Vertical:
+    // still keyed off the leaf cell so each pill matches its own row.
+    let left;
+    if (mainPillAnchorX != null) {
+      left = mainPillAnchorX;
+    } else {
+      const column = getColumnAncestor(cell);
+      const colRight = column ? column.getBoundingClientRect().right : r.right;
+      left = Math.round(colRight + 6);
+    }
     const top = Math.round(r.top + (r.height / 2) - 9);
     if (offscreen) {
       pill.style.display = 'none';
@@ -1346,6 +1404,11 @@
         pill.remove();
         cellToPill.delete(cell);
         lastPositioned.delete(cell);
+        // Clear the main-pill dedup flag too. TikTok recycles the same DOM node
+        // object across rows, so leaving decoratedKey set would make the next
+        // decorate pass believe a pill still exists for this cell and skip
+        // recreating it — the recycled top rows would render blank.
+        decoratedKey.delete(cell);
         // Today pill is keyed by the same cell; cleanup must mirror main pill
         // or it would leak orphaned floating pills as TikTok virtualizes rows.
         const todayPill = cellToTodayPill.get(cell);
@@ -1402,13 +1465,16 @@
                       :                     null;
 
     const entry = byName.get(key);
-    if (!entry) return null;
-    if (!entry.ambiguous) {
+    if (entry && !entry.ambiguous) {
       lastDecorateStats.resolvedByName++;
       return entry;
     }
 
-    // Ambiguous → try the bridge.
+    // Reach here on BOTH a true name miss (campaign renamed on the TikTok side
+    // so its current name isn't in the Adjust index) AND an ambiguous name
+    // match. Either way, resolve by the row's own id via the page-world bridge:
+    // Adjust keys its rows by the stable campaign/adgroup/ad id, which survives
+    // a UI rename, so this is the only path that rescues renamed campaigns.
     const hit = lookupBridgeRowHit(el);
     if (hit) {
       const id = level === 'campaign' ? hit.c
@@ -1418,25 +1484,40 @@
         const direct = byId.get(id);
         if (direct) {
           lastDecorateStats.resolvedByBridgeId++;
+          if (!entry) {
+            // Checklog: a climbing rescuedRenamed counter means more campaigns
+            // were renamed away from their Adjust names — expected after bid
+            // edits, but a sudden spike to ~all rows means the name index or
+            // bridge id space drifted and name matching silently died.
+            lastDecorateStats.rescuedRenamed++;
+            console.debug(
+              `%c[AOX-TT]%c bridge-id rescued renamed/missing row "${(el.textContent || '').slice(0, 48)}" → ${direct.campaignName}`,
+              'background:#0066ff;color:#fff;padding:1px 4px;border-radius:3px',
+              'color:#0066ff'
+            );
+          }
           return direct;
         }
-        if (byComposite) {
+        if (byComposite && hit.c) {
           // adset/ad: bridge gave us the id, but byId may be empty if the
           // captured id space doesn't match. Try (campId :: name) composite
           // when bridge ALSO supplies the campaign id (`c`) as a sibling hint.
-          if (hit.c) {
-            const m = byComposite.get(`${hit.c}::${key}`);
-            if (m) {
-              lastDecorateStats.resolvedByBridgeId++;
-              return m;
-            }
+          const m = byComposite.get(`${hit.c}::${key}`);
+          if (m) {
+            lastDecorateStats.resolvedByBridgeId++;
+            return m;
           }
         }
       }
     }
 
-    lastDecorateStats.stillAmbiguous++;
-    return entry;
+    // Bridge couldn't resolve. Fall back to the ambiguous aggregate if we had
+    // one; a true name miss with no bridge hit has nothing to render.
+    if (entry) {
+      lastDecorateStats.stillAmbiguous++;
+      return entry;
+    }
+    return null;
   }
 
   // ---- Pill helpers (kept compatible with content/meta-injector.css) ----
@@ -1649,7 +1730,12 @@
   }
 
   function decorateAllVisibleRows() {
-    lastDecorateStats = { candidates: 0, matched: 0, resolvedByName: 0, resolvedByBridgeId: 0, stillAmbiguous: 0 };
+    // `selfHealed` is a checklog signal: it counts cells whose decoratedKey
+    // flag said "pill exists" but cellToPill had none, forcing a recreate.
+    // Steady-state it should hover near 0; a sustained climb means the pill
+    // anchor/dedup invariant is breaking again (the v0.4.4 recycle bug) — watch
+    // it in DOM diagnostics instead of re-hunting the symptom from scratch.
+    lastDecorateStats = { candidates: 0, matched: 0, resolvedByName: 0, resolvedByBridgeId: 0, stillAmbiguous: 0, selfHealed: 0, rescuedRenamed: 0 };
     lastTodayStats = createEmptyTodayStats();
     rowYBuckets = null;
     // Locate the Cost column + detect TikTok UI date filter once per pass.
@@ -1665,6 +1751,10 @@
     lastTodayStats.ttDateIsToday = currentTikTokDate.isToday;
     lastTodayStats.ttDateLabel = currentTikTokDate.label;
     lastTodayStats.ttDateSource = currentTikTokDate.source;
+
+    // Compute the shared pill column anchor BEFORE decorating so the very
+    // first pill in this pass already lands in the straight column.
+    mainPillAnchorX = computeMainPillAnchorX();
 
     dispatchBridgeScan();
     pickNameCandidates().forEach(decorateCandidate);
@@ -1710,7 +1800,79 @@
     bodyObserver.observe(document.body, { childList: true, subtree: true });
   }
 
+  // ---- Pill visibility toggle ----
+  // The pills can clutter the table when the user just wants to read TikTok's
+  // own numbers. A single floating button flips a body-level <style> that
+  // hides every `.adjust-pill` (main + all Today variants share that base
+  // class) with one !important rule — no need to fight the rAF reposition
+  // loop, which keeps repositioning underneath the hidden style harmlessly.
+  // State persists in localStorage (same store the draggable banner already
+  // uses) so the preference survives reloads.
+  const PILLS_HIDDEN_KEY = 'aox-tt-pills-hidden';
+  let pillsHidden = false;
+
+  function readPillsHidden() {
+    try { return localStorage.getItem(PILLS_HIDDEN_KEY) === '1'; } catch { return false; }
+  }
+
+  function applyPillVisibility() {
+    let style = document.getElementById('aox-pill-hide-style');
+    if (pillsHidden) {
+      if (!style) {
+        style = document.createElement('style');
+        style.id = 'aox-pill-hide-style';
+        style.textContent = '.adjust-pill{display:none !important;}';
+        (document.head || document.documentElement).appendChild(style);
+      }
+    } else if (style) {
+      style.remove();
+    }
+    const btn = document.getElementById('aox-pill-toggle');
+    if (btn) {
+      btn.textContent = pillsHidden ? 'ROAS pill: OFF' : 'ROAS pill: ON';
+      btn.style.background = pillsHidden ? '#8a8f99' : '#0066ff';
+      btn.style.opacity = pillsHidden ? '0.7' : '0.92';
+      btn.title = pillsHidden
+        ? 'Adjust ROAS pills are hidden — click to show'
+        : 'Adjust ROAS pills are shown — click to hide';
+    }
+  }
+
+  function createPillToggle() {
+    if (document.getElementById('aox-pill-toggle')) return;
+    const btn = document.createElement('button');
+    btn.id = 'aox-pill-toggle';
+    btn.type = 'button';
+    Object.assign(btn.style, {
+      position: 'fixed', right: '16px', bottom: '16px', zIndex: '100000',
+      padding: '6px 11px', borderRadius: '14px', border: 'none',
+      color: '#fff', font: '600 12px/1 system-ui, -apple-system, sans-serif',
+      cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,.25)',
+    });
+    btn.addEventListener('click', () => {
+      pillsHidden = !pillsHidden;
+      try { localStorage.setItem(PILLS_HIDDEN_KEY, pillsHidden ? '1' : '0'); } catch { /* ignore */ }
+      applyPillVisibility();
+      console.log(
+        `%c[AOX-TT]%c ROAS pills ${pillsHidden ? 'hidden' : 'shown'} (user toggle)`,
+        'background:#0066ff;color:#fff;padding:1px 4px;border-radius:3px',
+        'color:#0066ff'
+      );
+    });
+    document.body.appendChild(btn);
+  }
+
+  function initPillToggle() {
+    pillsHidden = readPillsHidden();
+    createPillToggle();
+    applyPillVisibility();
+  }
+
   // ---- Init ----
+  // Mount the show/hide toggle immediately (independent of data load) so the
+  // user can collapse the overlay even before Adjust data arrives.
+  initPillToggle();
+
   // Load thresholds first so the very first decoration uses user-configured
   // colors rather than briefly painting with defaults and re-painting.
   loadColorThresholds().then(() => loadData());
