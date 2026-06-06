@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.4.1-tt-idkey-namespace';
+  const INJECTOR_VERSION = 'v0.4.3-tt-cold-cache-retry';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -95,6 +95,12 @@
   let campByIdIndex = new Map();
   let lastSyncAt = null;
   let sourceLabel = '';
+  // True once a real cache object has been received and indices built. The
+  // first GET_CACHED at init can race a cold service worker and return null,
+  // which leaves indices empty; the retry loop reloads until this flips true.
+  let dataLoaded = false;
+  // Guards against overlapping loadData() runs (retry tick + storage event).
+  let loadInFlight = false;
 
   // Color thresholds — overridable per-platform from popup Settings. Defaults
   // mirror what the popup writes when the user hasn't customized yet.
@@ -236,6 +242,8 @@
 
   // ---- Sync data from background ----
   async function loadData() {
+    if (loadInFlight) return;
+    loadInFlight = true;
     try {
       const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
       if (cached?.error) {
@@ -276,6 +284,7 @@
 
       lastSyncAt = cached.lastSyncAt;
       sourceLabel = cached.sourceLabel;
+      dataLoaded = true;
 
       // Post-build: attach revenueToday + adjustCurrency onto each index
       // entry by summing the per-row `revenueToday` field that data-source.js
@@ -292,6 +301,8 @@
       logDomDiagnostics();
     } catch (err) {
       console.warn('[Adjust Overlay TT] loadData failed:', err.message);
+    } finally {
+      loadInFlight = false;
     }
   }
 
@@ -1716,6 +1727,15 @@
   const retryHandle = setInterval(() => {
     if (Date.now() - retryStartedAt > RETRY_DEADLINE_MS) {
       clearInterval(retryHandle);
+      return;
+    }
+    // Data-level retry: the first GET_CACHED can lose a race with a cold
+    // service worker and return null, so loadData() bails before building any
+    // index. Without this, the DOM-level retry below would only ever decorate
+    // against empty indices (0 matches) until the user manually reloaded.
+    // Keep reloading until a real cache lands; loadData() decorates on success.
+    if (!dataLoaded) {
+      loadData();
       return;
     }
     const count = pickNameCandidates().length;
