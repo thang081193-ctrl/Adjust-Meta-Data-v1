@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.7.3-pill-anchor-guard';
+  const INJECTOR_VERSION = 'v0.7.4-pill-toggle';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -2018,6 +2018,77 @@
   window.addEventListener('popstate', () => {
     scheduleDecorate();
   });
+
+  // ---- Pill visibility toggle ----
+  // The pills can clutter the table when the user just wants to read Meta's
+  // own numbers. A single floating button flips a body-level <style> that
+  // hides every `.adjust-pill` (main + all Today variants share that base
+  // class) with one !important rule — no need to fight the rAF reposition
+  // loop, which keeps repositioning underneath the hidden style harmlessly.
+  // State persists in localStorage so the preference survives reloads.
+  const PILLS_HIDDEN_KEY = 'aox-meta-pills-hidden';
+  let pillsHidden = false;
+
+  function readPillsHidden() {
+    try { return localStorage.getItem(PILLS_HIDDEN_KEY) === '1'; } catch { return false; }
+  }
+
+  function applyPillVisibility() {
+    let style = document.getElementById('aox-pill-hide-style');
+    if (pillsHidden) {
+      if (!style) {
+        style = document.createElement('style');
+        style.id = 'aox-pill-hide-style';
+        style.textContent = '.adjust-pill{display:none !important;}';
+        (document.head || document.documentElement).appendChild(style);
+      }
+    } else if (style) {
+      style.remove();
+    }
+    const btn = document.getElementById('aox-pill-toggle');
+    if (btn) {
+      btn.textContent = pillsHidden ? 'ROAS pill: OFF' : 'ROAS pill: ON';
+      btn.style.background = pillsHidden ? '#8a8f99' : '#0066ff';
+      btn.style.opacity = pillsHidden ? '0.7' : '0.92';
+      btn.title = pillsHidden
+        ? 'Adjust ROAS pills are hidden — click to show'
+        : 'Adjust ROAS pills are shown — click to hide';
+    }
+  }
+
+  function createPillToggle() {
+    if (document.getElementById('aox-pill-toggle')) return;
+    const btn = document.createElement('button');
+    btn.id = 'aox-pill-toggle';
+    btn.type = 'button';
+    Object.assign(btn.style, {
+      position: 'fixed', right: '16px', bottom: '16px', zIndex: '100000',
+      padding: '6px 11px', borderRadius: '14px', border: 'none',
+      color: '#fff', font: '600 12px/1 system-ui, -apple-system, sans-serif',
+      cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,.25)',
+    });
+    btn.addEventListener('click', () => {
+      pillsHidden = !pillsHidden;
+      try { localStorage.setItem(PILLS_HIDDEN_KEY, pillsHidden ? '1' : '0'); } catch { /* ignore */ }
+      applyPillVisibility();
+      console.log(
+        `%c[AOX]%c ROAS pills ${pillsHidden ? 'hidden' : 'shown'} (user toggle)`,
+        'background:#0066ff;color:#fff;padding:1px 4px;border-radius:3px',
+        'color:#0066ff'
+      );
+    });
+    document.body.appendChild(btn);
+  }
+
+  function initPillToggle() {
+    pillsHidden = readPillsHidden();
+    createPillToggle();
+    applyPillVisibility();
+  }
+
+  // Mount the show/hide toggle immediately (independent of data load) so the
+  // user can collapse the overlay even before Adjust data arrives.
+  initPillToggle();
 
   // Initial. Load thresholds first so the very first decoration uses
   // user-configured colors rather than briefly painting with defaults.
