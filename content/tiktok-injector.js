@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.4.7-tt-pill-lineup';
+  const INJECTOR_VERSION = 'v0.4.8-tt-orphan-sweep';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -1392,33 +1392,25 @@
   // cell's current bounding rect to the last positioned values and only
   // updates style when something moved (cheap idle, smooth follow on scroll).
   // The loop self-terminates as soon as cellToPill drains.
-  let rafLoopActive = false;
+  //
+  // Tracked as the requestAnimationFrame HANDLE (not a bare boolean) so a
+  // suspended-then-dropped frame — which a long tab-hide or machine sleep can
+  // cause — can be cancelAnimationFrame'd and rescheduled cleanly on return.
+  // A boolean guard would get stuck "true" with no live frame, leaving the loop
+  // permanently dead (pills stop following scroll) and impossible to revive
+  // without risking a double-schedule. 0 means "no frame scheduled".
+  let rafHandle = 0;
   const lastPositioned = new WeakMap(); // cell → {left, top, hidden}
 
   function repositionLoopTick() {
-    rafLoopActive = false;
+    rafHandle = 0;
     if (cellToPill.size === 0) return;
 
     for (const [cell, pill] of cellToPill) {
-      if (!cell.isConnected) {
-        pill.remove();
-        cellToPill.delete(cell);
-        lastPositioned.delete(cell);
-        // Clear the main-pill dedup flag too. TikTok recycles the same DOM node
-        // object across rows, so leaving decoratedKey set would make the next
-        // decorate pass believe a pill still exists for this cell and skip
-        // recreating it — the recycled top rows would render blank.
-        decoratedKey.delete(cell);
-        // Today pill is keyed by the same cell; cleanup must mirror main pill
-        // or it would leak orphaned floating pills as TikTok virtualizes rows.
-        const todayPill = cellToTodayPill.get(cell);
-        if (todayPill) {
-          todayPill.remove();
-          cellToTodayPill.delete(cell);
-          decoratedTodayKey.delete(cell);
-        }
-        continue;
-      }
+      // Anchor cell left the DOM (virtualized out / table rebuilt) — reap its
+      // floating pills. dropPillFor is shared with gcDisconnectedPills so this
+      // teardown can't drift from the decorate-time sweep.
+      if (!cell.isConnected) { dropPillFor(cell); continue; }
       // Cheap prefilter using the cell's own rect: if vertical position and
       // visibility match what we last wrote, the pill is already correct.
       // commitTodayPill deletes the lastPositioned entry whenever a new
@@ -1438,15 +1430,13 @@
     }
 
     if (cellToPill.size > 0) {
-      rafLoopActive = true;
-      requestAnimationFrame(repositionLoopTick);
+      rafHandle = requestAnimationFrame(repositionLoopTick);
     }
   }
 
   function ensureRepositionLoop() {
-    if (rafLoopActive || cellToPill.size === 0) return;
-    rafLoopActive = true;
-    requestAnimationFrame(repositionLoopTick);
+    if (rafHandle || cellToPill.size === 0) return;
+    rafHandle = requestAnimationFrame(repositionLoopTick);
   }
 
   // Resolve a row at a specific level. Strategy chain:
@@ -1735,9 +1725,16 @@
     // Steady-state it should hover near 0; a sustained climb means the pill
     // anchor/dedup invariant is breaking again (the v0.4.4 recycle bug) — watch
     // it in DOM diagnostics instead of re-hunting the symptom from scratch.
-    lastDecorateStats = { candidates: 0, matched: 0, resolvedByName: 0, resolvedByBridgeId: 0, stillAmbiguous: 0, selfHealed: 0, rescuedRenamed: 0 };
+    lastDecorateStats = { candidates: 0, matched: 0, resolvedByName: 0, resolvedByBridgeId: 0, stillAmbiguous: 0, selfHealed: 0, rescuedRenamed: 0, gcOrphans: 0, gcLeaked: 0 };
     lastTodayStats = createEmptyTodayStats();
     rowYBuckets = null;
+    // Sweep stale pills BEFORE decorating, independent of the rAF janitor.
+    // gcDisconnectedPills drops pills whose cell virtualized out; sweepUntracked
+    // removes any leaked .adjust-pill node. Without this, a day-rollover refresh
+    // (MutationObserver path, no removeAllPills) leaves previous-day pills
+    // stacked under the new pass while the tab's rAF loop is suspended.
+    lastDecorateStats.gcOrphans = gcDisconnectedPills();
+    lastDecorateStats.gcLeaked = sweepUntrackedPills();
     // Locate the Cost column + detect TikTok UI date filter once per pass.
     // Today-pill rendering is skipped when the column isn't visible (banner
     // surfaces guidance). Off-date → rev-only warn variant.
@@ -1784,6 +1781,75 @@
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
     });
+  }
+
+  // Single source of truth for tearing down a cell's pills + bookkeeping. Both
+  // the rAF reposition loop (disconnect branch) and gcDisconnectedPills call
+  // this so the cleanup steps can never drift apart — this exact set of deletes
+  // regressed once before (the v0.4.4 recycle bug) when one call site forgot to
+  // clear decoratedKey. Idempotent: safe to call for a cell with no pill.
+  function dropPillFor(cell) {
+    const pill = cellToPill.get(cell);
+    if (pill) { pill.remove(); cellToPill.delete(cell); }
+    lastPositioned.delete(cell);
+    // Clear the main-pill dedup flag too. TikTok recycles the same DOM node
+    // object across rows, so leaving decoratedKey set would make the next
+    // decorate pass believe a pill still exists and skip recreating it — the
+    // recycled top rows would render blank.
+    decoratedKey.delete(cell);
+    const todayPill = cellToTodayPill.get(cell);
+    if (todayPill) {
+      todayPill.remove();
+      cellToTodayPill.delete(cell);
+      decoratedTodayKey.delete(cell);
+    }
+  }
+
+  // Drop every tracked pill whose anchor cell has left the DOM (TikTok
+  // virtualized the row out). Our pills are position:fixed body children, so a
+  // detached cell leaves its pill floating at its last coordinates until
+  // something removes it. The rAF loop does this per frame — but rAF is
+  // SUSPENDED while the tab is backgrounded, and TikTok still refreshes its own
+  // table across a day rollover (date-filter flip / auto-reload) via the
+  // MutationObserver path, which does NOT call removeAllPills(). Without a
+  // decorate-time sweep those stale pills hang around and the new pass renders
+  // fresh pills on top of them — the "stacked previous-day pills" symptom. The
+  // second loop catches a today pill whose cell left cellToPill but lingered in
+  // cellToTodayPill (bookkeeping drift), so the pair can never desync into an
+  // orphan. Returns count removed.
+  function gcDisconnectedPills() {
+    let removed = 0;
+    for (const [cell] of cellToPill) {
+      if (cell.isConnected) continue;
+      dropPillFor(cell);
+      removed++;
+    }
+    for (const [cell, pill] of cellToTodayPill) {
+      if (cell.isConnected) continue;
+      pill.remove();
+      cellToTodayPill.delete(cell);
+      decoratedTodayKey.delete(cell);
+      removed++;
+    }
+    return removed;
+  }
+
+  // Belt to gcDisconnectedPills's suspenders: remove any .adjust-pill node no
+  // longer referenced by either tracking Map. Such a node is genuinely leaked
+  // — a Map entry got overwritten without removing the old node, or a node
+  // escaped a prior removeAllPills query. Build the live set once per pass
+  // (visible-row count, cheap). Runs at the TOP of a decorate pass, before any
+  // new pill is created, so every legitimate pill is already in the Maps and
+  // only true orphans are swept. Returns count removed.
+  function sweepUntrackedPills() {
+    const live = new Set();
+    for (const pill of cellToPill.values()) live.add(pill);
+    for (const pill of cellToTodayPill.values()) live.add(pill);
+    let removed = 0;
+    document.querySelectorAll('.adjust-pill').forEach(node => {
+      if (!live.has(node)) { node.remove(); removed++; }
+    });
+    return removed;
   }
 
   function scheduleDecorate() {
@@ -1925,5 +1991,26 @@
         decorateAllVisibleRows();
       });
     }
+  });
+
+  // The rAF reposition loop — our per-frame orphan janitor — is SUSPENDED while
+  // the tab is hidden. TikTok can refresh its table across a day rollover while
+  // backgrounded, detaching the cells our pills anchor to; those pills then
+  // float at stale coordinates with no live loop to reap them. The moment the
+  // tab is visible again, sweep synchronously so the user never sees yesterday's
+  // pills stacked under today's, then debounce a full re-decorate (which also
+  // restarts the reposition loop). Both sweeps are idempotent and cheap.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    gcDisconnectedPills();
+    sweepUntrackedPills();
+    // The rAF frame that was pending when we were hidden may have been dropped
+    // by the browser, leaving rafHandle set but no live loop. Cancel it (a
+    // no-op if it already fired or was dropped) and reset, so the schedule
+    // below installs exactly one fresh frame and pills resume following scroll.
+    if (rafHandle) cancelAnimationFrame(rafHandle);
+    rafHandle = 0;
+    ensureRepositionLoop();
+    scheduleDecorate();
   });
 })();
