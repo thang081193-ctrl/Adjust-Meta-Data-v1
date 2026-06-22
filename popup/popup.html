@@ -36,6 +36,15 @@
   .thresh-table td:first-child { color: #555; }
   .thresh-table input { width: 48px; padding: 2px 4px; font-size: 11px; }
   .thresh-hint { font-size: 11px; color: #777; margin: 4px 0 8px; }
+
+  .tz-box { border: 1px solid #d0d7de; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fafbfc; }
+  .tz-head { font-size: 12px; font-weight: 600; color: #444; margin-bottom: 6px; }
+  .tz-field { margin: 8px 0; }
+  .tz-field:first-of-type { margin-top: 0; }
+  .tz-tag { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 3px; margin-bottom: 3px; letter-spacing: .2px; }
+  .tz-tag-adjust { background: #e7f0ff; color: #1851a6; }
+  .tz-tag-meta { background: #ffe9d6; color: #9a4a00; }
+  .tz-hint { font-size: 10px; color: #888; margin-top: 3px; line-height: 1.4; }
 </style>
 </head>
 <body>
@@ -67,10 +76,32 @@
         <input id="apiToken" type="password" style="width:100%" />
       </label>
     </div>
-    <div class="row">
-      <label>UTC offset:
-        <input id="utcOffset" type="text" value="+07:00" style="width:80px" />
-      </label>
+    <div class="tz-box">
+      <div class="tz-head">⏱ Timezone alignment</div>
+
+      <div class="tz-field">
+        <span class="tz-tag tz-tag-adjust">Adjust · điều chỉnh REVENUE</span><br>
+        <label>UTC offset (Adjust reporting timezone):<br>
+          <input id="utcOffset" type="text" list="utcOffsetList" value="+07:00" style="width:100%"
+                 placeholder="Search city or offset, e.g. Bangkok or +07:00"
+                 title="Adjust reporting offset. Type a city name or the ±HH:MM offset; the stored value is always normalized to ±HH:MM." />
+          <datalist id="utcOffsetList"></datalist>
+        </label>
+        <div class="tz-hint">Mốc giờ Adjust kéo doanh thu. Muốn ROAS khớp tuyệt đối: set thẳng theo giờ ad-account (vd LA = -08:00) và để dropdown dưới = "Same".</div>
+      </div>
+
+      <div class="tz-field">
+        <span class="tz-tag tz-tag-meta">Meta · điều chỉnh SPEND</span><br>
+        <label>Meta ad-account timezone (spend estimate):<br>
+          <select id="accountTimezone" style="width:100%">
+            <option value="">Same as UTC offset (no estimate)</option>
+            <option value="America/Los_Angeles">America/Los_Angeles (LA, PT)</option>
+            <option value="America/New_York">America/New_York (ET)</option>
+            <option value="UTC">UTC</option>
+          </select>
+        </label>
+        <div class="tz-hint">Để khi GIỮ Adjust ở +07:00 mà ad-account chạy giờ khác: chọn ở đây, extension ước lượng spend Meta về cửa sổ BKT (revenue giữ nguyên). Để "Same" nếu đã chỉnh UTC offset ở trên.</div>
+      </div>
     </div>
     <div class="row">
       <label style="font-size:11px;color:#777">

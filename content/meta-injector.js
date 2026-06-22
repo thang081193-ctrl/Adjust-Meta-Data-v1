@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.7.4-pill-toggle';
+  const INJECTOR_VERSION = 'v0.8.1-la-tz-optionb';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -139,6 +139,10 @@
     columnRight: null,
     pillsRendered: 0,
     pillsRenderedOffDate: 0,
+    pillsRenderedEstSpendDown: 0,
+    pillsRenderedEstSpendUp: 0,
+    pillsNeedYesterday: 0,
+    yestCaptured: 0,
     skippedNoSpendCell: 0,
     skippedZeroSpend: 0,
     skippedCurrencyMismatch: 0,
@@ -162,6 +166,98 @@
   // the spend cell value reflects whatever range the user has active. Detected
   // from URL params at decorate-pass start; see detectMetaUiDateInfo().
   let currentMetaDate = null;
+
+  // ---- LA-timezone (ad-account ≠ reporting timezone) today-pill estimate ----
+  // Adjust pulls revenue on the BKT reporting offset (utcOffset, default +07:00);
+  // Meta reports spend on the AD ACCOUNT timezone (e.g. America/Los_Angeles).
+  // When these differ, the BKT-"today" window the user reviews against and the
+  // LA-"today" spend Meta shows cover different absolute time ranges. We close
+  // the gap by topping up whichever side has fewer elapsed hours so both cover
+  // one identical window (see computeTzWindows + maybeRenderTodayPill).
+  //   currentReportingOffsetMin : minutes east of UTC for the Adjust offset.
+  //   currentAccountTz          : IANA zone of the Meta ad account, or '' (off).
+  let currentReportingOffsetMin = 420; // +07:00
+  let currentAccountTz = '';
+  // Per-row cache of a COMPLETE LA-yesterday spend, captured when the user
+  // switches Meta's date picker to "Yesterday". Keyed by canonical row key →
+  // { laDate, spend, currency }. laDate tags the LA calendar day it represents
+  // so a stale capture (from a previous day) is detected and a re-capture is
+  // requested instead of silently using wrong data.
+  const metaYestSpendCache = new Map();
+
+  // Read the Adjust reporting offset + Meta account timezone from the shared
+  // dataSourceConfig. Mirrors loadColorThresholds' storage-driven pattern.
+  async function loadTzConfig() {
+    try {
+      const { dataSourceConfig: cfg } = await chrome.storage.local.get('dataSourceConfig');
+      currentReportingOffsetMin = parseUtcOffsetMin(cfg?.utcOffset) ?? 420;
+      currentAccountTz = (cfg?.accountTimezone || '').trim();
+    } catch { /* keep defaults */ }
+  }
+
+  // Parse '+07:00' / '-08:00' / '+0700' → minutes east of UTC. Returns null on
+  // anything unparseable so callers fall back to the BKT default.
+  function parseUtcOffsetMin(raw) {
+    if (!raw) return null;
+    const m = String(raw).trim().match(/^([+-])(\d{1,2}):?(\d{2})?$/);
+    if (!m) return null;
+    const sign = m[1] === '-' ? -1 : 1;
+    const h = parseInt(m[2], 10);
+    const min = m[3] ? parseInt(m[3], 10) : 0;
+    return sign * (h * 60 + min);
+  }
+
+  // Wall-clock decomposition of `date` at a fixed UTC offset (minutes east).
+  // Returns hours-since-midnight (float) + ISO calendar date at that offset.
+  function partsAtOffset(date, offsetMin) {
+    const shifted = new Date(date.getTime() + offsetMin * 60000);
+    const h = shifted.getUTCHours() + shifted.getUTCMinutes() / 60 + shifted.getUTCSeconds() / 3600;
+    const y = shifted.getUTCFullYear();
+    const mo = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(shifted.getUTCDate()).padStart(2, '0');
+    return { h, dateISO: `${y}-${mo}-${d}` };
+  }
+
+  // Wall-clock decomposition of `date` in an IANA timezone (DST-aware, via
+  // Intl). Returns hours-since-midnight (float) + ISO calendar date in zone.
+  function partsInZone(date, timeZone) {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    const p = {};
+    for (const part of fmt.formatToParts(date)) p[part.type] = part.value;
+    const h = Number(p.hour) + Number(p.minute) / 60 + Number(p.second) / 3600;
+    return { h, dateISO: `${p.year}-${p.month}-${p.day}` };
+  }
+
+  // Compute the two "today" windows and the estimation regime for the current
+  // moment. Returns null when no account timezone is configured or it matches
+  // the reporting offset (no estimate needed).
+  //   hBKT/hLA  : hours elapsed since midnight in the reporting / account zone.
+  //   extra     : |hBKT - hLA| = the hours one side is missing vs the other.
+  //   regime    : 1 → account day more elapsed (estimate REVENUE up);
+  //               2 → reporting day more elapsed (estimate SPEND up).
+  //   yestLaDate: ISO of the account zone's yesterday (cache tag for S_yest).
+  function computeTzWindows() {
+    if (!currentAccountTz) return null;
+    const now = new Date();
+    let acct;
+    try {
+      acct = partsInZone(now, currentAccountTz);
+    } catch {
+      return null; // invalid IANA zone — disable estimate rather than throw
+    }
+    const rep = partsAtOffset(now, currentReportingOffsetMin);
+    const hBKT = rep.h;
+    const hLA = acct.h;
+    const extra = Math.abs(hLA - hBKT);
+    if (extra < 0.01) return null; // zones effectively aligned
+    const regime = hLA > hBKT ? 1 : 2;
+    const yAcct = partsInZone(new Date(now.getTime() - 86400000), currentAccountTz);
+    return { hBKT, hLA, extra, regime, yestLaDate: yAcct.dateISO };
+  }
 
   // Meta preloads campaign/ad structure as JSON inside <script> tags BEFORE
   // rendering the table — specifically `campaign_structure_tree` payloads,
@@ -874,6 +970,28 @@
     // is alive). Skip the spend-cell read entirely — its value is correct for
     // some other date range and reading it would only confuse diagnostics.
     if (currentMetaDate && !currentMetaDate.isToday) {
+      // Capture a COMPLETE account-yesterday spend when the user parks Meta on
+      // the "Yesterday" view. Regime-2 today-pills (reporting day more elapsed
+      // than the account day) need yesterday's full spend to top up the partial
+      // account-today value; there's no Meta spend API, so this DOM read while
+      // the picker shows yesterday is the only source. Tagged with the account
+      // calendar date so a stale capture is rejected next day.
+      const capWin = computeTzWindows();
+      if (capWin && (currentMetaDate.label === 'yesterday' || currentMetaDate.label === capWin.yestLaDate)) {
+        const yText = findSpendCellText(nameEl);
+        if (yText != null) {
+          const yParsed = parseCurrencyCell(yText);
+          if (yParsed.parsed && yParsed.value != null && !yParsed.abbreviated) {
+            metaYestSpendCache.set(mainKey, {
+              laDate: capWin.yestLaDate,
+              spend: yParsed.value,
+              currency: yParsed.currency,
+            });
+            lastTodayStats.yestCaptured = (lastTodayStats.yestCaptured || 0) + 1;
+          }
+        }
+      }
+
       const todayKey = `${mainKey}|offdate:${currentMetaDate.label}|rev:${rev}|a:${adjCcy || ''}`;
       if (decoratedTodayKey.get(nameEl) === todayKey) return;
 
@@ -932,8 +1050,56 @@
 
     const currencyMismatch = metaCcy && adjCcy && metaCcy !== adjCcy;
 
+    // LA-timezone estimate (Option B — BKT-anchored window).
+    // Adjust pulls revenue on the reporting offset (BKT +07); Meta shows spend
+    // on the ad-account timezone (LA). The pill ALWAYS represents the BKT
+    // "today" window [BKT 00:00 → now]. Adjust revenue is already exactly that
+    // window, so REVENUE IS ALWAYS KEPT AS-IS — only spend is re-projected onto
+    // the BKT window, because Meta measures it on the misaligned LA day.
+    //   Regime 1 (account/LA day ahead, hLA > hBKT): Meta's LA-today window
+    //     (hLA h) fully contains the BKT-today window (hBKT h) as its tail.
+    //     Scale spend DOWN to that tail: spend × hBKT/hLA. No yesterday data
+    //     needed — derived entirely from today's own spend.
+    //   Regime 2 (reporting/BKT day ahead, hBKT > hLA): Meta's LA-today window
+    //     only covers the tail hLA hours of the BKT day; the missing leading
+    //     `extra` hours fall in LA-yesterday's late hours. Top up with the
+    //     DOM-captured complete account-yesterday spend: spend + S_yest×extra/24.
+    //     No capture ⇒ refuse to guess and show a warn pill asking the user.
+    let est = null;
+    if (!currencyMismatch && rev != null && spend != null) {
+      const win = computeTzWindows();
+      if (win) {
+        if (win.regime === 1) {
+          const dispSpend = win.hLA > 0 ? spend * (win.hBKT / win.hLA) : spend;
+          est = { mode: 'spend-down', dispRev: rev, dispSpend, win };
+        } else {
+          const cached = metaYestSpendCache.get(mainKey);
+          const fresh = cached && cached.laDate === win.yestLaDate && cached.spend != null;
+          const ccyOk = !fresh || !metaCcy || !cached.currency || cached.currency === metaCcy;
+          if (fresh && ccyOk) {
+            est = {
+              mode: 'spend-up',
+              dispRev: rev,
+              dispSpend: spend + cached.spend * (win.extra / 24),
+              win, syest: cached.spend,
+            };
+          } else {
+            est = { mode: 'need-yesterday', win };
+          }
+        }
+      }
+    }
+
+    // Dedup tag: rev is unchanged (already in todayKey), so key by mode + the
+    // re-projected spend so the pill repaints when the estimate drifts.
+    const estTag = est
+      ? (est.mode === 'need-yesterday'
+          ? '|est:need-yesterday'
+          : `|est:${est.mode}:${Math.round(est.dispSpend * 100)}`)
+      : '';
+
     // Dedup key includes everything that drives render content.
-    const todayKey = `${mainKey}|rev:${rev}|spend:${spend}|m:${metaCcy || ''}|a:${adjCcy || ''}|mm:${currencyMismatch}`;
+    const todayKey = `${mainKey}|rev:${rev}|spend:${spend}|m:${metaCcy || ''}|a:${adjCcy || ''}|mm:${currencyMismatch}${estTag}`;
     if (decoratedTodayKey.get(nameEl) === todayKey) return;
 
     const possibleStale = mainPill.nextElementSibling;
@@ -954,14 +1120,31 @@
         `Meta ad-account spend (${metaCcy}): ${formatMoneyOrDash(spend)}\n` +
         `Refusing to divide across currencies (would mislead).`;
       lastTodayStats.skippedCurrencyMismatch++;
+    } else if (est && est.mode === 'need-yesterday') {
+      // Regime 2 with no usable yesterday-spend capture. We will not divide a
+      // partial account-today spend (it would overstate ROAS), and we refuse
+      // to fabricate the missing slice. Ask the user to park Meta on Yesterday
+      // so the DOM read can capture the complete account-yesterday spend.
+      todayPill.className = 'adjust-pill adjust-pill-today-offdate';
+      todayPill.textContent =
+        `Today: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)} — need Yesterday spend`;
+      todayPill.title =
+        `Today ROAS not computed — LA-timezone account, reporting day is ahead.\n` +
+        `The Meta spend cell only covers part of the BKT day; the missing slice\n` +
+        `is yesterday's LA spend, which has no Meta API. Switch the Meta date\n` +
+        `picker to "Yesterday" once so the extension can capture it, then return\n` +
+        `to "Today". (Account ${currentAccountTz}, gap ${win2Label(est.win)}h.)`;
+      lastTodayStats.pillsNeedYesterday = (lastTodayStats.pillsNeedYesterday || 0) + 1;
     } else {
+      const effRev = est ? est.dispRev : rev;
+      const effSpend = est ? est.dispSpend : spend;
       todayPill.className = 'adjust-pill adjust-pill-today';
       todayPill.textContent = '';
-      todayPill.appendChild(document.createTextNode(
-        `Today: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`
-      ));
-      if (rev != null && spend != null && spend > 0) {
-        const roas = rev / spend;
+      let label = `Today: ${formatMoneyOrDash(effRev)}/${formatMoneyOrDash(effSpend)}`;
+      if (est && (est.mode === 'spend-down' || est.mode === 'spend-up')) label += ' (spend~)';
+      todayPill.appendChild(document.createTextNode(label));
+      if (effRev != null && effSpend != null && effSpend > 0) {
+        const roas = effRev / effSpend;
         todayPill.appendChild(document.createTextNode(' '));
         const valSpan = document.createElement('span');
         valSpan.textContent = pct(roas);
@@ -969,8 +1152,10 @@
         else if (roas > 1.00) valSpan.className = 'adjust-rv-green';
         todayPill.appendChild(valSpan);
       }
-      todayPill.title = formatTodayTooltip(rev, spend, metaCcy || adjCcy || '?', adjCcy, data);
+      todayPill.title = formatTodayTooltip(rev, spend, metaCcy || adjCcy || '?', adjCcy, data, est);
       lastTodayStats.pillsRendered++;
+      if (est && est.mode === 'spend-down') lastTodayStats.pillsRenderedEstSpendDown = (lastTodayStats.pillsRenderedEstSpendDown || 0) + 1;
+      else if (est && est.mode === 'spend-up') lastTodayStats.pillsRenderedEstSpendUp = (lastTodayStats.pillsRenderedEstSpendUp || 0) + 1;
     }
 
     todayPill.dataset.aoxKey = mainKey;
@@ -978,18 +1163,35 @@
     decoratedTodayKey.set(nameEl, todayKey);
   }
 
+  function win2Label(win) {
+    return win ? win.extra.toFixed(1) : '?';
+  }
+
   function formatMoneyOrDash(n) {
     if (n == null || !Number.isFinite(n)) return '–';
     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
-  function formatTodayTooltip(rev, spend, displayCcy, adjCcy, data) {
+  function formatTodayTooltip(rev, spend, displayCcy, adjCcy, data, est) {
     const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
     const lines = [
       `Today realtime ROAS`,
       `Rev (Adjust today${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoney(rev)}`,
       `Spend (Meta UI${displayCcy ? `, ${displayCcy}` : ''}): ${formatMoney(spend)}`,
     ];
+    if (est && est.mode === 'spend-down') {
+      lines.push(
+        `LA-tz estimate (account ${currentAccountTz}, regime 1 — rev kept, spend scaled):`,
+        `  Spend → BKT day: ${formatMoney(spend)} × ${est.win.hBKT.toFixed(1)}/${est.win.hLA.toFixed(1)}h`,
+        `  Est spend: ${formatMoney(est.dispSpend)} — both sides now cover the BKT day`,
+      );
+    } else if (est && est.mode === 'spend-up') {
+      lines.push(
+        `LA-tz estimate (account ${currentAccountTz}, regime 2 — rev kept, spend topped up):`,
+        `  Spend → BKT day: ${formatMoney(spend)} + ${formatMoney(est.syest)} × ${est.win.extra.toFixed(1)}/24 (Meta yesterday)`,
+        `  Est spend: ${formatMoney(est.dispSpend)} — both sides now cover the BKT day`,
+      );
+    }
     if (ageMin != null) lines.push(`Adjust sync age: ${ageMin}m`);
     if (!data.todayRowExisted) {
       lines.push(`Note: no cohort data for this row (new today?)`);
@@ -1062,6 +1264,17 @@
       lastDecoratePass: { ...lastDecorateStats },
       bridgeProbe,
       today: { ...lastTodayStats },
+      laTzEstimate: (() => {
+        const win = computeTzWindows();
+        return {
+          accountTz: currentAccountTz || '(none — estimate off)',
+          reportingOffsetMin: currentReportingOffsetMin,
+          window: win
+            ? { hBKT: win.hBKT.toFixed(2), hLA: win.hLA.toFixed(2), extra: win.extra.toFixed(2), regime: win.regime, yestLaDate: win.yestLaDate }
+            : '(zones aligned or no tz)',
+          yestSpendCacheSize: metaYestSpendCache.size,
+        };
+      })(),
     });
   }
 
@@ -1736,6 +1949,8 @@
     lastTodayStats = {
       columnFound: false, columnHeaderText: null, columnX: null, columnRight: null,
       pillsRendered: 0, pillsRenderedOffDate: 0,
+      pillsRenderedEstSpendDown: 0, pillsRenderedEstSpendUp: 0,
+      pillsNeedYesterday: 0, yestCaptured: 0,
       skippedNoSpendCell: 0, skippedZeroSpend: 0,
       skippedCurrencyMismatch: 0, skippedNoAdjustData: 0,
       skippedAmbiguous: 0, skippedAbbreviated: 0,
@@ -2007,6 +2222,14 @@
         removeAllPills();
         decorateAllVisibleRows();
       });
+    } else if (changes.dataSourceConfig) {
+      // Account-timezone / reporting-offset change flips the today-pill
+      // estimate; re-read and repaint so pills reflect the new config.
+      loadTzConfig().then(() => {
+        metaYestSpendCache.clear();
+        removeAllPills();
+        decorateAllVisibleRows();
+      });
     }
   });
 
@@ -2090,7 +2313,8 @@
   // user can collapse the overlay even before Adjust data arrives.
   initPillToggle();
 
-  // Initial. Load thresholds first so the very first decoration uses
-  // user-configured colors rather than briefly painting with defaults.
-  loadColorThresholds().then(() => loadData());
+  // Initial. Load thresholds + timezone config first so the very first
+  // decoration uses user-configured colors and the correct estimate mode
+  // rather than briefly painting with defaults.
+  Promise.all([loadColorThresholds(), loadTzConfig()]).then(() => loadData());
 })();

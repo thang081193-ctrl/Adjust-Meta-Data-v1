@@ -17,7 +17,13 @@ const CACHE_KEY = 'campaignDataCache';
 // v3: fixed todayIdKey collision between ad-level shadow rows and adset-level
 //     rows that caused adsetByIdIndex to be bumped twice (cohort row + orphan
 //     row both keyed by adsetId), producing inflated pill revenue.
-const CACHE_SCHEMA_VERSION = 3;
+// v4: added per-row revenueYesterday (BKT-yesterday gross) for the Meta
+//     LA-timezone today-pill regime-1 revenue estimate.
+// v5: removed revenueYesterday again — the LA-timezone today-pill switched to
+//     a BKT-anchored model (Option B) where revenue is kept as Adjust's
+//     BKT-today and only spend is re-projected, so no Adjust yesterday-revenue
+//     fetch/field is needed. Discard v4 caches to drop the now-dead field.
+const CACHE_SCHEMA_VERSION = 5;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Async pattern: return true to keep channel open.

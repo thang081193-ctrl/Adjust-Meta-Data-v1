@@ -51,13 +51,82 @@ async function doSync(force = false) {
   }
 }
 
+// Source of truth for the UTC-offset searchable dropdown. Each entry pairs the
+// canonical Adjust offset (stored & sent to the API) with a human label that
+// also lists major cities so the user can search by place name. The datalist
+// option VALUE is the full label, so typing "Bangkok" or "+07" both filter to
+// the right row; saveCfg() re-extracts the bare ±HH:MM before persisting.
+const UTC_OFFSETS = [
+  { off: '-11:00', label: '-11:00 — Pago Pago, Midway' },
+  { off: '-10:00', label: '-10:00 — Honolulu (HST)' },
+  { off: '-09:00', label: '-09:00 — Anchorage (AKST)' },
+  { off: '-08:00', label: '-08:00 — Los Angeles, Vancouver (PT)' },
+  { off: '-07:00', label: '-07:00 — Denver, Phoenix (MT)' },
+  { off: '-06:00', label: '-06:00 — Chicago, Mexico City (CT)' },
+  { off: '-05:00', label: '-05:00 — New York, Toronto, Lima (ET)' },
+  { off: '-04:00', label: '-04:00 — Santiago, Halifax, Caracas' },
+  { off: '-03:00', label: '-03:00 — São Paulo, Buenos Aires' },
+  { off: '-01:00', label: '-01:00 — Azores, Cape Verde' },
+  { off: '+00:00', label: '+00:00 — London, Lisbon, Accra (GMT)' },
+  { off: '+01:00', label: '+01:00 — Berlin, Paris, Madrid, Lagos (CET)' },
+  { off: '+02:00', label: '+02:00 — Cairo, Athens, Johannesburg (EET)' },
+  { off: '+03:00', label: '+03:00 — Moscow, Istanbul, Riyadh, Nairobi' },
+  { off: '+03:30', label: '+03:30 — Tehran' },
+  { off: '+04:00', label: '+04:00 — Dubai, Baku, Tbilisi' },
+  { off: '+04:30', label: '+04:30 — Kabul' },
+  { off: '+05:00', label: '+05:00 — Karachi, Tashkent' },
+  { off: '+05:30', label: '+05:30 — New Delhi, Mumbai, Colombo (IST)' },
+  { off: '+05:45', label: '+05:45 — Kathmandu' },
+  { off: '+06:00', label: '+06:00 — Dhaka, Almaty' },
+  { off: '+06:30', label: '+06:30 — Yangon' },
+  { off: '+07:00', label: '+07:00 — Bangkok, Hanoi, Jakarta (ICT)' },
+  { off: '+08:00', label: '+08:00 — Singapore, Beijing, Manila, Taipei, Perth' },
+  { off: '+09:00', label: '+09:00 — Tokyo, Seoul (JST/KST)' },
+  { off: '+09:30', label: '+09:30 — Adelaide, Darwin' },
+  { off: '+10:00', label: '+10:00 — Sydney, Brisbane (AEST)' },
+  { off: '+11:00', label: '+11:00 — Nouméa, Solomon Is.' },
+  { off: '+12:00', label: '+12:00 — Auckland, Fiji' },
+  { off: '+13:00', label: "+13:00 — Apia, Nuku'alofa" },
+  { off: '+14:00', label: '+14:00 — Kiritimati' },
+];
+
+function populateUtcOffsetList() {
+  const dl = $('utcOffsetList');
+  if (!dl) return;
+  dl.replaceChildren();
+  for (const o of UTC_OFFSETS) {
+    const opt = document.createElement('option');
+    opt.value = o.label;
+    dl.appendChild(opt);
+  }
+}
+
+// Extract a canonical ±HH:MM from whatever the field holds — a picked rich
+// label ("+07:00 — Bangkok …"), a bare offset, or a sloppily typed "+7:0".
+// Falls back to +07:00 (BKT) when nothing parseable is present.
+function parseOffsetInput(raw) {
+  const m = String(raw || '').match(/([+-])(\d{1,2}):?(\d{2})/);
+  if (!m) return '+07:00';
+  const h = String(parseInt(m[2], 10)).padStart(2, '0');
+  return `${m[1]}${h}:${m[3]}`;
+}
+
+// Map a stored offset back to its rich label for display, so the field shows
+// city context on reopen. Unknown offsets (e.g. a hand-typed +05:15) show raw.
+function offsetLabelFor(off) {
+  const norm = parseOffsetInput(off);
+  const found = UTC_OFFSETS.find((o) => o.off === norm);
+  return found ? found.label : norm;
+}
+
 async function loadCfg(prefetched) {
   const dataSourceConfig = prefetched !== undefined
     ? prefetched
     : (await chrome.storage.local.get('dataSourceConfig')).dataSourceConfig;
   if (dataSourceConfig?.kind === 'adjust-direct' || !dataSourceConfig) {
     $('apiToken').value = dataSourceConfig?.apiToken || '';
-    $('utcOffset').value = dataSourceConfig?.utcOffset || '+07:00';
+    $('utcOffset').value = offsetLabelFor(dataSourceConfig?.utcOffset || '+07:00');
+    $('accountTimezone').value = dataSourceConfig?.accountTimezone || '';
     $('datePeriod').value = dataSourceConfig?.datePeriod || 'rolling30';
     $('appTokens').value = dataSourceConfig?.appTokens || '';
   }
@@ -68,7 +137,8 @@ async function saveCfg() {
   const cfg = {
     kind: 'adjust-direct',
     apiToken: $('apiToken').value.trim(),
-    utcOffset: $('utcOffset').value.trim() || '+07:00',
+    utcOffset: parseOffsetInput($('utcOffset').value),
+    accountTimezone: $('accountTimezone').value.trim(),
     datePeriod: $('datePeriod').value.trim() || 'rolling30',
     appTokens: $('appTokens').value.trim(),
   };
@@ -172,6 +242,14 @@ function pctParse(raw) {
 $('sync').addEventListener('click', () => doSync(false));
 $('forceSync').addEventListener('click', () => doSync(true));
 $('saveCfg').addEventListener('click', saveCfg);
+
+// Re-snap the offset field to its canonical city label once the user commits an
+// edit (blur or datalist pick). Without this, hand-editing just the sign — e.g.
+// flipping "+07:00 — Bangkok" to "-07:00" — leaves the stale cities showing,
+// even though the saved value is correct. Snapping makes the zone unambiguous.
+$('utcOffset').addEventListener('change', () => {
+  $('utcOffset').value = offsetLabelFor($('utcOffset').value);
+});
 $('saveThresholds').addEventListener('click', saveColorThresholds);
 
 for (const btn of $('periods').querySelectorAll('button')) {
@@ -182,6 +260,7 @@ for (const btn of $('periods').querySelectorAll('button')) {
 // burst so the popup paints faster on open. Sequential awaits used to add
 // 15-45ms of unnecessary IPC latency across three round trips.
 (async function bootstrap() {
+  populateUtcOffsetList();
   const [{ dataSourceConfig, colorThresholds }] = await Promise.all([
     chrome.storage.local.get(['dataSourceConfig', 'colorThresholds']),
     refreshStatus(),
