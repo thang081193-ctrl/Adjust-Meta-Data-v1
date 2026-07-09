@@ -23,7 +23,11 @@ const CACHE_KEY = 'campaignDataCache';
 //     a BKT-anchored model (Option B) where revenue is kept as Adjust's
 //     BKT-today and only spend is re-projected, so no Adjust yesterday-revenue
 //     fetch/field is needed. Discard v4 caches to drop the now-dead field.
-const CACHE_SCHEMA_VERSION = 5;
+// v6: re-added per-row revenueYesterday (event-date, realtime gross) to power
+//     the optional Meta Yesterday realtime pill (Adjust yesterday rev ÷ Meta
+//     yesterday spend). Only populated when that pill's toggle is on; 0
+//     otherwise. Discard v5 caches so the field is present on next sync.
+const CACHE_SCHEMA_VERSION = 6;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Async pattern: return true to keep channel open.

@@ -2,7 +2,7 @@
 // Adapter pattern. Today: pulls direct from Adjust API.
 // Later (when JM-AM exits soak): swap to JmAmDataSource without touching anything else.
 
-import { fetchCampaignROAS, fetchTodayGrossRevenue } from './adjust-client.js';
+import { fetchCampaignROAS, fetchTodayGrossRevenue, fetchYesterdayGrossRevenue } from './adjust-client.js';
 import { canonicalKey } from './matcher.js';
 
 /**
@@ -11,19 +11,43 @@ import { canonicalKey } from './matcher.js';
  */
 
 export class AdjustDirectDataSource {
-  constructor({ apiToken, utcOffset, datePeriod, appTokens }) {
+  constructor({ apiToken, utcOffset, datePeriod, appTokens, fetchYesterday = false }) {
     this.apiToken = apiToken;
     this.utcOffset = utcOffset;
     this.datePeriod = datePeriod;
     this.appTokens = appTokens;
+    // Only pull the yesterday event-date report when the Yesterday realtime
+    // pill is enabled (set from pillVisibility in createDataSource). Saves one
+    // multi-level report call per sync when the pill is off.
+    this.fetchYesterday = fetchYesterday;
   }
 
   async fetchAll() {
-    // Parallel: existing cohort pipeline + new today-revenue pipeline. The
-    // today fetch is allowed to fail without taking down the cohort pills —
-    // the today pill simply won't render. This keeps the existing user
-    // experience intact if Adjust adds/changes the today endpoint shape.
-    const [cohortRows, todayRows] = await Promise.all([
+    // Parallel: cohort pipeline + today-revenue pipeline + optional
+    // yesterday-revenue pipeline. Each realtime fetch is allowed to fail
+    // without taking down the cohort pills — that pill simply won't render.
+    // This keeps the existing user experience intact if Adjust changes the
+    // realtime endpoint shape.
+    //
+    // yesterdayAvailable tracks whether the yesterday fetch actually SUCCEEDED
+    // (toggle on AND no error). When it didn't, mergeRealtimeInto leaves
+    // revenueYesterday null (not 0) so the pill shows a "no data" dash instead
+    // of a fabricated red 0% — distinguishing a failed/absent fetch from a
+    // genuine zero-revenue day.
+    let yesterdayAvailable = false;
+    const yesterdayPromise = this.fetchYesterday
+      ? fetchYesterdayGrossRevenue({
+          apiToken: this.apiToken,
+          utcOffset: this.utcOffset,
+          appTokens: this.appTokens,
+        }).then(rows => { yesterdayAvailable = true; return rows; })
+          .catch(err => {
+            console.warn('[Adjust Overlay] yesterday-revenue fetch failed:', err.message);
+            return [];
+          })
+      : Promise.resolve([]);
+
+    const [cohortRows, todayRows, yesterdayRows] = await Promise.all([
       fetchCampaignROAS({
         apiToken: this.apiToken,
         utcOffset: this.utcOffset,
@@ -38,8 +62,9 @@ export class AdjustDirectDataSource {
         console.warn('[Adjust Overlay] today-revenue fetch failed:', err.message);
         return [];
       }),
+      yesterdayPromise,
     ]);
-    return mergeTodayInto(cohortRows, todayRows);
+    return mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable);
   }
 
   describe() {
@@ -49,68 +74,120 @@ export class AdjustDirectDataSource {
   }
 }
 
-// Attach revenueToday + currency from todayRows onto matching cohortRows.
-// Match priority: Meta ID (campaign / adset / ad) when both sides carry it,
-// then canonical name as fallback. Today-only rows (ads that ran today but
-// have no cohort row in the cohort fetch's wider window) are appended with
-// roas fields = null — covers brand-new ads launched today.
+// Attach revenueToday + revenueYesterday + currency from the realtime fetches
+// onto matching cohortRows. Match priority: Meta ID (campaign / adset / ad)
+// when both sides carry it, then canonical name as fallback. Realtime-only
+// rows (an ad that ran today/yesterday but has no cohort row in the cohort
+// fetch's wider window) are appended with roas fields = null; a row present in
+// BOTH today and yesterday orphan sets is merged into one output row carrying
+// both revenue fields.
 //
 // Output rows always carry: revenueToday (number, 0 if no match),
-// todayRowExisted (bool), adjustCurrency (string|null). Cache-shape addition
-// is backwards-compatible — readers that don't know about the new fields
-// behave exactly as before.
-function mergeTodayInto(cohortRows, todayRows) {
-  const idIndex = new Map();
-  const nameIndex = new Map();
-  for (const t of todayRows) {
-    const idKey = todayIdKey(t);
-    if (idKey) idIndex.set(idKey, t);
-    const nameKey = todayNameKey(t);
-    if (nameKey && !nameIndex.has(nameKey)) nameIndex.set(nameKey, t);
-  }
+// revenueYesterday (number 0 for a genuine no-match when the yesterday fetch
+// SUCCEEDED, or null when it didn't run / failed), todayRowExisted (bool),
+// adjustCurrency (string|null). Cache-shape addition is backwards-compatible —
+// readers that don't know about the new fields behave exactly as before.
+//
+// yesterdayAvailable: true only when the yesterday fetch ran and succeeded. When
+// false, revenueYesterday is null on every row so the pill renders a "no data"
+// dash rather than a fabricated 0% ROAS.
+function mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable = false) {
+  const today = buildRealtimeIndex(todayRows);
+  const yest = buildRealtimeIndex(yesterdayRows);
+  // 0 for a genuine no-match only when the fetch succeeded; null otherwise.
+  const yestMiss = yesterdayAvailable ? 0 : null;
 
-  const matched = new Set();
+  const matchedToday = new Set();
+  const matchedYest = new Set();
   const out = [];
+
   for (const c of cohortRows) {
-    const idKey = todayIdKey(c);
-    const nameKey = todayNameKey(c);
-    const match = (idKey && idIndex.get(idKey)) || (nameKey && nameIndex.get(nameKey)) || null;
-    if (match) matched.add(match);
+    const tMatch = matchRealtime(c, today);
+    const yMatch = matchRealtime(c, yest);
+    if (tMatch) matchedToday.add(tMatch);
+    if (yMatch) matchedYest.add(yMatch);
     out.push({
       ...c,
-      revenueToday: match?.revenueToday ?? 0,
-      todayRowExisted: !!match,
-      adjustCurrency: match?.currency ?? null,
+      revenueToday: tMatch?.revenueToday ?? 0,
+      revenueYesterday: yMatch?.revenueYesterday ?? yestMiss,
+      todayRowExisted: !!tMatch,
+      adjustCurrency: tMatch?.currency ?? yMatch?.currency ?? null,
     });
   }
 
-  // Today-only rows (no cohort counterpart): append with cohort fields nulled.
-  // matcher.js's canonicalKey is applied indirectly via todayNameKey, so the
-  // injector's index builders will still key these by their canonical names.
-  for (const t of todayRows) {
-    if (matched.has(t)) continue;
-    out.push({
-      level: t.level,
-      campaignName: t.campaignName,
-      adsetName: t.adsetName,
-      adName: t.adName,
-      campaignId: t.campaignId,
-      adsetId: t.adsetId,
-      adId: t.adId,
-      network: t.network,
-      cost: null,
-      cohortAllRevenue: null,
-      installs: null,
-      roas: { d0: null, d3: null, d7: null, allTime: null },
-      revenueToday: t.revenueToday ?? 0,
-      todayRowExisted: true,
-      adjustCurrency: t.currency || null,
-    });
-  }
+  // Realtime-only rows (no cohort counterpart): append with cohort fields
+  // nulled. Dedup today-only and yesterday-only orphans by the same key space
+  // so a row seen in both merges into one output row.
+  const orphanMap = new Map();
+  const addOrphan = (r, which, matchedSet) => {
+    if (matchedSet.has(r)) return;
+    const k = orphanKey(r);
+    let o = orphanMap.get(k);
+    if (!o) {
+      o = {
+        level: r.level,
+        campaignName: r.campaignName,
+        adsetName: r.adsetName,
+        adName: r.adName,
+        campaignId: r.campaignId,
+        adsetId: r.adsetId,
+        adId: r.adId,
+        network: r.network,
+        cost: null,
+        cohortAllRevenue: null,
+        installs: null,
+        roas: { d0: null, d3: null, d7: null, allTime: null },
+        revenueToday: 0,
+        revenueYesterday: yestMiss,
+        todayRowExisted: false,
+        adjustCurrency: r.currency || null,
+      };
+      orphanMap.set(k, o);
+    }
+    if (which === 'today') { o.revenueToday = r.revenueToday ?? 0; o.todayRowExisted = true; }
+    else { o.revenueYesterday = r.revenueYesterday ?? 0; }
+    if (!o.adjustCurrency && r.currency) o.adjustCurrency = r.currency;
+  };
+  for (const t of todayRows) addOrphan(t, 'today', matchedToday);
+  for (const y of yesterdayRows) addOrphan(y, 'yesterday', matchedYest);
+  for (const o of orphanMap.values()) out.push(o);
+
   return out;
 }
 
-function todayIdKey(row) {
+// Build id + name lookup indexes for a set of realtime (event-date) rows.
+function buildRealtimeIndex(rows) {
+  const idIndex = new Map();
+  const nameIndex = new Map();
+  for (const r of rows) {
+    const idKey = realtimeIdKey(r);
+    if (idKey) idIndex.set(idKey, r);
+    const nameKey = realtimeNameKey(r);
+    if (nameKey && !nameIndex.has(nameKey)) nameIndex.set(nameKey, r);
+  }
+  return { idIndex, nameIndex };
+}
+
+function matchRealtime(row, index) {
+  const idKey = realtimeIdKey(row);
+  const nameKey = realtimeNameKey(row);
+  return (idKey && index.idIndex.get(idKey)) || (nameKey && index.nameIndex.get(nameKey)) || null;
+}
+
+// Stable key for orphan dedup across the today/yesterday sets. Deliberately
+// keyed by level + campaignId + canonical NAME (via realtimeNameKey), NOT by
+// adId: Adjust can return creative_id_network on one event-date fetch and null
+// (a finalization shadow) on the other for the SAME ad, so an adId-first key
+// would split one ad's today-orphan and yesterday-orphan into two same-named
+// rows that then collide as "ambiguous" downstream and suppress both realtime
+// pills. Name+campaign keying merges them into one orphan carrying both fields.
+function orphanKey(r) {
+  const nameKey = realtimeNameKey(r) ||
+    `${r.level}::${r.campaignName}::${r.adsetName}::${r.adName}`;
+  return r.campaignId ? `${r.campaignId}::${nameKey}` : nameKey;
+}
+
+function realtimeIdKey(row) {
   if (row.level === 'ad' && row.adId) return `ad::${row.adId}`;
   if (row.level === 'adset' && row.adsetId) return `adset::${row.adsetId}`;
   // NOTE: ad-level rows with adId=null MUST NOT fall back to
@@ -126,7 +203,7 @@ function todayIdKey(row) {
   return null;
 }
 
-function todayNameKey(row) {
+function realtimeNameKey(row) {
   if (row.level === 'campaign') return `campaign::${canonicalKey(row.campaignName || '')}`;
   if (row.level === 'adset') return `adset::${canonicalKey(row.adsetName || '')}`;
   // ad-level row: key by ad name; adset is implicit. Name-only matches risk
@@ -167,11 +244,16 @@ export class JmAmDataSource {
  * Factory. Reads config from chrome.storage and returns the active source.
  */
 export async function createDataSource() {
-  const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
+  const { dataSourceConfig, pillVisibility } = await chrome.storage.local.get([
+    'dataSourceConfig', 'pillVisibility',
+  ]);
   const cfg = dataSourceConfig || { kind: 'adjust-direct' };
 
   if (cfg.kind === 'jm-am') {
     return new JmAmDataSource(cfg);
   }
-  return new AdjustDirectDataSource(cfg);
+  // Only fetch the yesterday event-date report when the Meta Yesterday pill is
+  // enabled — avoids an extra multi-level Adjust call on every sync otherwise.
+  const fetchYesterday = !!(pillVisibility?.meta?.yesterday);
+  return new AdjustDirectDataSource({ ...cfg, fetchYesterday });
 }

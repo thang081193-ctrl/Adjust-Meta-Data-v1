@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.8.1-la-tz-optionb';
+  const INJECTOR_VERSION = 'v0.9.1-pill-toggles';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -95,6 +95,12 @@
   // mirror what the popup writes when the user hasn't customized yet.
   let colorThresholds = { pause: 0.30, red: 0.60, green: 1.00 };
 
+  // Which pill types to render, set from the popup's "Meta pills shown"
+  // checkboxes (chrome.storage.local.pillVisibility.meta). Defaults preserve the
+  // historical behavior: cohort + today on, yesterday opt-in. The yesterday flag
+  // also gates the background's yesterday-revenue fetch (see createDataSource).
+  let pillVis = { cohort: true, today: true, yesterday: false };
+
   let bodyObserver = null;
   let decorateTimer = null;
   // Tracks which campaign key each ellipsis div is currently decorated for.
@@ -105,6 +111,9 @@
   // Parallel WeakMap for the today pill (sibling next to the main pill). Kept
   // separate so today-pill churn does not invalidate the main pill's dedup.
   const decoratedTodayKey = new WeakMap();
+  // Parallel WeakMap for the yesterday pill (optional third sibling). Separate
+  // dedup so its churn is independent of the cohort / today pills.
+  const decoratedYesterdayKey = new WeakMap();
 
   // Row-Y bucket index, valid only inside one decorateAllVisibleRows() pass.
   // Built lazily on first ambiguous lookup, cleared at the end of the pass.
@@ -143,6 +152,8 @@
     pillsRenderedEstSpendUp: 0,
     pillsNeedYesterday: 0,
     yestCaptured: 0,
+    pillsYesterday: 0,
+    yestNeedSpend: 0,
     skippedNoSpendCell: 0,
     skippedZeroSpend: 0,
     skippedCurrencyMismatch: 0,
@@ -178,11 +189,13 @@
   //   currentAccountTz          : IANA zone of the Meta ad account, or '' (off).
   let currentReportingOffsetMin = 420; // +07:00
   let currentAccountTz = '';
-  // Per-row cache of a COMPLETE LA-yesterday spend, captured when the user
+  // Per-row cache of a COMPLETE account-yesterday spend, captured when the user
   // switches Meta's date picker to "Yesterday". Keyed by canonical row key →
-  // { laDate, spend, currency }. laDate tags the LA calendar day it represents
-  // so a stale capture (from a previous day) is detected and a re-capture is
-  // requested instead of silently using wrong data.
+  // { representsDay, spend, currency }. representsDay tags the account-calendar
+  // day the captured spend represents (metaYesterdayRepresentsDay) so a stale
+  // capture — from a previous day, or from a day that rolled over within one
+  // reporting day — is detected and a re-capture requested instead of silently
+  // using the wrong day's spend.
   const metaYestSpendCache = new Map();
 
   // Read the Adjust reporting offset + Meta account timezone from the shared
@@ -290,6 +303,20 @@
           green: typeof t.green === 'number' ? t.green : colorThresholds.green,
         };
       }
+    } catch { /* keep defaults */ }
+  }
+
+  // Read the Meta pill-visibility toggles from shared storage. Same
+  // storage-driven pattern as loadColorThresholds / loadTzConfig.
+  async function loadPillVisibility() {
+    try {
+      const { pillVisibility } = await chrome.storage.local.get('pillVisibility');
+      const m = pillVisibility?.meta || {};
+      pillVis = {
+        cohort:    typeof m.cohort    === 'boolean' ? m.cohort    : true,
+        today:     typeof m.today     === 'boolean' ? m.today     : true,
+        yesterday: typeof m.yesterday === 'boolean' ? m.yesterday : false,
+      };
     } catch { /* keep defaults */ }
   }
 
@@ -632,6 +659,15 @@
     if (visited.has(e)) return;
     visited.add(e);
     e.revenueToday = (e.revenueToday || 0) + (row.revenueToday || 0);
+    // Yesterday event-date revenue. row.revenueYesterday is null when the
+    // yesterday fetch did not run / failed (data-source leaves it null), and a
+    // number (0 or positive) only when the fetch succeeded. Accumulate ONLY the
+    // numeric case so a not-fetched row leaves the entry's revenueYesterday
+    // undefined → the pill shows a dash rather than a fabricated red 0%. Same
+    // visited-guard as revenueToday so shared entry objects aren't double-counted.
+    if (row.revenueYesterday != null) {
+      e.revenueYesterday = (e.revenueYesterday || 0) + row.revenueYesterday;
+    }
     if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
     e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
   }
@@ -970,27 +1006,11 @@
     // is alive). Skip the spend-cell read entirely — its value is correct for
     // some other date range and reading it would only confuse diagnostics.
     if (currentMetaDate && !currentMetaDate.isToday) {
-      // Capture a COMPLETE account-yesterday spend when the user parks Meta on
-      // the "Yesterday" view. Regime-2 today-pills (reporting day more elapsed
-      // than the account day) need yesterday's full spend to top up the partial
-      // account-today value; there's no Meta spend API, so this DOM read while
-      // the picker shows yesterday is the only source. Tagged with the account
-      // calendar date so a stale capture is rejected next day.
-      const capWin = computeTzWindows();
-      if (capWin && (currentMetaDate.label === 'yesterday' || currentMetaDate.label === capWin.yestLaDate)) {
-        const yText = findSpendCellText(nameEl);
-        if (yText != null) {
-          const yParsed = parseCurrencyCell(yText);
-          if (yParsed.parsed && yParsed.value != null && !yParsed.abbreviated) {
-            metaYestSpendCache.set(mainKey, {
-              laDate: capWin.yestLaDate,
-              spend: yParsed.value,
-              currency: yParsed.currency,
-            });
-            lastTodayStats.yestCaptured = (lastTodayStats.yestCaptured || 0) + 1;
-          }
-        }
-      }
+      // NOTE: the COMPLETE account-yesterday spend capture now lives in
+      // maybeCaptureYesterdaySpend(), called unconditionally from
+      // decorateCandidate so it fires even when the today pill is toggled off
+      // (the Yesterday pill and the LA-tz regime-2 estimate both read the
+      // shared metaYestSpendCache it populates).
 
       const todayKey = `${mainKey}|offdate:${currentMetaDate.label}|rev:${rev}|a:${adjCcy || ''}`;
       if (decoratedTodayKey.get(nameEl) === todayKey) return;
@@ -1074,7 +1094,12 @@
           est = { mode: 'spend-down', dispRev: rev, dispSpend, win };
         } else {
           const cached = metaYestSpendCache.get(mainKey);
-          const fresh = cached && cached.laDate === win.yestLaDate && cached.spend != null;
+          // Require the captured spend to REPRESENT the current account-tz
+          // yesterday (win.yestLaDate). A capture whose LA day has since rolled
+          // over within this same reporting day fails this check and falls back
+          // to the need-yesterday prompt instead of topping up with the wrong
+          // day's spend. (The prior capDay===reportingTodayIso tag missed this.)
+          const fresh = cached && cached.representsDay === win.yestLaDate && cached.spend != null;
           const ccyOk = !fresh || !metaCcy || !cached.currency || cached.currency === metaCcy;
           if (fresh && ccyOk) {
             est = {
@@ -1161,6 +1186,175 @@
     todayPill.dataset.aoxKey = mainKey;
     mainPill.parentNode.insertBefore(todayPill, mainPill.nextSibling);
     decoratedTodayKey.set(nameEl, todayKey);
+  }
+
+  // ---- Yesterday realtime pill helpers ----
+  // reportingYesterdayIso() is the reporting-offset (Adjust) calendar yesterday —
+  // the day fetchYesterdayGrossRevenue's date_period='yesterday' covers, and, when
+  // the reporting offset equals the ad-account timezone, the day Meta's "Yesterday"
+  // spend cell covers.
+  function reportingYesterdayIso() {
+    return partsAtOffset(new Date(Date.now() - 86400000), currentReportingOffsetMin).dateISO;
+  }
+
+  // The account-calendar day a Meta "Yesterday" spend cell REPRESENTS right now.
+  // In LA-tz mode (reporting offset != account tz) that is the account-tz
+  // yesterday (win.yestLaDate); otherwise the reporting-offset yesterday. Used to
+  // tag a spend capture so a stale capture (from a prior day, or from a day that
+  // has since rolled over within one reporting day) is rejected rather than
+  // silently reused — this is the invariant the earlier {laDate} tag enforced.
+  function metaYesterdayRepresentsDay() {
+    const win = computeTzWindows();
+    return win ? win.yestLaDate : reportingYesterdayIso();
+  }
+
+  // Is the Meta UI date picker showing the COMPLETE "yesterday" a spend capture
+  // needs? The literal "yesterday" preset always qualifies. An explicit single-day
+  // range must equal the account-calendar yesterday: in LA-tz mode ONLY
+  // win.yestLaDate — NOT the reporting-offset yesterday, which in the morning
+  // regime equals the account TODAY (a partial day that must never be captured as
+  // a complete yesterday); in aligned mode the reporting-offset yesterday.
+  function metaDateIsYesterday() {
+    if (!currentMetaDate || currentMetaDate.isToday) return false;
+    if (currentMetaDate.label === 'yesterday') return true;
+    return currentMetaDate.label === metaYesterdayRepresentsDay();
+  }
+
+  // Pill-type predicates for walking a row's sibling pill chain. All our pills
+  // are <span class="adjust-pill …"> siblings stamped with dataset.aoxKey.
+  function isTodayVariantPill(n) {
+    return n.classList.contains('adjust-pill-today') ||
+      n.classList.contains('adjust-pill-today-mismatch') ||
+      n.classList.contains('adjust-pill-today-offdate');
+  }
+  function isYesterdayVariantPill(n) {
+    return n.classList.contains('adjust-pill-yesterday') ||
+      n.classList.contains('adjust-pill-yest-mismatch') ||
+      n.classList.contains('adjust-pill-yest-offdate');
+  }
+
+  // Find the first pill for `key` matching `predicate` in nameEl's sibling
+  // chain, or null. Used to locate/anchor/remove a specific pill type when the
+  // cohort pill (the usual anchor) may be absent due to the toggles.
+  function findRowPill(nameEl, key, predicate) {
+    let n = nameEl.nextElementSibling;
+    while (n && n.classList && n.classList.contains('adjust-pill') && n.dataset.aoxKey === key) {
+      if (predicate(n)) return n;
+      n = n.nextElementSibling;
+    }
+    return null;
+  }
+
+  // Capture a COMPLETE Meta yesterday spend when the picker is on "Yesterday".
+  // Populates metaYestSpendCache (read by both the Yesterday pill and the LA-tz
+  // today-pill regime-2 estimate). Runs regardless of which pills are enabled,
+  // and independent of timezone config — there is no Meta spend API, so this DOM
+  // read while the picker shows yesterday is the only source. Tagged with the
+  // account-calendar day the spend REPRESENTS (metaYesterdayRepresentsDay) so a
+  // capture whose day has rolled over is rejected by the readers below.
+  function maybeCaptureYesterdaySpend(nameEl, mainKey) {
+    if (!currentSpendColumn) return;
+    if (!metaDateIsYesterday()) return;
+    const yText = findSpendCellText(nameEl);
+    if (yText == null) return;
+    const p = parseCurrencyCell(yText);
+    if (!p.parsed || p.value == null || p.abbreviated) return;
+    metaYestSpendCache.set(mainKey, {
+      representsDay: metaYesterdayRepresentsDay(),
+      spend: p.value,
+      currency: p.currency,
+    });
+    lastTodayStats.yestCaptured = (lastTodayStats.yestCaptured || 0) + 1;
+  }
+
+  // Render the Yesterday realtime pill: Adjust yesterday event-date revenue ÷
+  // Meta yesterday spend (from metaYestSpendCache). `anchor` is the node to
+  // insert after (today pill → cohort pill → name el, whichever is present).
+  // Mirrors the today pill's currency-mismatch guard; when no yesterday spend
+  // has been captured yet, shows a prompt so the pipeline-state-visible rule
+  // holds. Same-day-window (event-date) ROAS is a directional early read — it
+  // is NOT the cohort roas_d0 that matures after Adjust's daily pull.
+  function maybeRenderYesterdayPill(nameEl, anchor, data, mainKey) {
+    if (!data || data.ambiguous) return;
+    // rev is null when the yesterday fetch has not run / failed (data-source
+    // leaves revenueYesterday null in that case), 0 only for a genuine
+    // zero-revenue day — so a not-yet-fetched row shows a dash, never a red 0%.
+    const rev = (data.revenueYesterday == null) ? null : data.revenueYesterday;
+    const adjCcy = data.adjustCurrency;
+
+    // Timezone-window guard. Adjust yesterday revenue is on the reporting offset;
+    // the captured Meta yesterday spend is on the ad-account tz. When they differ
+    // (LA-tz mode, computeTzWindows() != null) the two "yesterday" windows are
+    // DIFFERENT 24h calendar days — dividing would mix days (the same misalignment
+    // the today pill's regime machinery corrects for). There is no account-tz
+    // yesterday-revenue fetch, so rather than mislead we show a revenue-only pill.
+    const tzMisaligned = computeTzWindows() != null;
+
+    const cached = metaYestSpendCache.get(mainKey);
+    const spendFresh = !!(cached && cached.representsDay === reportingYesterdayIso() && cached.spend != null);
+    const spend = spendFresh ? cached.spend : null;
+    const metaCcy = spendFresh ? cached.currency : null;
+    const currencyMismatch = metaCcy && adjCcy && metaCcy !== adjCcy;
+
+    const tag = `${mainKey}|tz:${tzMisaligned}|yrev:${rev}|yspend:${spend}|m:${metaCcy || ''}|a:${adjCcy || ''}|mm:${currencyMismatch}`;
+    if (decoratedYesterdayKey.get(nameEl) === tag) return;
+
+    const stale = findRowPill(nameEl, mainKey, isYesterdayVariantPill);
+    if (stale) stale.remove();
+
+    const pill = document.createElement('span');
+    if (tzMisaligned) {
+      // Revenue-only: cannot form a same-window ratio across reporting/account tz.
+      pill.className = 'adjust-pill adjust-pill-yest-offdate';
+      pill.textContent = `Y'day rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)} (LA-tz)`;
+      pill.title =
+        `Yesterday ROAS not computed — Adjust reporting timezone differs from the\n` +
+        `Meta ad-account timezone (${currentAccountTz || 'account tz'}). Adjust yesterday\n` +
+        `revenue and Meta's "Yesterday" spend cell cover different 24h calendar days,\n` +
+        `so dividing would mix days. Set the Adjust UTC offset equal to the ad-account\n` +
+        `timezone (Meta dropdown = "Same") to get a yesterday ROAS.\n` +
+        `Adjust yesterday rev${adjCcy ? ` (${adjCcy})` : ''}: ${formatMoneyOrDash(rev)}.`;
+      lastTodayStats.yestNeedSpend = (lastTodayStats.yestNeedSpend || 0) + 1;
+    } else if (!spendFresh) {
+      pill.className = 'adjust-pill adjust-pill-yest-offdate';
+      pill.textContent = `Y'day: ${formatMoneyOrDash(rev)}/– — cần view Yesterday`;
+      pill.title =
+        `Yesterday ROAS chưa tính — chưa bắt được Meta spend hôm qua.\n` +
+        `Chuyển Meta date picker sang "Yesterday" một lần để extension đọc spend cell,\n` +
+        `rồi quay lại. Revenue hôm qua (Adjust, event-date) đã có: ` +
+        `${formatMoneyOrDash(rev)}${adjCcy ? ` ${adjCcy}` : ''}.`;
+      lastTodayStats.yestNeedSpend = (lastTodayStats.yestNeedSpend || 0) + 1;
+    } else if (currencyMismatch) {
+      pill.className = 'adjust-pill adjust-pill-yest-mismatch';
+      pill.textContent = `Y'day: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)} (${adjCcy}→${metaCcy})`;
+      pill.title =
+        `Yesterday ROAS unavailable — cross-currency.\n` +
+        `Adjust yesterday rev (${adjCcy}): ${formatMoneyOrDash(rev)}\n` +
+        `Meta yesterday spend (${metaCcy}): ${formatMoneyOrDash(spend)}\n` +
+        `Refusing to divide across currencies (would mislead).`;
+    } else {
+      pill.className = 'adjust-pill adjust-pill-yesterday';
+      pill.appendChild(document.createTextNode(`Y'day: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`));
+      if (rev != null && spend != null && spend > 0) {
+        const roas = rev / spend;
+        pill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
+        pill.appendChild(valSpan);
+      }
+      const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+      pill.title =
+        `Yesterday realtime ROAS (event-date — directional, not cohort d0)\n` +
+        `Rev (Adjust yesterday${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoney(rev)}\n` +
+        `Spend (Meta yesterday${metaCcy ? `, ${metaCcy}` : ''}): ${formatMoney(spend)}` +
+        (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
+      lastTodayStats.pillsYesterday = (lastTodayStats.pillsYesterday || 0) + 1;
+    }
+    pill.dataset.aoxKey = mainKey;
+    anchor.parentNode.insertBefore(pill, anchor.nextSibling);
+    decoratedYesterdayKey.set(nameEl, tag);
   }
 
   function win2Label(win) {
@@ -1340,47 +1534,77 @@
       campaignIndex.get(key);
     if (!data) return;
 
+    // Cohort (main) pill — gated on the popup toggle. When enabled, build/reuse
+    // it; when disabled, remove any lingering one and clear its dedup so
+    // re-enabling rebuilds. The realtime pills anchor after it when present,
+    // else directly after the name element.
+    //
     // Self-healing dedup via WeakMap: if Meta replaces el, its WeakMap entry
-    // auto-clears and we re-decorate. NOTE: today pill has an INDEPENDENT
-    // dedup map (decoratedTodayKey) and must be allowed to render/refresh
-    // on every pass even when the main pill is already current — column
-    // header may not have been visible on the first pass.
-    let pill;
-    const mainCurrent = decoratedKey.get(el) === key;
-    if (mainCurrent) {
-      // Reuse the existing main pill as the today-pill anchor. el.nextSibling
-      // is the main pill (today pill, if present, lives at pill.nextSibling).
-      const sibling = el.nextElementSibling;
-      if (sibling?.classList?.contains('adjust-pill') &&
-          !sibling.classList.contains('adjust-pill-today') &&
-          !sibling.classList.contains('adjust-pill-today-mismatch')) {
-        pill = sibling;
+    // auto-clears and we re-decorate. NOTE: the today/yesterday pills have
+    // INDEPENDENT dedup maps and must be allowed to render/refresh on every
+    // pass even when the main pill is already current — the spend column header
+    // may not have been visible on the first pass.
+    let mainPill = null;
+    if (pillVis.cohort) {
+      const mainCurrent = decoratedKey.get(el) === key;
+      if (mainCurrent) {
+        const sibling = el.nextElementSibling;
+        if (sibling?.classList?.contains('adjust-pill') &&
+            !isTodayVariantPill(sibling) && !isYesterdayVariantPill(sibling)) {
+          mainPill = sibling;
+        }
       }
-    }
-    if (!pill) {
-      // First decoration for this key, or main pill was removed. Build fresh.
-      const stalePill = el.nextElementSibling;
-      if (stalePill?.classList?.contains('adjust-pill')) {
-        stalePill.remove();
+      if (!mainPill) {
+        // First decoration for this key, or main pill was removed. Drop a stale
+        // cohort pill (wrong content) if the immediate sibling is one, then
+        // build fresh. Realtime pills (today/yesterday) are left untouched.
+        const stalePill = el.nextElementSibling;
+        if (stalePill?.classList?.contains('adjust-pill') &&
+            !isTodayVariantPill(stalePill) && !isYesterdayVariantPill(stalePill)) {
+          stalePill.remove();
+        }
+        mainPill = document.createElement('span');
+        if (data.ambiguous) {
+          mainPill.className = 'adjust-pill adjust-pill-ambiguous';
+          mainPill.title = formatAmbiguousTooltip(data);
+        } else {
+          mainPill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
+          mainPill.title = formatTooltip(data);
+        }
+        fillPillSegments(mainPill, data.roas);
+        mainPill.dataset.aoxKey = key;
+        el.parentNode.insertBefore(mainPill, el.nextSibling);
+        decoratedKey.set(el, key);
       }
-      pill = document.createElement('span');
-      if (data.ambiguous) {
-        pill.className = 'adjust-pill adjust-pill-ambiguous';
-        pill.title = formatAmbiguousTooltip(data);
-      } else {
-        pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
-        pill.title = formatTooltip(data);
-      }
-      fillPillSegments(pill, data.roas);
-      pill.dataset.aoxKey = key;
-      el.parentNode.insertBefore(pill, el.nextSibling);
-      decoratedKey.set(el, key);
+    } else {
+      const existing = findRowPill(el, key, n => !isTodayVariantPill(n) && !isYesterdayVariantPill(n));
+      if (existing) existing.remove();
+      decoratedKey.delete(el);
     }
 
-    // Today pill is a SEPARATE sibling inserted after the main pill. ALWAYS
-    // attempt; its own decoratedTodayKey WeakMap dedups so repeated calls
-    // are cheap. Failure paths bump lastTodayStats counters but never throw.
-    maybeRenderTodayPill(el, pill, data, key);
+    // Capture Meta yesterday spend when the picker is on Yesterday. Runs
+    // unconditionally (feeds both the Yesterday pill and the LA-tz regime-2
+    // estimate) so it works even when the today pill is toggled off.
+    maybeCaptureYesterdaySpend(el, key);
+
+    // Realtime pills — each gated on its toggle, anchored after the previous
+    // pill so order is [cohort?][today?][yesterday?]. When a pill is disabled,
+    // remove any lingering instance and clear its dedup.
+    if (pillVis.today) {
+      maybeRenderTodayPill(el, mainPill || el, data, key);
+    } else {
+      const t = findRowPill(el, key, isTodayVariantPill);
+      if (t) t.remove();
+      decoratedTodayKey.delete(el);
+    }
+    if (pillVis.yesterday) {
+      const todayPillEl = findRowPill(el, key, isTodayVariantPill);
+      maybeRenderYesterdayPill(el, todayPillEl || mainPill || el, data, key);
+    } else {
+      const y = findRowPill(el, key, isYesterdayVariantPill);
+      if (y) y.remove();
+      decoratedYesterdayKey.delete(el);
+    }
   }
 
   // Remove pills currently anchored to `el` that do NOT belong to `key`.
@@ -1411,9 +1635,12 @@
     }
     if (removed) {
       // Force a clean rebuild on this pass — the dedup WeakMaps may still claim
-      // this node is decorated for the now-removed (foreign) key.
+      // this node is decorated for the now-removed (foreign) key. Must clear ALL
+      // three (cohort/today/yesterday) or a recycled node can stale-skip the
+      // yesterday pill and render it missing after scrolling back.
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
+      decoratedYesterdayKey.delete(el);
     }
   }
 
@@ -1951,6 +2178,7 @@
       pillsRendered: 0, pillsRenderedOffDate: 0,
       pillsRenderedEstSpendDown: 0, pillsRenderedEstSpendUp: 0,
       pillsNeedYesterday: 0, yestCaptured: 0,
+      pillsYesterday: 0, yestNeedSpend: 0,
       skippedNoSpendCell: 0, skippedZeroSpend: 0,
       skippedCurrencyMismatch: 0, skippedNoAdjustData: 0,
       skippedAmbiguous: 0, skippedAbbreviated: 0,
@@ -2008,6 +2236,7 @@
     document.querySelectorAll(NAME_CANDIDATE_SELECTOR).forEach(el => {
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
+      decoratedYesterdayKey.delete(el);
     });
   }
 
@@ -2230,6 +2459,15 @@
         removeAllPills();
         decorateAllVisibleRows();
       });
+    } else if (changes.pillVisibility) {
+      // Popup toggled which pill types to show. Re-read and repaint. Enabling
+      // Yesterday also triggers a force-sync from the popup, which writes
+      // campaignDataCache and re-runs loadData separately — so here we only
+      // need to gate/repaint against whatever data is already cached.
+      loadPillVisibility().then(() => {
+        removeAllPills();
+        decorateAllVisibleRows();
+      });
     }
   });
 
@@ -2242,79 +2480,16 @@
     scheduleDecorate();
   });
 
-  // ---- Pill visibility toggle ----
-  // The pills can clutter the table when the user just wants to read Meta's
-  // own numbers. A single floating button flips a body-level <style> that
-  // hides every `.adjust-pill` (main + all Today variants share that base
-  // class) with one !important rule — no need to fight the rAF reposition
-  // loop, which keeps repositioning underneath the hidden style harmlessly.
-  // State persists in localStorage so the preference survives reloads.
-  const PILLS_HIDDEN_KEY = 'aox-meta-pills-hidden';
-  let pillsHidden = false;
+  // NOTE: the old in-page floating "ROAS pill: ON/OFF" button (a binary
+  // hide-all toggle backed by localStorage) was removed in v0.9.0. Pill
+  // visibility is now per-type and controlled from the popup's "Meta pills
+  // shown" checkboxes (chrome.storage.local.pillVisibility.meta), gated at
+  // decoration time in decorateCandidate. Unchecking all three is the new
+  // "hide everything".
 
-  function readPillsHidden() {
-    try { return localStorage.getItem(PILLS_HIDDEN_KEY) === '1'; } catch { return false; }
-  }
-
-  function applyPillVisibility() {
-    let style = document.getElementById('aox-pill-hide-style');
-    if (pillsHidden) {
-      if (!style) {
-        style = document.createElement('style');
-        style.id = 'aox-pill-hide-style';
-        style.textContent = '.adjust-pill{display:none !important;}';
-        (document.head || document.documentElement).appendChild(style);
-      }
-    } else if (style) {
-      style.remove();
-    }
-    const btn = document.getElementById('aox-pill-toggle');
-    if (btn) {
-      btn.textContent = pillsHidden ? 'ROAS pill: OFF' : 'ROAS pill: ON';
-      btn.style.background = pillsHidden ? '#8a8f99' : '#0066ff';
-      btn.style.opacity = pillsHidden ? '0.7' : '0.92';
-      btn.title = pillsHidden
-        ? 'Adjust ROAS pills are hidden — click to show'
-        : 'Adjust ROAS pills are shown — click to hide';
-    }
-  }
-
-  function createPillToggle() {
-    if (document.getElementById('aox-pill-toggle')) return;
-    const btn = document.createElement('button');
-    btn.id = 'aox-pill-toggle';
-    btn.type = 'button';
-    Object.assign(btn.style, {
-      position: 'fixed', right: '16px', bottom: '16px', zIndex: '100000',
-      padding: '6px 11px', borderRadius: '14px', border: 'none',
-      color: '#fff', font: '600 12px/1 system-ui, -apple-system, sans-serif',
-      cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,.25)',
-    });
-    btn.addEventListener('click', () => {
-      pillsHidden = !pillsHidden;
-      try { localStorage.setItem(PILLS_HIDDEN_KEY, pillsHidden ? '1' : '0'); } catch { /* ignore */ }
-      applyPillVisibility();
-      console.log(
-        `%c[AOX]%c ROAS pills ${pillsHidden ? 'hidden' : 'shown'} (user toggle)`,
-        'background:#0066ff;color:#fff;padding:1px 4px;border-radius:3px',
-        'color:#0066ff'
-      );
-    });
-    document.body.appendChild(btn);
-  }
-
-  function initPillToggle() {
-    pillsHidden = readPillsHidden();
-    createPillToggle();
-    applyPillVisibility();
-  }
-
-  // Mount the show/hide toggle immediately (independent of data load) so the
-  // user can collapse the overlay even before Adjust data arrives.
-  initPillToggle();
-
-  // Initial. Load thresholds + timezone config first so the very first
-  // decoration uses user-configured colors and the correct estimate mode
-  // rather than briefly painting with defaults.
-  Promise.all([loadColorThresholds(), loadTzConfig()]).then(() => loadData());
+  // Initial. Load thresholds + timezone config + pill-visibility toggles first
+  // so the very first decoration uses user-configured colors, the correct
+  // estimate mode, and the right set of pills rather than briefly painting with
+  // defaults.
+  Promise.all([loadColorThresholds(), loadTzConfig(), loadPillVisibility()]).then(() => loadData());
 })();

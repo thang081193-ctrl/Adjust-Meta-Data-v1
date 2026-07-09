@@ -228,6 +228,48 @@ function mergeThresholds(stored) {
   };
 }
 
+// ---- Meta pill visibility ----
+// Stored under chrome.storage.local.pillVisibility.meta as three booleans. The
+// content script gates each pill type on these; the Yesterday pill also drives
+// whether the background pulls the yesterday event-date report (see
+// createDataSource), so enabling it force-syncs to populate the data.
+const DEFAULT_PILL_VIS = { cohort: true, today: true, yesterday: false };
+
+function readPillVis(stored) {
+  const m = stored?.meta || {};
+  return {
+    cohort:    typeof m.cohort    === 'boolean' ? m.cohort    : DEFAULT_PILL_VIS.cohort,
+    today:     typeof m.today     === 'boolean' ? m.today     : DEFAULT_PILL_VIS.today,
+    yesterday: typeof m.yesterday === 'boolean' ? m.yesterday : DEFAULT_PILL_VIS.yesterday,
+  };
+}
+
+function loadPillVisibility(prefetched) {
+  const v = readPillVis(prefetched);
+  $('pillCohort').checked = v.cohort;
+  $('pillToday').checked = v.today;
+  $('pillYesterday').checked = v.yesterday;
+}
+
+async function savePillVisibility() {
+  const prev = readPillVis((await chrome.storage.local.get('pillVisibility')).pillVisibility);
+  const next = {
+    cohort: $('pillCohort').checked,
+    today: $('pillToday').checked,
+    yesterday: $('pillYesterday').checked,
+  };
+  await chrome.storage.local.set({ pillVisibility: { meta: next } });
+  // Yesterday OFF→ON needs the yesterday event-date report (only fetched when
+  // the toggle is on). Force a sync so the pill has data immediately. Other
+  // toggles are pure client-side gating — the content script re-decorates on
+  // the storage change without a refetch.
+  if (next.yesterday && !prev.yesterday) {
+    doSync(true);
+  } else {
+    $('status').textContent = 'Pill visibility saved.';
+  }
+}
+
 function numOr(v, fallback) {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
@@ -256,15 +298,20 @@ for (const btn of $('periods').querySelectorAll('button')) {
   btn.addEventListener('click', () => pickPeriod(btn.dataset.period));
 }
 
+for (const id of ['pillCohort', 'pillToday', 'pillYesterday']) {
+  $(id).addEventListener('change', savePillVisibility);
+}
+
 // Batch the two storage reads + the GET_CACHED IPC into a single concurrent
 // burst so the popup paints faster on open. Sequential awaits used to add
 // 15-45ms of unnecessary IPC latency across three round trips.
 (async function bootstrap() {
   populateUtcOffsetList();
-  const [{ dataSourceConfig, colorThresholds }] = await Promise.all([
-    chrome.storage.local.get(['dataSourceConfig', 'colorThresholds']),
+  const [{ dataSourceConfig, colorThresholds, pillVisibility }] = await Promise.all([
+    chrome.storage.local.get(['dataSourceConfig', 'colorThresholds', 'pillVisibility']),
     refreshStatus(),
   ]);
   loadCfg(dataSourceConfig);
   loadColorThresholds(colorThresholds);
+  loadPillVisibility(pillVisibility);
 })();

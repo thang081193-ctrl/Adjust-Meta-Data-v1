@@ -207,12 +207,25 @@ export async function fetchTodayGrossRevenue({ apiToken, utcOffset = '+07:00', a
   return rows;
 }
 
-// NOTE: a sibling fetchYesterdayGrossRevenue (BKT "yesterday" gross) was
-// removed in v0.8.1. The LA-timezone today-pill is now BKT-anchored (Option B):
-// revenue is kept exactly as Adjust's BKT-today, and only SPEND is re-projected
-// onto the BKT window (regime 1 scales today's spend down; regime 2 tops up
-// with the DOM-captured Meta yesterday spend). No Adjust yesterday-revenue
-// fetch is needed, saving one report call per sync.
+// Realtime "Yesterday" revenue, event-date attribution (NOT cohort). Powers the
+// optional Yesterday realtime pill (Adjust yesterday gross rev ÷ Meta yesterday
+// spend read from the DOM). This uses the SAME event-date endpoint as the today
+// fetch — the key property is that event-date revenue is available in near-real
+// time and is NOT gated by Adjust's once-a-day cohort finalization (the post-9am
+// pull). So the user gets a directional yesterday ROAS well before cohort
+// roas_d0 for yesterday's installs matures.
+//
+// NOTE: a previous fetchYesterdayGrossRevenue was removed in v0.8.1 because the
+// LA-timezone today-pill switched to a BKT-anchored model that no longer needed
+// yesterday REVENUE (only yesterday SPEND). This re-introduction serves a
+// different purpose (the Yesterday pill), so callers gate it behind that pill's
+// toggle to avoid paying the extra report call when the pill is off.
+export async function fetchYesterdayGrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
+  const rows = await fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod: 'yesterday' });
+  for (const r of rows) { r.revenueYesterday = r.revenue; }
+  return rows;
+}
+
 async function fetchGrossRevenue({ apiToken, utcOffset = '+07:00', appTokens, datePeriod }) {
   const [campaignRows, adsetRows, adRows] = await Promise.all([
     fetchGrossRevenueAtLevel({

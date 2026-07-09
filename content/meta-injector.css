@@ -40,6 +40,16 @@
 .adjust-pill-today-offdate  { background: #fff3e0; color: #6a3a00; border: 1px dashed #d9a300; }
 .adjust-pill-today-offdate::before { content: "⚠ "; }
 
+/* Yesterday pill (optional third sibling): Adjust yesterday event-date revenue
+   × Meta yesterday spend. Purple tint to distinguish it from the blue Today
+   pill at a glance. */
+.adjust-pill-yesterday      { background: #f3ecff; color: #4a2a8c; border-color: #d3c2ff; }
+.adjust-pill-yest-mismatch  { background: #fff3e0; color: #6a3a00; border-color: #ffd9a0; }
+.adjust-pill-yest-mismatch::before { content: "⚠ "; }
+/* No yesterday spend captured yet — prompt the user to visit the Yesterday view. */
+.adjust-pill-yest-offdate   { background: #f3ecff; color: #4a2a8c; border: 1px dashed #9a6ad9; }
+.adjust-pill-yest-offdate::before { content: "⚠ "; }
+
 /* Banner = small draggable badge that expands into a details panel on click.
    Default position is bottom-right; once the user drags it, the new position
    is saved to localStorage and restored across reloads. */
