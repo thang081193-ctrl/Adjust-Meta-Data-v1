@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.5.0-tt-yesterday-pill';
+  const INJECTOR_VERSION = 'v0.5.1-tt-thresh-parity';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -103,8 +103,10 @@
   let loadInFlight = false;
 
   // Color thresholds — overridable per-platform from popup Settings. Defaults
-  // mirror what the popup writes when the user hasn't customized yet.
-  let colorThresholds = { pause: 0.30, red: 0.60, green: 1.00 };
+  // mirror what the popup writes when the user hasn't customized yet, and are
+  // kept identical to meta-injector's so one campaign reads the same colour in
+  // either table (see DEFAULT_COLOR_THRESHOLDS in popup/popup.js).
+  let colorThresholds = { pause: 0.60, red: 0.80, green: 1.00 };
 
   let bodyObserver = null;
   let decorateTimer = null;

@@ -171,14 +171,20 @@ async function pickPeriod(period) {
 }
 
 // ---- Color thresholds (per-platform) ----
-// Stored as decimals (0.30 = 30%) under chrome.storage.local.colorThresholds.
+// Stored as decimals (0.60 = 60%) under chrome.storage.local.colorThresholds.
 // Pill background turns red when d7 < pause. Each segment value gets red text
 // when below `red` or green text when above `green`. Defaults are tuned for
-// app-marketing ROAS where d7 < 30% is "stop bleeding", 30-60% is acceptable
-// while ramping, 60-99% is hold, 100%+ is breakeven/scale.
+// app-marketing ROAS where d7 < 60% is "stop bleeding", 60-80% is acceptable
+// while ramping, 80-99% is hold, 100%+ is breakeven/scale.
+//
+// Both platforms share one scale on purpose: the same campaign judged on the
+// same d7 ROAS should get the same colour whichever table it is read in.
+// Meta moved to this scale in v0.9.2 and TikTok followed — a split scale meant
+// a 50% d7 campaign read red on Meta and neutral on TikTok, which is exactly
+// the kind of inconsistency that erodes trust in the colour signal.
 const DEFAULT_COLOR_THRESHOLDS = {
   meta:   { pause: 0.60, red: 0.80, green: 1.00 },
-  tiktok: { pause: 0.30, red: 0.60, green: 1.00 },
+  tiktok: { pause: 0.60, red: 0.80, green: 1.00 },
 };
 
 async function loadColorThresholds(prefetched) {
