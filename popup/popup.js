@@ -177,7 +177,7 @@ async function pickPeriod(period) {
 // app-marketing ROAS where d7 < 30% is "stop bleeding", 30-60% is acceptable
 // while ramping, 60-99% is hold, 100%+ is breakeven/scale.
 const DEFAULT_COLOR_THRESHOLDS = {
-  meta:   { pause: 0.30, red: 0.60, green: 1.00 },
+  meta:   { pause: 0.60, red: 0.80, green: 1.00 },
   tiktok: { pause: 0.30, red: 0.60, green: 1.00 },
 };
 

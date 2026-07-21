@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.9.1-pill-toggles';
+  const INJECTOR_VERSION = 'v0.9.2-meta-thresh-defaults';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -93,7 +93,7 @@
 
   // Color thresholds — overridable per-platform from popup Settings. Defaults
   // mirror what the popup writes when the user hasn't customized yet.
-  let colorThresholds = { pause: 0.30, red: 0.60, green: 1.00 };
+  let colorThresholds = { pause: 0.60, red: 0.80, green: 1.00 };
 
   // Which pill types to render, set from the popup's "Meta pills shown"
   // checkboxes (chrome.storage.local.pillVisibility.meta). Defaults preserve the
@@ -1173,8 +1173,8 @@
         todayPill.appendChild(document.createTextNode(' '));
         const valSpan = document.createElement('span');
         valSpan.textContent = pct(roas);
-        if (roas < 0.60) valSpan.className = 'adjust-rv-red';
-        else if (roas > 1.00) valSpan.className = 'adjust-rv-green';
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
         todayPill.appendChild(valSpan);
       }
       todayPill.title = formatTodayTooltip(rev, spend, metaCcy || adjCcy || '?', adjCcy, data, est);
