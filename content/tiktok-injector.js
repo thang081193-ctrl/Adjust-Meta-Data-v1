@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.4.8-tt-orphan-sweep';
+  const INJECTOR_VERSION = 'v0.5.0-tt-yesterday-pill';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -140,16 +140,26 @@
       detectedTikTokCurrency: null, adjustCurrencyExample: null,
       sampleRowCandidates: null,
       ttDateIsToday: null, ttDateLabel: null, ttDateSource: null,
+      // Yesterday-pill counters (v0.5.0). yestCaptured counts spend cells
+      // harvested while the UI sits on Yesterday; pillsYesterday counts full
+      // ROAS pills; yestNeedSpend counts the "cần view Yesterday" prompts.
+      ttDateIsYesterday: null,
+      yestCaptured: 0, pillsYesterday: 0, yestNeedSpend: 0,
+      skippedYestCurrencyMismatch: 0, sampleRevYesterday: null,
     };
   }
   let lastTodayStats = createEmptyTodayStats();
 
-  // CSS class names for the three today-pill variants. Defined once so the
-  // strings can't drift between the render branches and the dedup cleanup
-  // sweep in decorateCandidate / maybeRenderTodayPill.
+  // CSS class names for the today- and yesterday-pill variants. Defined once
+  // so the strings can't drift between the render branches and the dedup
+  // cleanup sweeps in decorateCandidate / maybeRender*Pill. The rules live in
+  // content/meta-injector.css, which the manifest loads on TikTok too.
   const TODAY_PILL_CLASS_NORMAL   = 'adjust-pill adjust-pill-today';
   const TODAY_PILL_CLASS_OFFDATE  = 'adjust-pill adjust-pill-today-offdate';
   const TODAY_PILL_CLASS_MISMATCH = 'adjust-pill adjust-pill-today-mismatch';
+  const YEST_PILL_CLASS_NORMAL    = 'adjust-pill adjust-pill-yesterday';
+  const YEST_PILL_CLASS_OFFDATE   = 'adjust-pill adjust-pill-yest-offdate';
+  const YEST_PILL_CLASS_MISMATCH  = 'adjust-pill adjust-pill-yest-mismatch';
   // Per-pass caches populated at the start of decorateAllVisibleRows.
   let currentCostColumn = null;
   let currentTikTokDate = null;
@@ -161,6 +171,19 @@
   // disconnects or virtualizes).
   const cellToTodayPill = new Map();
   const decoratedTodayKey = new WeakMap();
+
+  // Yesterday pill: a THIRD position:fixed sibling, same lifecycle contract as
+  // the today pill but its own Map/WeakMap so each type can be toggled off
+  // independently without disturbing the other two.
+  const cellToYesterdayPill = new Map();
+  const decoratedYesterdayKey = new WeakMap();
+
+  // TikTok exposes no spend API, so yesterday's spend can only be scraped from
+  // the table while the date picker is parked on Yesterday. Harvested values
+  // live here keyed by the row's match key, tagged with the calendar day they
+  // represent so a stale capture is never divided into a newer day's revenue.
+  //   Map<mainKey, { representsDay: 'YYYY-MM-DD', spend: number, currency: string }>
+  const ttYestSpendCache = new Map();
 
   // ---- Bridge integration ----
   let bridgeScanToken = 0;
@@ -499,19 +522,39 @@
   //   - Date filter URL format is `?st=YYYY-MM-DD&et=YYYY-MM-DD` with no
   //     preset keyword (unlike Meta's `date_preset=today` or `,today` suffix).
 
-  // Header text TikTok uses for the Cost column across locales. Keys are
+  // Header text TikTok uses for the spend column across locales. Keys are
   // canonicalKey'd at construction. Failure is graceful (column-missing
   // banner) rather than silent miscoluming.
+  //
+  // TikTok labels this column "Cost" in some account/locale builds and
+  // "Spend" in others (same underlying `stat_cost` metric — visible in the
+  // URL's `sort_state=stat_cost`). v0.4.8 only knew "Cost", so accounts on
+  // the "Spend" build silently got NO today pill and the misleading
+  // "enable Cost column" banner while the column was right there. Both
+  // spellings — and their locale variants — are accepted now.
   const TIKTOK_COST_HEADER_KEYS = new Set([
     canonicalKey('Cost'),
+    canonicalKey('Spend'),
+    canonicalKey('Amount spent'),
+    canonicalKey('Total cost'),
     canonicalKey('Chi phí'),
+    canonicalKey('Chi tiêu'),
     canonicalKey('Costo'),
+    canonicalKey('Gasto'),
     canonicalKey('Coût'),
+    canonicalKey('Dépenses'),
     canonicalKey('Kosten'),
+    canonicalKey('Ausgaben'),
     canonicalKey('Custo'),
+    canonicalKey('Gastos'),
+    canonicalKey('Biaya'),
+    canonicalKey('ค่าใช้จ่าย'),
     canonicalKey('费用'),
     canonicalKey('費用'),
+    canonicalKey('花费'),
+    canonicalKey('消費額'),
     canonicalKey('비용'),
+    canonicalKey('지출'),
   ]);
 
   // Currencies with no fractional unit. Symbol detection uses these to decide
@@ -584,6 +627,17 @@
     if (visited.has(e)) return;
     visited.add(e);
     e.revenueToday = (e.revenueToday || 0) + (row.revenueToday || 0);
+    // Yesterday event-date revenue. row.revenueYesterday is null when the
+    // yesterday fetch did not run (no Yesterday pill enabled on either
+    // platform) or failed — data-source.js leaves it null — and a number
+    // (0 included) only when the fetch succeeded. Accumulate ONLY the numeric
+    // case so a not-fetched row leaves the entry's revenueYesterday undefined
+    // → the pill shows a dash rather than a fabricated red 0%. Same visited
+    // guard as revenueToday: buildAdIndex shares one entry object across
+    // byName/byComposite/byAdId, so without it revenue triple-counts.
+    if (row.revenueYesterday != null) {
+      e.revenueYesterday = (e.revenueYesterday || 0) + row.revenueYesterday;
+    }
     if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
     e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
   }
@@ -871,37 +925,57 @@
     return { value: negative ? -value : value, currency, parsed: true };
   }
 
-  // Detect whether TikTok UI's date filter is set to "Today". TikTok exposes
-  // the active range via `?st=YYYY-MM-DD&et=YYYY-MM-DD` with no preset
-  // keyword (unlike Meta's `date_preset` / `,today` suffix). When both equal
-  // browser-local today → isToday=true. When absent → isToday=false (don't
-  // silently divide by an unknown range's spend).
+  // Detect whether TikTok UI's date filter is set to "Today" / "Yesterday".
+  // TikTok exposes the active range via `?st=YYYY-MM-DD&et=YYYY-MM-DD` with no
+  // preset keyword (unlike Meta's `date_preset` / `,today` suffix) — so unlike
+  // Meta, which can short-circuit on the literal string 'yesterday', the ONLY
+  // way to recognise yesterday here is ISO equality on a single-day range.
+  // When both bounds equal browser-local today → isToday=true. When absent →
+  // both false (don't silently divide by an unknown range's spend).
   //
-  // Returns: { isToday: bool, label: string, source: 'range'|'absent'|'error' }
+  // Returns: { isToday, isYesterday, label, source: 'range'|'absent'|'error' }
   function detectTikTokDateInfo() {
     try {
       const params = new URLSearchParams(window.location.search);
       const st = params.get('st');
       const et = params.get('et');
       if (!st && !et) {
-        return { isToday: false, label: 'unknown', source: 'absent' };
+        return { isToday: false, isYesterday: false, label: 'unknown', source: 'absent' };
       }
       if (st && et && /^\d{4}-\d{2}-\d{2}$/.test(st) && /^\d{4}-\d{2}-\d{2}$/.test(et)) {
         const today = todayLocalIsoDate();
         if (st === today && et === today) {
-          return { isToday: true, label: 'today', source: 'range' };
+          return { isToday: true, isYesterday: false, label: 'today', source: 'range' };
         }
+        const yesterday = yesterdayLocalIsoDate();
+        const isYesterday = st === yesterday && et === yesterday;
         const label = st === et ? st : `${st}…${et}`;
-        return { isToday: false, label, source: 'range' };
+        return { isToday: false, isYesterday, label, source: 'range' };
       }
-      return { isToday: false, label: `${st || '?'}…${et || '?'}`, source: 'range' };
+      return {
+        isToday: false, isYesterday: false,
+        label: `${st || '?'}…${et || '?'}`, source: 'range',
+      };
     } catch {
-      return { isToday: false, label: 'unknown', source: 'error' };
+      return { isToday: false, isYesterday: false, label: 'unknown', source: 'error' };
     }
   }
 
   function todayLocalIsoDate() {
-    const d = new Date();
+    return localIsoDate(new Date());
+  }
+
+  // Browser-local yesterday. Deliberately the same clock the today check uses:
+  // both assume the browser timezone tracks the ad-account timezone. If they
+  // diverge the pill is off by a day — the SAME exposure the today pill has
+  // always carried on TikTok, not a new one introduced here. Computed by
+  // subtracting 24h from the epoch, so DST shifts land on the right calendar
+  // day (a date-component decrement would not).
+  function yesterdayLocalIsoDate() {
+    return localIsoDate(new Date(Date.now() - 86400000));
+  }
+
+  function localIsoDate(d) {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
     const day = String(d.getDate()).padStart(2, '0');
@@ -1025,6 +1099,113 @@
     commitTodayPill(nameEl, mainPill, todayPill, todayKey);
   }
 
+  // Harvest yesterday's spend from the table — the ONLY moment it is readable
+  // is while the date picker sits on Yesterday, because TikTok gives us no
+  // spend API and the cost cell always reflects the active range. Runs
+  // UNCONDITIONALLY from decorateCandidate (not gated on pillVis.yesterday) so
+  // a user who browses Yesterday with the pill off still has the data cached
+  // the moment they turn it on.
+  //
+  // Captures are tagged with the day they represent and re-validated at render
+  // time; a capture from two days ago is dropped rather than divided into a
+  // fresher revenue figure.
+  function maybeCaptureYesterdaySpend(nameEl, mainKey) {
+    if (!currentCostColumn) return;
+    if (!currentTikTokDate || !currentTikTokDate.isYesterday) return;
+    const text = findCostCellText(nameEl);
+    if (text == null) return;
+    const parsed = parseCurrencyCell(text);
+    if (!parsed.parsed || parsed.value == null || parsed.abbreviated) return;
+    ttYestSpendCache.set(mainKey, {
+      representsDay: currentTikTokDate.label,
+      spend: parsed.value,
+      currency: parsed.currency,
+    });
+    lastTodayStats.yestCaptured++;
+  }
+
+  // Build (or refresh) the yesterday pill. Like the today pill it ALWAYS
+  // renders (pipeline-state-visible rule) — when spend was never captured it
+  // shows `Y'day: <rev>/– — cần view Yesterday` rather than vanishing, so the
+  // user can tell "not captured yet" from "extension broken".
+  //
+  // Deliberately NOT gated on the current date filter: the pill's spend comes
+  // from cache, not from the visible cells, so it stays meaningful (and stays
+  // the daily driver) while the UI sits on Today.
+  function maybeRenderYesterdayPill(nameEl, anchorPill, data, mainKey) {
+    if (!data || data.ambiguous) return;
+
+    const rev = (data.revenueYesterday == null) ? null : data.revenueYesterday;
+    const adjCcy = data.adjustCurrency;
+    if (lastTodayStats.sampleRevYesterday == null && rev != null) {
+      lastTodayStats.sampleRevYesterday = rev;
+    }
+
+    // A capture only counts if it represents the day Adjust's `yesterday`
+    // report covers. Comparing against the live yesterday ISO (not against
+    // whatever the picker shows now) is what makes a day-rollover drop the
+    // stale capture instead of misattributing it.
+    const cached = ttYestSpendCache.get(mainKey);
+    const spendFresh = !!(
+      cached && cached.representsDay === yesterdayLocalIsoDate() && cached.spend != null
+    );
+    const spend = spendFresh ? cached.spend : null;
+    const ttCcy = spendFresh ? cached.currency : null;
+    const currencyMismatch = ttCcy && adjCcy && ttCcy !== adjCcy;
+
+    const yestKey =
+      `${mainKey}|yrev:${rev}|yspend:${spend}|t:${ttCcy || ''}|a:${adjCcy || ''}|mm:${currencyMismatch}`;
+    if (decoratedYesterdayKey.get(nameEl) === yestKey) return;
+
+    const yestPill = document.createElement('span');
+
+    if (!spendFresh) {
+      yestPill.className = YEST_PILL_CLASS_OFFDATE;
+      yestPill.textContent = `Y'day: ${formatMoneyOrDash(rev)}/– — cần view Yesterday`;
+      yestPill.title =
+        `Yesterday ROAS chưa tính — chưa bắt được TikTok spend hôm qua.\n` +
+        `Chuyển TikTok date picker sang đúng ngày ${yesterdayLocalIsoDate()} một lần để\n` +
+        `extension đọc cost cell, rồi quay lại Today.\n` +
+        `Revenue hôm qua (Adjust, event-date) đã có: ` +
+        `${formatMoneyOrDash(rev)}${adjCcy ? ` ${adjCcy}` : ''}.`;
+      lastTodayStats.yestNeedSpend++;
+    } else if (currencyMismatch) {
+      yestPill.className = YEST_PILL_CLASS_MISMATCH;
+      yestPill.textContent =
+        `Y'day: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)} (${adjCcy}→${ttCcy})`;
+      yestPill.title =
+        `Yesterday ROAS unavailable — cross-currency.\n` +
+        `Adjust yesterday rev (${adjCcy}): ${formatMoneyOrDash(rev)}\n` +
+        `TikTok yesterday spend (${ttCcy}): ${formatMoneyOrDash(spend)}\n` +
+        `Refusing to divide across currencies (would mislead).`;
+      lastTodayStats.skippedYestCurrencyMismatch++;
+    } else {
+      yestPill.className = YEST_PILL_CLASS_NORMAL;
+      yestPill.appendChild(document.createTextNode(
+        `Y'day: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`
+      ));
+      if (rev != null && spend != null && spend > 0) {
+        const roas = rev / spend;
+        yestPill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
+        yestPill.appendChild(valSpan);
+      }
+      const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+      yestPill.title =
+        `Yesterday realtime ROAS (event-date — directional, not cohort d0)\n` +
+        `Rev (Adjust yesterday${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(rev)}\n` +
+        `Spend (TikTok ${cached.representsDay}${ttCcy ? `, ${ttCcy}` : ''}): ` +
+        `${formatMoneyOrDash(spend)}` +
+        (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
+      lastTodayStats.pillsYesterday++;
+    }
+
+    commitYesterdayPill(nameEl, anchorPill, yestPill, yestKey);
+  }
+
   // Final commit step shared by both render branches: drop any stale pill,
   // apply position-fixed styling, position once on the current frame, attach
   // to body, register in the tracking Maps, invalidate the rAF early-exit
@@ -1037,14 +1218,40 @@
     todayPill.style.position = 'fixed';
     todayPill.style.zIndex = '99999';
     todayPill.style.margin = '0';
-    positionTodayPillToCell(nameEl, mainPill, todayPill);
+    // Park off-screen and measure BEFORE positioning, same reason the main
+    // pill does: the yesterday pill's column anchor is derived from the widest
+    // today pill, and offsetWidth on a display:none element reads 0. Without
+    // this the two would overlap on rows created while scrolled out of view.
+    todayPill.style.left = '-99999px';
+    todayPill.style.top = '0';
     document.body.appendChild(todayPill);
+    todayPill._aoxWidth = todayPill.offsetWidth;
+    if (todayPill._aoxWidth > maxTodayPillWidth) maxTodayPillWidth = todayPill._aoxWidth;
+    positionTodayPillToCell(nameEl, mainPill, todayPill);
     cellToTodayPill.set(nameEl, todayPill);
     decoratedTodayKey.set(nameEl, todayKey);
     // The rAF early-exit prefilter only tracks the main pill's cell rect; a
     // newly-created today pill would otherwise sit at its initial position
     // until the row moved. Drop the prefilter cache so the next frame runs
     // the full positioning path once and re-records the prev state.
+    lastPositioned.delete(nameEl);
+    ensureRepositionLoop();
+  }
+
+  // Same contract as commitTodayPill, for the third column.
+  function commitYesterdayPill(nameEl, anchorPill, yestPill, yestKey) {
+    const stale = cellToYesterdayPill.get(nameEl);
+    if (stale) { stale.remove(); cellToYesterdayPill.delete(nameEl); }
+    yestPill.style.position = 'fixed';
+    yestPill.style.zIndex = '99999';
+    yestPill.style.margin = '0';
+    yestPill.style.left = '-99999px';
+    yestPill.style.top = '0';
+    document.body.appendChild(yestPill);
+    yestPill._aoxWidth = yestPill.offsetWidth;
+    positionYesterdayPillToCell(nameEl, anchorPill, yestPill);
+    cellToYesterdayPill.set(nameEl, yestPill);
+    decoratedYesterdayKey.set(nameEl, yestKey);
     lastPositioned.delete(nameEl);
     ensureRepositionLoop();
   }
@@ -1068,20 +1275,24 @@
       return;
     }
     const cached = lastPositioned.get(cell);
-    let mainWidth = mainPill._aoxWidth || 0;
+    // mainPill is null when the cohort pill is toggled off — the today pill is
+    // then the leading pill and simply takes the main column's slot.
+    let mainWidth = mainPill && mainPill._aoxWidth || 0;
     // Lazy re-measure if the creation-time read returned 0 (shouldn't happen
     // with the off-screen park, but be defensive — e.g. if CSS animations
     // were mid-flight on creation). Costs one layout flush per pill once.
-    if (mainWidth === 0 && mainPill.isConnected) {
+    if (mainWidth === 0 && mainPill && mainPill.isConnected) {
       mainWidth = mainPill.offsetWidth;
       if (mainWidth > 0) mainPill._aoxWidth = mainWidth;
     }
     let leftAnchor;
-    if (mainPillAnchorX != null && maxMainPillWidth > 0) {
+    if (mainPillAnchorX != null) {
       // Fixed slot: every Today pill starts at the same x (main column anchor +
       // widest main pill + gap), so the Today pills line up in one straight
-      // column that never collides with the main-pill column.
-      leftAnchor = mainPillAnchorX + maxMainPillWidth + 6;
+      // column that never collides with the main-pill column. With the cohort
+      // pill off, maxMainPillWidth stays 0 and this collapses onto the main
+      // column rather than leaving an empty gutter.
+      leftAnchor = mainPillAnchorX + (maxMainPillWidth > 0 ? maxMainPillWidth + 6 : 0);
     } else if (cached && !cached.hidden && mainWidth > 0) {
       leftAnchor = cached.left + mainWidth + 4;
     } else {
@@ -1092,6 +1303,48 @@
     todayPill.style.display = '';
     todayPill.style.left = Math.round(leftAnchor) + 'px';
     todayPill.style.top = Math.round(cr.top + (cr.height / 2) - 9) + 'px';
+  }
+
+  // Third column, same fixed-slot discipline as the today pill. Anchors past
+  // the widest today pill so all three columns stay straight regardless of
+  // per-row text width.
+  //
+  // When the today pill is toggled OFF no today pill is ever created, so
+  // maxTodayPillWidth stays 0 and this collapses onto the today slot exactly —
+  // the yesterday pill slides left into the vacated column instead of leaving
+  // a visible gap.
+  function positionYesterdayPillToCell(cell, anchorPill, yestPill) {
+    const cr = cell.getBoundingClientRect();
+    const offscreen = cr.width === 0 || cr.height === 0
+      || cr.bottom < 0 || cr.top > window.innerHeight;
+    if (offscreen) {
+      yestPill.style.display = 'none';
+      return;
+    }
+    let leftAnchor;
+    if (mainPillAnchorX != null) {
+      const todaySlot = mainPillAnchorX + (maxMainPillWidth > 0 ? maxMainPillWidth + 6 : 0);
+      leftAnchor = maxTodayPillWidth > 0 ? todaySlot + maxTodayPillWidth + 6 : todaySlot;
+    } else {
+      // Pre-anchor fallback: chain off whatever pill we were handed. The next
+      // rAF tick tightens placement once the table-wide anchors are computed.
+      let anchorWidth = anchorPill && anchorPill._aoxWidth || 0;
+      if (anchorWidth === 0 && anchorPill && anchorPill.isConnected) {
+        anchorWidth = anchorPill.offsetWidth;
+        if (anchorWidth > 0) anchorPill._aoxWidth = anchorWidth;
+      }
+      const cached = lastPositioned.get(cell);
+      if (cached && !cached.hidden && anchorWidth > 0) {
+        leftAnchor = cached.left + anchorWidth + 4;
+      } else {
+        const column = getColumnAncestor(cell);
+        const colRight = column ? column.getBoundingClientRect().right : cr.right;
+        leftAnchor = colRight + 220;
+      }
+    }
+    yestPill.style.display = '';
+    yestPill.style.left = Math.round(leftAnchor) + 'px';
+    yestPill.style.top = Math.round(cr.top + (cr.height / 2) - 9) + 'px';
   }
 
   function logDomDiagnostics() {
@@ -1180,7 +1433,25 @@
       // every main pill snaps to; slot is the reserved main-pill width the
       // Today column clears. If pills look staggered again, check these are
       // stable across rows instead of re-deriving the layout from scratch.
-      pillLayout: { anchorX: mainPillAnchorX, slot: maxMainPillWidth },
+      pillLayout: {
+        anchorX: mainPillAnchorX,
+        slot: maxMainPillWidth,
+        todaySlot: maxTodayPillWidth,
+      },
+      // Checklog for the per-type toggles + yesterday capture. `pillVis` is
+      // what the popup checkboxes resolved to; yestSpendCacheSize is how many
+      // rows have a harvested yesterday spend. A yesterday pill stuck on
+      // "cần view Yesterday" with a non-zero cache size means the capture is
+      // landing but the day tag no longer matches (rollover) — check
+      // yestRepresentsDay against today's date before re-hunting the scraper.
+      pillVis: { ...pillVis },
+      yesterday: {
+        cacheSize: ttYestSpendCache.size,
+        expectsDay: yesterdayLocalIsoDate(),
+        sampleEntry: ttYestSpendCache.size
+          ? [...ttYestSpendCache.values()][0]
+          : null,
+      },
     });
   }
 
@@ -1218,15 +1489,20 @@
 
     lastDecorateStats.matched++;
 
+    // Harvest yesterday spend BEFORE any visibility gate — see the function
+    // comment: a user browsing Yesterday with the pill off should still come
+    // back to a populated cache when they switch it on.
+    maybeCaptureYesterdaySpend(el, key);
+
     if (decoratedKey.get(el) === key) {
-      // Same cell + same content — main pill SHOULD be up to date. Today pill
-      // has its own independent dedup map (decoratedTodayKey) and MUST still be
-      // attempted: column header may not have been visible on the first pass,
-      // or the date filter may have flipped. The rAF loop is already (or about
-      // to be) tracking pill positions; nothing else to do for main.
+      // Same cell + same content — main pill SHOULD be up to date. Today and
+      // yesterday pills have their own independent dedup maps and MUST still
+      // be attempted: column header may not have been visible on the first
+      // pass, or the date filter may have flipped. The rAF loop is already (or
+      // about to be) tracking pill positions; nothing else to do for main.
       const existingPill = cellToPill.get(el);
       if (existingPill) {
-        maybeRenderTodayPill(el, existingPill, data, key);
+        renderTrailingPills(el, existingPill, data, key);
         ensureRepositionLoop();
         return;
       }
@@ -1245,9 +1521,9 @@
     }
 
     // Cell got reassigned to a different campaign (virtualization recycle):
-    // drop the old pills before creating fresh ones. Today pill is tracked
-    // separately and must also be dropped or it would orphan once cellToPill
-    // is rekeyed.
+    // drop the old pills before creating fresh ones. The trailing pills are
+    // tracked separately and must also be dropped or they would orphan once
+    // cellToPill is rekeyed.
     const stale = cellToPill.get(el);
     if (stale) {
       stale.remove();
@@ -1259,47 +1535,82 @@
       cellToTodayPill.delete(el);
       decoratedTodayKey.delete(el);
     }
-
-    const pill = document.createElement('span');
-    if (data.ambiguous) {
-      pill.className = 'adjust-pill adjust-pill-ambiguous';
-      pill.title = formatAmbiguousTooltip(data);
-    } else {
-      pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
-      pill.title = formatTooltip(data);
+    const staleYest = cellToYesterdayPill.get(el);
+    if (staleYest) {
+      staleYest.remove();
+      cellToYesterdayPill.delete(el);
+      decoratedYesterdayKey.delete(el);
     }
-    fillPillSegments(pill, data.roas);
 
-    pill.style.position = 'fixed';
-    pill.style.zIndex = '99999';
-    pill.style.margin = '0';
-    // Park the pill off-screen (still display:'') BEFORE appending so we can
-    // measure its rendered width without a layout flicker. If we let
-    // positionPillToCell run first, a cell that's currently offscreen would
-    // apply `display:none` — and offsetWidth on a display:none element is 0,
-    // making the cached width useless and causing the today pill to overlap
-    // the main pill when the row later scrolls into view. The off-screen
-    // park + measure + reposition sequence guarantees a non-zero width
-    // regardless of cell visibility at creation time.
-    pill.style.left = '-99999px';
-    pill.style.top = '0';
-    document.body.appendChild(pill);
-    pill._aoxWidth = pill.offsetWidth;
-    // Track the widest main pill so the Today pill column gets a fixed slot
-    // wide enough to clear every main pill — keeps both columns straight.
-    if (pill._aoxWidth > maxMainPillWidth) maxMainPillWidth = pill._aoxWidth;
-    positionPillToCell(el, pill);
+    let pill = null;
+    if (pillVis.cohort) {
+      pill = document.createElement('span');
+      if (data.ambiguous) {
+        pill.className = 'adjust-pill adjust-pill-ambiguous';
+        pill.title = formatAmbiguousTooltip(data);
+      } else {
+        pill.className = `adjust-pill adjust-pill-${classifyForColor(data.roas)}`;
+        pill.title = formatTooltip(data);
+      }
+      fillPillSegments(pill, data.roas);
 
-    cellToPill.set(el, pill);
-    decoratedKey.set(el, key);
+      pill.style.position = 'fixed';
+      pill.style.zIndex = '99999';
+      pill.style.margin = '0';
+      // Park the pill off-screen (still display:'') BEFORE appending so we can
+      // measure its rendered width without a layout flicker. If we let
+      // positionPillToCell run first, a cell that's currently offscreen would
+      // apply `display:none` — and offsetWidth on a display:none element is 0,
+      // making the cached width useless and causing the today pill to overlap
+      // the main pill when the row later scrolls into view. The off-screen
+      // park + measure + reposition sequence guarantees a non-zero width
+      // regardless of cell visibility at creation time.
+      pill.style.left = '-99999px';
+      pill.style.top = '0';
+      document.body.appendChild(pill);
+      pill._aoxWidth = pill.offsetWidth;
+      // Track the widest main pill so the Today pill column gets a fixed slot
+      // wide enough to clear every main pill — keeps both columns straight.
+      if (pill._aoxWidth > maxMainPillWidth) maxMainPillWidth = pill._aoxWidth;
+      positionPillToCell(el, pill);
 
-    // Today pill is a SEPARATE position:fixed sibling tracked in
-    // cellToTodayPill. ALWAYS attempt; its own decoratedTodayKey WeakMap
-    // dedups so repeated calls are cheap. Failure paths bump lastTodayStats
-    // counters but never throw.
-    maybeRenderTodayPill(el, pill, data, key);
+      cellToPill.set(el, pill);
+      decoratedKey.set(el, key);
+    } else {
+      // Cohort pill off: clear its dedup flag so re-enabling the checkbox
+      // repaints instead of stale-skipping this cell forever.
+      decoratedKey.delete(el);
+    }
+
+    renderTrailingPills(el, pill, data, key);
 
     ensureRepositionLoop();
+  }
+
+  // Today + yesterday pills, each independently gated. Both are SEPARATE
+  // position:fixed siblings with their own tracking Maps; their dedup WeakMaps
+  // make repeated calls cheap, and every failure path bumps a lastTodayStats
+  // counter rather than throwing.
+  //
+  // The else-branches are load-bearing, not defensive noise: TikTok recycles
+  // cell nodes across rows, so a pill left behind after its checkbox was
+  // unticked would be re-adopted by whatever campaign lands on that node next.
+  function renderTrailingPills(el, mainPill, data, key) {
+    if (pillVis.today) {
+      maybeRenderTodayPill(el, mainPill, data, key);
+    } else {
+      const t = cellToTodayPill.get(el);
+      if (t) { t.remove(); cellToTodayPill.delete(el); }
+      decoratedTodayKey.delete(el);
+    }
+
+    if (pillVis.yesterday) {
+      maybeRenderYesterdayPill(el, cellToTodayPill.get(el) || mainPill, data, key);
+    } else {
+      const y = cellToYesterdayPill.get(el);
+      if (y) { y.remove(); cellToYesterdayPill.delete(el); }
+      decoratedYesterdayKey.delete(el);
+    }
   }
 
   // Cache the column ancestor per leaf cell. DOM structure for a row is
@@ -1316,6 +1627,10 @@
   // fixed slot for the main pill so the Today pill column never overlaps it.
   let mainPillAnchorX = null;
   let maxMainPillWidth = 0;
+  // Widest today pill seen this session — reserves the today column's slot so
+  // the yesterday column starts clear of it. Grows only, like maxMainPillWidth:
+  // shrinking it mid-session would make the columns jitter as rows scroll.
+  let maxTodayPillWidth = 0;
 
   // Median (not max) of the visible name cells' column right edges: robust to
   // the occasional row where findColumnAncestor walks up to an over-wide
@@ -1402,11 +1717,31 @@
   let rafHandle = 0;
   const lastPositioned = new WeakMap(); // cell → {left, top, hidden}
 
+  // Cells with at least one live pill. cellToPill is a SUPERSET of the two
+  // trailing maps whenever the cohort pill is enabled (decorateCandidate
+  // creates it first), so the common path returns its keys directly with no
+  // per-frame allocation. Only when the cohort pill is toggled off — where a
+  // row can have a today/yesterday pill and no main pill — do we pay for the
+  // union. Iterating cellToPill alone in that state would leave the trailing
+  // pills frozen at stale coordinates and unreaped.
+  function livePillCells() {
+    if (pillVis.cohort) return cellToPill.keys();
+    const cells = new Set(cellToPill.keys());
+    for (const cell of cellToTodayPill.keys()) cells.add(cell);
+    for (const cell of cellToYesterdayPill.keys()) cells.add(cell);
+    return cells;
+  }
+
+  function hasLivePills() {
+    return cellToPill.size > 0 || cellToTodayPill.size > 0 || cellToYesterdayPill.size > 0;
+  }
+
   function repositionLoopTick() {
     rafHandle = 0;
-    if (cellToPill.size === 0) return;
+    if (!hasLivePills()) return;
 
-    for (const [cell, pill] of cellToPill) {
+    for (const cell of livePillCells()) {
+      const pill = cellToPill.get(cell);
       // Anchor cell left the DOM (virtualized out / table rebuilt) — reap its
       // floating pills. dropPillFor is shared with gcDisconnectedPills so this
       // teardown can't drift from the decorate-time sweep.
@@ -1424,18 +1759,31 @@
       if (prev && prev.top === top && prev.hidden === offscreen && prev.cellRight === r.right) {
         continue;
       }
-      positionPillToCell(cell, pill);
+      if (pill) {
+        positionPillToCell(cell, pill);
+      } else {
+        // No cohort pill on this row (toggled off). positionPillToCell is what
+        // normally records the prefilter entry, so record it here instead —
+        // otherwise `prev` stays undefined forever and every frame re-runs the
+        // full positioning path for every visible row.
+        lastPositioned.set(cell, {
+          left: mainPillAnchorX != null ? mainPillAnchorX : r.right,
+          top, hidden: offscreen, cellRight: r.right,
+        });
+      }
       const todayPill = cellToTodayPill.get(cell);
       if (todayPill) positionTodayPillToCell(cell, pill, todayPill);
+      const yestPill = cellToYesterdayPill.get(cell);
+      if (yestPill) positionYesterdayPillToCell(cell, todayPill || pill, yestPill);
     }
 
-    if (cellToPill.size > 0) {
+    if (hasLivePills()) {
       rafHandle = requestAnimationFrame(repositionLoopTick);
     }
   }
 
   function ensureRepositionLoop() {
-    if (rafHandle || cellToPill.size === 0) return;
+    if (rafHandle || !hasLivePills()) return;
     rafHandle = requestAnimationFrame(repositionLoopTick);
   }
 
@@ -1704,9 +2052,16 @@
     // higher-priority condition gates EVERY row, so surfacing it first avoids
     // the user fixing a per-row issue while a global block still hides pills.
     const t = lastTodayStats;
-    if (!t.columnFound) {
-      lines.push(`⚠ Today ROAS disabled — enable "Cost" column in this TikTok view.`);
-    } else if (t.ttDateIsToday === false) {
+    if (!pillVis.cohort && !pillVis.today && !pillVis.yesterday) {
+      lines.push(`ⓘ All pills are hidden — re-enable them in the extension popup ("Pills shown").`);
+    } else if (!t.columnFound && (pillVis.today || pillVis.yesterday)) {
+      lines.push(`⚠ Today ROAS disabled — enable the "Cost" / "Spend" column in this TikTok view.`);
+    } else if (t.ttDateIsYesterday && t.yestCaptured > 0) {
+      // Parked on Yesterday to harvest spend. The today pill IS off-date here,
+      // but saying so reads as a failure at the exact moment the yesterday
+      // capture is doing its job — report the capture instead.
+      lines.push(`ⓘ Đang ở view Yesterday — đã bắt spend hôm qua cho ${t.yestCaptured} dòng. Quay lại Today để xem ROAS realtime.`);
+    } else if (t.ttDateIsToday === false && pillVis.today) {
       const label = t.ttDateLabel || 'unknown';
       lines.push(`⚠ Today ROAS not computed — TikTok UI date range is "${label}". Switch to Today for live ROAS.`);
     } else if (t.skippedCurrencyMismatch > 0 && t.pillsRendered === 0) {
@@ -1715,6 +2070,8 @@
       lines.push(`⚠ Today ROAS unavailable — Adjust app currency (${adj}) ≠ TikTok ad-account currency (${tt}).`);
     } else if (t.skippedAbbreviated > 0 && t.pillsRendered === 0) {
       lines.push(`⚠ Today ROAS disabled — disable TikTok's number abbreviation to read cost cells.`);
+    } else if (pillVis.yesterday && t.yestNeedSpend > 0 && t.pillsYesterday === 0) {
+      lines.push(`⚠ Yesterday ROAS chưa có spend — ghé date range ${yesterdayLocalIsoDate()} một lần để extension đọc cost cell.`);
     }
     return lines.join('\n');
   }
@@ -1746,6 +2103,7 @@
     }
     currentTikTokDate = detectTikTokDateInfo();
     lastTodayStats.ttDateIsToday = currentTikTokDate.isToday;
+    lastTodayStats.ttDateIsYesterday = currentTikTokDate.isYesterday;
     lastTodayStats.ttDateLabel = currentTikTokDate.label;
     lastTodayStats.ttDateSource = currentTikTokDate.source;
 
@@ -1776,10 +2134,16 @@
     cellToPill.clear();
     for (const [cell, pill] of cellToTodayPill) pill.remove();
     cellToTodayPill.clear();
+    for (const [cell, pill] of cellToYesterdayPill) pill.remove();
+    cellToYesterdayPill.clear();
     document.querySelectorAll('.adjust-pill').forEach(p => p.remove());
     pickNameCandidates().forEach(el => {
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
+      // Omitting this one lets a recycled virtualized row stale-skip the
+      // yesterday pill into permanent absence — the same class of bug the
+      // v0.4.4 recycle regression was.
+      decoratedYesterdayKey.delete(el);
     });
   }
 
@@ -1802,6 +2166,12 @@
       todayPill.remove();
       cellToTodayPill.delete(cell);
       decoratedTodayKey.delete(cell);
+    }
+    const yestPill = cellToYesterdayPill.get(cell);
+    if (yestPill) {
+      yestPill.remove();
+      cellToYesterdayPill.delete(cell);
+      decoratedYesterdayKey.delete(cell);
     }
   }
 
@@ -1831,6 +2201,13 @@
       decoratedTodayKey.delete(cell);
       removed++;
     }
+    for (const [cell, pill] of cellToYesterdayPill) {
+      if (cell.isConnected) continue;
+      pill.remove();
+      cellToYesterdayPill.delete(cell);
+      decoratedYesterdayKey.delete(cell);
+      removed++;
+    }
     return removed;
   }
 
@@ -1845,6 +2222,7 @@
     const live = new Set();
     for (const pill of cellToPill.values()) live.add(pill);
     for (const pill of cellToTodayPill.values()) live.add(pill);
+    for (const pill of cellToYesterdayPill.values()) live.add(pill);
     let removed = 0;
     document.querySelectorAll('.adjust-pill').forEach(node => {
       if (!live.has(node)) { node.remove(); removed++; }
@@ -1866,82 +2244,80 @@
     bodyObserver.observe(document.body, { childList: true, subtree: true });
   }
 
-  // ---- Pill visibility toggle ----
-  // The pills can clutter the table when the user just wants to read TikTok's
-  // own numbers. A single floating button flips a body-level <style> that
-  // hides every `.adjust-pill` (main + all Today variants share that base
-  // class) with one !important rule — no need to fight the rAF reposition
-  // loop, which keeps repositioning underneath the hidden style harmlessly.
-  // State persists in localStorage (same store the draggable banner already
-  // uses) so the preference survives reloads.
-  const PILLS_HIDDEN_KEY = 'aox-tt-pills-hidden';
-  let pillsHidden = false;
+  // ---- Pill visibility (per type, from the popup) ----
+  // NOTE: the old in-page floating "ROAS pill: ON/OFF" button (a binary
+  // hide-all toggle backed by localStorage under 'aox-tt-pills-hidden') was
+  // removed in v0.5.0 for parity with meta-injector v0.9.0. It hid every
+  // `.adjust-pill` with one CSS !important rule, so it could not distinguish
+  // pill types — and a stale '1' left in a user's localStorage would have
+  // silently hidden pills the new checkboxes say are ON, with no popup
+  // affordance to recover. Visibility is now per-type and controlled from the
+  // popup's "Pills shown" checkboxes (chrome.storage.local.pillVisibility
+  // .tiktok), gated at decoration time in decorateCandidate. Unchecking all
+  // three is the new "hide everything".
+  //
+  // migratePillsHiddenLegacy() below removes the dead localStorage key and any
+  // <style> node an older build left behind, so upgrading users are not stuck
+  // with invisible pills.
+  let pillVis = { cohort: true, today: true, yesterday: false };
 
-  function readPillsHidden() {
-    try { return localStorage.getItem(PILLS_HIDDEN_KEY) === '1'; } catch { return false; }
+  async function loadPillVisibility() {
+    try {
+      const { pillVisibility } = await chrome.storage.local.get('pillVisibility');
+      const t = pillVisibility?.tiktok || {};
+      pillVis = {
+        cohort:    typeof t.cohort    === 'boolean' ? t.cohort    : true,
+        today:     typeof t.today     === 'boolean' ? t.today     : true,
+        yesterday: typeof t.yesterday === 'boolean' ? t.yesterday : false,
+      };
+    } catch { /* keep defaults */ }
   }
 
-  function applyPillVisibility() {
-    let style = document.getElementById('aox-pill-hide-style');
-    if (pillsHidden) {
-      if (!style) {
-        style = document.createElement('style');
-        style.id = 'aox-pill-hide-style';
-        style.textContent = '.adjust-pill{display:none !important;}';
-        (document.head || document.documentElement).appendChild(style);
+  // One-shot cleanup of the pre-v0.5.0 hide mechanism. Idempotent and cheap;
+  // runs before the first decorate so no frame ever paints under the stale
+  // blanket-hide style.
+  function migratePillsHiddenLegacy() {
+    let hadLegacy = false;
+    try {
+      if (localStorage.getItem('aox-tt-pills-hidden') !== null) {
+        localStorage.removeItem('aox-tt-pills-hidden');
+        hadLegacy = true;
       }
-    } else if (style) {
-      style.remove();
-    }
-    const btn = document.getElementById('aox-pill-toggle');
-    if (btn) {
-      btn.textContent = pillsHidden ? 'ROAS pill: OFF' : 'ROAS pill: ON';
-      btn.style.background = pillsHidden ? '#8a8f99' : '#0066ff';
-      btn.style.opacity = pillsHidden ? '0.7' : '0.92';
-      btn.title = pillsHidden
-        ? 'Adjust ROAS pills are hidden — click to show'
-        : 'Adjust ROAS pills are shown — click to hide';
-    }
-  }
-
-  function createPillToggle() {
-    if (document.getElementById('aox-pill-toggle')) return;
-    const btn = document.createElement('button');
-    btn.id = 'aox-pill-toggle';
-    btn.type = 'button';
-    Object.assign(btn.style, {
-      position: 'fixed', right: '16px', bottom: '16px', zIndex: '100000',
-      padding: '6px 11px', borderRadius: '14px', border: 'none',
-      color: '#fff', font: '600 12px/1 system-ui, -apple-system, sans-serif',
-      cursor: 'pointer', boxShadow: '0 2px 6px rgba(0,0,0,.25)',
-    });
-    btn.addEventListener('click', () => {
-      pillsHidden = !pillsHidden;
-      try { localStorage.setItem(PILLS_HIDDEN_KEY, pillsHidden ? '1' : '0'); } catch { /* ignore */ }
-      applyPillVisibility();
+    } catch { /* ignore */ }
+    const staleStyle = document.getElementById('aox-pill-hide-style');
+    if (staleStyle) { staleStyle.remove(); hadLegacy = true; }
+    const staleBtn = document.getElementById('aox-pill-toggle');
+    if (staleBtn) { staleBtn.remove(); hadLegacy = true; }
+    if (hadLegacy) {
       console.log(
-        `%c[AOX-TT]%c ROAS pills ${pillsHidden ? 'hidden' : 'shown'} (user toggle)`,
+        `%c[AOX-TT]%c migrated legacy hide-all toggle → popup per-type checkboxes`,
         'background:#0066ff;color:#fff;padding:1px 4px;border-radius:3px',
         'color:#0066ff'
       );
-    });
-    document.body.appendChild(btn);
-  }
-
-  function initPillToggle() {
-    pillsHidden = readPillsHidden();
-    createPillToggle();
-    applyPillVisibility();
+    }
   }
 
   // ---- Init ----
-  // Mount the show/hide toggle immediately (independent of data load) so the
-  // user can collapse the overlay even before Adjust data arrives.
-  initPillToggle();
+  // Drop the pre-v0.5.0 blanket-hide artifacts before anything paints.
+  migratePillsHiddenLegacy();
 
-  // Load thresholds first so the very first decoration uses user-configured
-  // colors rather than briefly painting with defaults and re-painting.
-  loadColorThresholds().then(() => loadData());
+  // Load thresholds AND pill visibility first so the very first decoration
+  // uses user-configured colors and renders exactly the enabled pill types —
+  // rather than briefly painting with defaults and re-painting.
+  Promise.all([loadColorThresholds(), loadPillVisibility()]).then(() => {
+    // Checklog: which pill types this page will actually paint. "0 pills"
+    // reports that used to mean a broken matcher can now legitimately mean
+    // three unticked checkboxes — this line settles it without a code dive.
+    console.log(
+      `%c[AOX-TT ${INJECTOR_VERSION}]%c pills enabled → ` +
+      `cohort:${pillVis.cohort ? 'on' : 'OFF'} ` +
+      `today:${pillVis.today ? 'on' : 'OFF'} ` +
+      `yesterday:${pillVis.yesterday ? 'on' : 'OFF'}`,
+      'background:#0066ff;color:#fff;padding:2px 6px;border-radius:3px;font-weight:bold',
+      'color:#0066ff'
+    );
+    loadData();
+  });
 
   // Safety net: TikTok loads its table 2-10 seconds after document_idle on
   // slow networks, and MutationObserver sometimes misses the initial paint
@@ -1987,6 +2363,23 @@
       loadData();
     } else if (changes.colorThresholds) {
       loadColorThresholds().then(() => {
+        removeAllPills();
+        decorateAllVisibleRows();
+      });
+    } else if (changes.dataSourceConfig) {
+      // Reporting offset / app tokens changed → yesterday captures were tagged
+      // under the old config's calendar day and may no longer line up with
+      // what Adjust now calls "yesterday". Drop them rather than divide a
+      // stale spend into fresh revenue.
+      ttYestSpendCache.clear();
+      removeAllPills();
+      decorateAllVisibleRows();
+    } else if (changes.pillVisibility) {
+      // Full teardown + repaint. Incremental diffing would have to reason
+      // about which of the three pill types changed AND about cells recycled
+      // by TikTok's virtualizer since the last pass — not worth it for a
+      // click-frequency event.
+      loadPillVisibility().then(() => {
         removeAllPills();
         decorateAllVisibleRows();
       });

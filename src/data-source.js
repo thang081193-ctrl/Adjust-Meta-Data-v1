@@ -252,8 +252,12 @@ export async function createDataSource() {
   if (cfg.kind === 'jm-am') {
     return new JmAmDataSource(cfg);
   }
-  // Only fetch the yesterday event-date report when the Meta Yesterday pill is
+  // Only fetch the yesterday event-date report when a Yesterday pill is
   // enabled — avoids an extra multi-level Adjust call on every sync otherwise.
-  const fetchYesterday = !!(pillVisibility?.meta?.yesterday);
+  // The cache is shared across platforms, so ANY platform asking for it is
+  // enough; gating on `meta` alone would starve the TikTok pill of data.
+  const fetchYesterday = !!(
+    pillVisibility?.meta?.yesterday || pillVisibility?.tiktok?.yesterday
+  );
   return new AdjustDirectDataSource({ ...cfg, fetchYesterday });
 }

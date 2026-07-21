@@ -228,15 +228,27 @@ function mergeThresholds(stored) {
   };
 }
 
-// ---- Meta pill visibility ----
-// Stored under chrome.storage.local.pillVisibility.meta as three booleans. The
-// content script gates each pill type on these; the Yesterday pill also drives
-// whether the background pulls the yesterday event-date report (see
-// createDataSource), so enabling it force-syncs to populate the data.
+// ---- Pill visibility (Meta + TikTok) ----
+// Stored under chrome.storage.local.pillVisibility as one object namespaced by
+// platform: { meta: {...}, tiktok: {...} }, three booleans each. Each content
+// script gates its pill types on its own namespace; the Yesterday pill ALSO
+// drives whether the background pulls the yesterday event-date report (see
+// createDataSource), so enabling it on EITHER platform force-syncs to populate
+// the data.
+//
+// Both platforms are written on every save. v0.9.1 wrote `{ meta: next }`,
+// which whole-object-replaced the key — the moment a second platform existed
+// that would silently wipe its settings on any Meta checkbox change. Reading
+// both checkbox sets from the DOM (which loadPillVisibility already seeded
+// from storage) keeps the write total and clobber-free.
+const PILL_PLATFORMS = {
+  meta:   { cohort: 'pillCohort',   today: 'pillToday',   yesterday: 'pillYesterday' },
+  tiktok: { cohort: 'ttPillCohort', today: 'ttPillToday', yesterday: 'ttPillYesterday' },
+};
 const DEFAULT_PILL_VIS = { cohort: true, today: true, yesterday: false };
 
-function readPillVis(stored) {
-  const m = stored?.meta || {};
+function readPillVis(stored, platform) {
+  const m = stored?.[platform] || {};
   return {
     cohort:    typeof m.cohort    === 'boolean' ? m.cohort    : DEFAULT_PILL_VIS.cohort,
     today:     typeof m.today     === 'boolean' ? m.today     : DEFAULT_PILL_VIS.today,
@@ -245,25 +257,39 @@ function readPillVis(stored) {
 }
 
 function loadPillVisibility(prefetched) {
-  const v = readPillVis(prefetched);
-  $('pillCohort').checked = v.cohort;
-  $('pillToday').checked = v.today;
-  $('pillYesterday').checked = v.yesterday;
+  for (const [platform, ids] of Object.entries(PILL_PLATFORMS)) {
+    const v = readPillVis(prefetched, platform);
+    $(ids.cohort).checked = v.cohort;
+    $(ids.today).checked = v.today;
+    $(ids.yesterday).checked = v.yesterday;
+  }
+}
+
+function currentPillVis() {
+  const out = {};
+  for (const [platform, ids] of Object.entries(PILL_PLATFORMS)) {
+    out[platform] = {
+      cohort: $(ids.cohort).checked,
+      today: $(ids.today).checked,
+      yesterday: $(ids.yesterday).checked,
+    };
+  }
+  return out;
 }
 
 async function savePillVisibility() {
-  const prev = readPillVis((await chrome.storage.local.get('pillVisibility')).pillVisibility);
-  const next = {
-    cohort: $('pillCohort').checked,
-    today: $('pillToday').checked,
-    yesterday: $('pillYesterday').checked,
-  };
-  await chrome.storage.local.set({ pillVisibility: { meta: next } });
+  const stored = (await chrome.storage.local.get('pillVisibility')).pillVisibility;
+  const prevYesterday = Object.keys(PILL_PLATFORMS)
+    .some(p => readPillVis(stored, p).yesterday);
+  const next = currentPillVis();
+  const nextYesterday = Object.values(next).some(v => v.yesterday);
+
+  await chrome.storage.local.set({ pillVisibility: next });
   // Yesterday OFF→ON needs the yesterday event-date report (only fetched when
-  // the toggle is on). Force a sync so the pill has data immediately. Other
-  // toggles are pure client-side gating — the content script re-decorates on
-  // the storage change without a refetch.
-  if (next.yesterday && !prev.yesterday) {
+  // at least one platform's toggle is on). Force a sync so the pill has data
+  // immediately. Other toggles are pure client-side gating — the content
+  // scripts re-decorate on the storage change without a refetch.
+  if (nextYesterday && !prevYesterday) {
     doSync(true);
   } else {
     $('status').textContent = 'Pill visibility saved.';
@@ -298,8 +324,10 @@ for (const btn of $('periods').querySelectorAll('button')) {
   btn.addEventListener('click', () => pickPeriod(btn.dataset.period));
 }
 
-for (const id of ['pillCohort', 'pillToday', 'pillYesterday']) {
-  $(id).addEventListener('change', savePillVisibility);
+for (const ids of Object.values(PILL_PLATFORMS)) {
+  for (const id of Object.values(ids)) {
+    $(id).addEventListener('change', savePillVisibility);
+  }
 }
 
 // Batch the two storage reads + the GET_CACHED IPC into a single concurrent

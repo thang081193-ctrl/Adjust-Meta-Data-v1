@@ -51,7 +51,13 @@
   .pills-row { display: flex; align-items: center; gap: 6px; margin: 5px 0; font-size: 12px; }
   .pills-row input { margin: 0; }
   .pills-row label { cursor: pointer; }
-  .pills-row .pill-tag { font: 600 10px/1 ui-monospace, monospace; padding: 1px 5px; border-radius: 3px; }
+  .pills-table { width: 100%; font-size: 12px; border-collapse: collapse; margin: 4px 0 2px; }
+  .pills-table th, .pills-table td { padding: 4px 4px; text-align: left; }
+  .pills-table th { font-weight: 600; color: #555; }
+  .pills-table th:not(:first-child), .pills-table td:not(:first-child) { text-align: center; width: 52px; }
+  .pills-table td:first-child { color: #555; }
+  .pills-table input { margin: 0; cursor: pointer; }
+  .pills-box .pill-tag { font: 600 10px/1 ui-monospace, monospace; padding: 1px 5px; border-radius: 3px; }
   .pill-tag-cohort { background: #f5f5f5; color: #424242; border: 1px solid #ddd; }
   .pill-tag-today { background: #eaf3ff; color: #0b3d8c; border: 1px solid #b8d1ff; }
   .pill-tag-yest { background: #f3ecff; color: #4a2a8c; border: 1px solid #d3c2ff; }
@@ -81,22 +87,29 @@
   <div id="groups"></div>
 
   <div class="pills-box">
-    <div class="pills-head">🏷 Meta pills shown</div>
-    <div class="pills-row">
-      <input type="checkbox" id="pillCohort" />
-      <label for="pillCohort"><span class="pill-tag pill-tag-cohort">D0 3d 7d All</span> Cohort ROAS</label>
-    </div>
-    <div class="pills-row">
-      <input type="checkbox" id="pillToday" />
-      <label for="pillToday"><span class="pill-tag pill-tag-today">Today</span> Realtime hôm nay (rev/spend)</label>
-    </div>
-    <div class="pills-row">
-      <input type="checkbox" id="pillYesterday" />
-      <label for="pillYesterday"><span class="pill-tag pill-tag-yest">Y'day</span> Realtime hôm qua (rev/spend)</label>
-    </div>
+    <div class="pills-head">🏷 Pills shown</div>
+    <table class="pills-table">
+      <tr><th></th><th>Meta</th><th>TikTok</th></tr>
+      <tr>
+        <td><span class="pill-tag pill-tag-cohort">D0 3d 7d All</span> Cohort ROAS</td>
+        <td><input type="checkbox" id="pillCohort" title="Meta: cohort ROAS pill" /></td>
+        <td><input type="checkbox" id="ttPillCohort" title="TikTok: cohort ROAS pill" /></td>
+      </tr>
+      <tr>
+        <td><span class="pill-tag pill-tag-today">Today</span> Realtime hôm nay</td>
+        <td><input type="checkbox" id="pillToday" title="Meta: today realtime pill" /></td>
+        <td><input type="checkbox" id="ttPillToday" title="TikTok: today realtime pill" /></td>
+      </tr>
+      <tr>
+        <td><span class="pill-tag pill-tag-yest">Y'day</span> Realtime hôm qua</td>
+        <td><input type="checkbox" id="pillYesterday" title="Meta: yesterday realtime pill" /></td>
+        <td><input type="checkbox" id="ttPillYesterday" title="TikTok: yesterday realtime pill" /></td>
+      </tr>
+    </table>
     <div class="pills-hint">
-      Bật cái nào hiện cái đó trên bảng Meta. Yesterday cần ghé view "Yesterday"
-      1 lần để đọc spend; bật nó sẽ tự force-sync để kéo revenue hôm qua.
+      Bật cái nào hiện cái đó trên bảng tương ứng. Yesterday cần ghé view
+      "Yesterday" 1 lần để đọc spend; bật nó (ở bất kỳ bên nào) sẽ tự
+      force-sync để kéo revenue hôm qua.
     </div>
   </div>
 
