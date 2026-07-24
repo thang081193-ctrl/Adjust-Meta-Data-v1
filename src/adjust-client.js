@@ -226,6 +226,113 @@ export async function fetchYesterdayGrossRevenue({ apiToken, utcOffset = '+07:00
   return rows;
 }
 
+// Realtime "D-2" (two days ago) revenue AND cost. Powers the optional D-2 pill.
+// Unlike the Yesterday pill — whose spend must be scraped from the ads-manager
+// UI because "yesterday" has a picker preset the user can park on — D-2 has NO
+// preset in either Meta or TikTok, so requiring a daily custom-range visit would
+// make the pill useless. Instead BOTH sides of the ratio come from Adjust, which
+// also removes the currency-mismatch and timezone-window guards the UI-spend
+// pills need.
+//
+// Two endpoints, because they carry different metrics:
+//   • Revenue: the EVENT-DATE report (same as today/yesterday). That endpoint
+//     is finicky about metrics — `cost`, `currency`, `all_revenue`,
+//     `network_revenue` all return HTTP 400 "Unsupported metric" (verified
+//     2026-05-11), so we must NOT ask it for cost.
+//   • Cost: the COHORT report (fetchCampaignROAS), which DOES expose `cost`
+//     (ad_spend_mode=network) and accepts explicit ISO ranges. D-2 spend is
+//     just network spend in that day's window — independent of cohort maturity —
+//     so the cohort endpoint's cost is the correct denominator.
+// We fetch both for the same single-day range and join per row.
+//
+// Adjust has no 'two_days_ago' keyword — we pass an explicit single-day range
+// computed on the reporting offset, matching the calendar the 'yesterday'
+// keyword uses.
+export async function fetchD2GrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
+  const iso = isoDateDaysAgoAtOffset(2, utcOffset);
+  const range = `${iso}:${iso}`;
+  // Cost (and cohort-revenue fallback) come from the proven cohort endpoint —
+  // it accepts ISO ranges and exposes both `cost` and `cohort_all_revenue`.
+  const costRowsPromise = fetchCampaignROAS({ apiToken, utcOffset, datePeriod: range, appTokens });
+  // Prefer event-date revenue (parity with today/yesterday). The event-date
+  // endpoint has only ever been exercised with 'today'/'yesterday' keywords, so
+  // if it rejects an explicit range we fall back to the cohort endpoint's
+  // cohort_all_revenue rather than leave the pill showing dashes.
+  let revRows = null;
+  try {
+    revRows = await fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod: range });
+  } catch (err) {
+    console.warn('[Adjust Overlay] D-2 event-date revenue unavailable, using cohort revenue:', err.message);
+  }
+  const costRows = await costRowsPromise;
+  return revRows
+    ? joinD2RevenueCost(revRows, costRows)
+    : costRows.map(c => ({ ...c, revenueD2: c.cohortAllRevenue, costD2: c.cost }));
+}
+
+// Join D-2 event-date revenue rows with D-2 cohort-endpoint cost rows into one
+// row set carrying both revenueD2 and costD2. Both sides come from the same
+// account + date range + dimensions, so the full identity tuple (level + every
+// id + every name) matches exactly for the same entity — no canonicalization
+// needed here. Cost-only rows (spend but zero event-date revenue) are emitted
+// with revenueD2 = 0 so the pill shows a truthful "earned nothing on spend".
+function joinD2RevenueCost(revRows, costRows) {
+  // Primary index: full identity tuple. Secondary: level + strongest id — a
+  // safety net for the occasional row where the two endpoints disagree on a
+  // name (whitespace) or one side carries a creative_id_network the other nulls.
+  const costByTuple = new Map();
+  const costById = new Map();
+  for (const c of costRows) {
+    costByTuple.set(d2TupleKey(c), c);
+    const idk = d2IdKey(c);
+    if (idk) costById.set(idk, c);
+  }
+
+  const usedCost = new Set();
+  const matchCost = (r) => {
+    let c = costByTuple.get(d2TupleKey(r));
+    if (!c) { const idk = d2IdKey(r); c = idk ? costById.get(idk) : null; }
+    return c || null;
+  };
+
+  const out = [];
+  for (const r of revRows) {
+    const c = matchCost(r);
+    if (c) usedCost.add(c);
+    out.push({ ...r, revenueD2: r.revenue, costD2: c ? c.cost : null });
+  }
+  for (const c of costRows) {
+    if (usedCost.has(c)) continue;
+    out.push({
+      level: c.level,
+      campaignName: c.campaignName,
+      adsetName: c.adsetName,
+      adName: c.adName,
+      campaignId: c.campaignId,
+      adsetId: c.adsetId,
+      adId: c.adId,
+      network: c.network,
+      currency: null,
+      revenueD2: 0,
+      costD2: c.cost,
+    });
+  }
+  return out;
+}
+
+function d2TupleKey(r) {
+  return [
+    r.level,
+    r.campaignId || '', r.adsetId || '', r.adId || '',
+    r.campaignName || '', r.adsetName || '', r.adName || '',
+  ].join('::');
+}
+
+function d2IdKey(r) {
+  const id = r.level === 'ad' ? r.adId : r.level === 'adset' ? r.adsetId : r.campaignId;
+  return id ? `${r.level}::${id}` : null;
+}
+
 async function fetchGrossRevenue({ apiToken, utcOffset = '+07:00', appTokens, datePeriod }) {
   const [campaignRows, adsetRows, adRows] = await Promise.all([
     fetchGrossRevenueAtLevel({
@@ -399,4 +506,17 @@ function isoDate(d) {
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   const day = String(d.getUTCDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+
+// Calendar date `daysAgo` days back on the given reporting offset (±HH:MM).
+// Shifting the epoch by the offset then reading UTC components yields the
+// wall-clock date in that zone — the same day arithmetic Adjust applies to its
+// own 'yesterday' keyword. Unparseable offsets fall back to +07:00 (BKT),
+// matching the default everywhere else in this client.
+function isoDateDaysAgoAtOffset(daysAgo, utcOffset) {
+  const m = String(utcOffset || '').trim().match(/^([+-])(\d{1,2}):?(\d{2})?$/);
+  const offMin = m
+    ? (m[1] === '-' ? -1 : 1) * (parseInt(m[2], 10) * 60 + (m[3] ? parseInt(m[3], 10) : 0))
+    : 420;
+  return isoDate(new Date(Date.now() + offMin * 60000 - daysAgo * 86400000));
 }

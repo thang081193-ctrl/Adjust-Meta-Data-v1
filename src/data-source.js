@@ -2,7 +2,7 @@
 // Adapter pattern. Today: pulls direct from Adjust API.
 // Later (when JM-AM exits soak): swap to JmAmDataSource without touching anything else.
 
-import { fetchCampaignROAS, fetchTodayGrossRevenue, fetchYesterdayGrossRevenue } from './adjust-client.js';
+import { fetchCampaignROAS, fetchTodayGrossRevenue, fetchYesterdayGrossRevenue, fetchD2GrossRevenue } from './adjust-client.js';
 import { canonicalKey } from './matcher.js';
 
 /**
@@ -11,15 +11,16 @@ import { canonicalKey } from './matcher.js';
  */
 
 export class AdjustDirectDataSource {
-  constructor({ apiToken, utcOffset, datePeriod, appTokens, fetchYesterday = false }) {
+  constructor({ apiToken, utcOffset, datePeriod, appTokens, fetchYesterday = false, fetchD2 = false }) {
     this.apiToken = apiToken;
     this.utcOffset = utcOffset;
     this.datePeriod = datePeriod;
     this.appTokens = appTokens;
-    // Only pull the yesterday event-date report when the Yesterday realtime
+    // Only pull the yesterday / D-2 event-date reports when the corresponding
     // pill is enabled (set from pillVisibility in createDataSource). Saves one
-    // multi-level report call per sync when the pill is off.
+    // multi-level report call per sync per disabled pill.
     this.fetchYesterday = fetchYesterday;
+    this.fetchD2 = fetchD2;
   }
 
   async fetchAll() {
@@ -47,7 +48,23 @@ export class AdjustDirectDataSource {
           })
       : Promise.resolve([]);
 
-    const [cohortRows, todayRows, yesterdayRows] = await Promise.all([
+    // Same success-tracking contract for the D-2 (two days ago) pipeline:
+    // revenueD2/costD2 stay null unless the fetch ran AND succeeded, so the
+    // pill can show a "no data" dash instead of a fabricated 0%.
+    let d2Available = false;
+    const d2Promise = this.fetchD2
+      ? fetchD2GrossRevenue({
+          apiToken: this.apiToken,
+          utcOffset: this.utcOffset,
+          appTokens: this.appTokens,
+        }).then(rows => { d2Available = true; return rows; })
+          .catch(err => {
+            console.warn('[Adjust Overlay] D-2 revenue fetch failed:', err.message);
+            return [];
+          })
+      : Promise.resolve([]);
+
+    const [cohortRows, todayRows, yesterdayRows, d2Rows] = await Promise.all([
       fetchCampaignROAS({
         apiToken: this.apiToken,
         utcOffset: this.utcOffset,
@@ -63,8 +80,9 @@ export class AdjustDirectDataSource {
         return [];
       }),
       yesterdayPromise,
+      d2Promise,
     ]);
-    return mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable);
+    return mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable, d2Rows, d2Available);
   }
 
   describe() {
@@ -88,36 +106,45 @@ export class AdjustDirectDataSource {
 // adjustCurrency (string|null). Cache-shape addition is backwards-compatible —
 // readers that don't know about the new fields behave exactly as before.
 //
-// yesterdayAvailable: true only when the yesterday fetch ran and succeeded. When
-// false, revenueYesterday is null on every row so the pill renders a "no data"
-// dash rather than a fabricated 0% ROAS.
-function mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable = false) {
+// yesterdayAvailable / d2Available: true only when that fetch ran and
+// succeeded. When false, the corresponding fields are null on every row so the
+// pill renders a "no data" dash rather than a fabricated 0% ROAS. The D-2 rows
+// additionally carry costD2 (Adjust network spend) — both sides of that pill's
+// ratio are Adjust-sourced, see fetchD2GrossRevenue.
+function mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable = false, d2Rows = [], d2Available = false) {
   const today = buildRealtimeIndex(todayRows);
   const yest = buildRealtimeIndex(yesterdayRows);
+  const d2 = buildRealtimeIndex(d2Rows);
   // 0 for a genuine no-match only when the fetch succeeded; null otherwise.
   const yestMiss = yesterdayAvailable ? 0 : null;
+  const d2Miss = d2Available ? 0 : null;
 
   const matchedToday = new Set();
   const matchedYest = new Set();
+  const matchedD2 = new Set();
   const out = [];
 
   for (const c of cohortRows) {
     const tMatch = matchRealtime(c, today);
     const yMatch = matchRealtime(c, yest);
+    const dMatch = matchRealtime(c, d2);
     if (tMatch) matchedToday.add(tMatch);
     if (yMatch) matchedYest.add(yMatch);
+    if (dMatch) matchedD2.add(dMatch);
     out.push({
       ...c,
       revenueToday: tMatch?.revenueToday ?? 0,
       revenueYesterday: yMatch?.revenueYesterday ?? yestMiss,
+      revenueD2: dMatch?.revenueD2 ?? d2Miss,
+      costD2: dMatch?.costD2 ?? d2Miss,
       todayRowExisted: !!tMatch,
-      adjustCurrency: tMatch?.currency ?? yMatch?.currency ?? null,
+      adjustCurrency: tMatch?.currency ?? yMatch?.currency ?? dMatch?.currency ?? null,
     });
   }
 
   // Realtime-only rows (no cohort counterpart): append with cohort fields
-  // nulled. Dedup today-only and yesterday-only orphans by the same key space
-  // so a row seen in both merges into one output row.
+  // nulled. Dedup today-only / yesterday-only / d2-only orphans by the same
+  // key space so a row seen in several sets merges into one output row.
   const orphanMap = new Map();
   const addOrphan = (r, which, matchedSet) => {
     if (matchedSet.has(r)) return;
@@ -139,17 +166,21 @@ function mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvaila
         roas: { d0: null, d3: null, d7: null, allTime: null },
         revenueToday: 0,
         revenueYesterday: yestMiss,
+        revenueD2: d2Miss,
+        costD2: d2Miss,
         todayRowExisted: false,
         adjustCurrency: r.currency || null,
       };
       orphanMap.set(k, o);
     }
     if (which === 'today') { o.revenueToday = r.revenueToday ?? 0; o.todayRowExisted = true; }
-    else { o.revenueYesterday = r.revenueYesterday ?? 0; }
+    else if (which === 'yesterday') { o.revenueYesterday = r.revenueYesterday ?? 0; }
+    else { o.revenueD2 = r.revenueD2 ?? 0; o.costD2 = r.costD2 ?? 0; }
     if (!o.adjustCurrency && r.currency) o.adjustCurrency = r.currency;
   };
   for (const t of todayRows) addOrphan(t, 'today', matchedToday);
   for (const y of yesterdayRows) addOrphan(y, 'yesterday', matchedYest);
+  for (const d of d2Rows) addOrphan(d, 'd2', matchedD2);
   for (const o of orphanMap.values()) out.push(o);
 
   return out;
@@ -252,12 +283,15 @@ export async function createDataSource() {
   if (cfg.kind === 'jm-am') {
     return new JmAmDataSource(cfg);
   }
-  // Only fetch the yesterday event-date report when a Yesterday pill is
-  // enabled — avoids an extra multi-level Adjust call on every sync otherwise.
-  // The cache is shared across platforms, so ANY platform asking for it is
-  // enough; gating on `meta` alone would starve the TikTok pill of data.
+  // Only fetch the yesterday / D-2 event-date reports when the corresponding
+  // pill is enabled — avoids extra multi-level Adjust calls on every sync
+  // otherwise. The cache is shared across platforms, so ANY platform asking
+  // for it is enough; gating on `meta` alone would starve the TikTok pill.
   const fetchYesterday = !!(
     pillVisibility?.meta?.yesterday || pillVisibility?.tiktok?.yesterday
   );
-  return new AdjustDirectDataSource({ ...cfg, fetchYesterday });
+  const fetchD2 = !!(
+    pillVisibility?.meta?.d2 || pillVisibility?.tiktok?.d2
+  );
+  return new AdjustDirectDataSource({ ...cfg, fetchYesterday, fetchD2 });
 }

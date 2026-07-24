@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.9.2-meta-thresh-defaults';
+  const INJECTOR_VERSION = 'v0.9.4-meta-d2-pill';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -97,9 +97,10 @@
 
   // Which pill types to render, set from the popup's "Meta pills shown"
   // checkboxes (chrome.storage.local.pillVisibility.meta). Defaults preserve the
-  // historical behavior: cohort + today on, yesterday opt-in. The yesterday flag
-  // also gates the background's yesterday-revenue fetch (see createDataSource).
-  let pillVis = { cohort: true, today: true, yesterday: false };
+  // historical behavior: cohort + today on, yesterday + d2 opt-in. The yesterday
+  // and d2 flags also gate the background's event-date fetches (see
+  // createDataSource).
+  let pillVis = { cohort: true, today: true, yesterday: false, d2: false };
 
   let bodyObserver = null;
   let decorateTimer = null;
@@ -114,6 +115,8 @@
   // Parallel WeakMap for the yesterday pill (optional third sibling). Separate
   // dedup so its churn is independent of the cohort / today pills.
   const decoratedYesterdayKey = new WeakMap();
+  // Parallel WeakMap for the D-2 pill (optional fourth sibling). Same rationale.
+  const decoratedD2Key = new WeakMap();
 
   // Row-Y bucket index, valid only inside one decorateAllVisibleRows() pass.
   // Built lazily on first ambiguous lookup, cleared at the end of the pass.
@@ -154,6 +157,8 @@
     yestCaptured: 0,
     pillsYesterday: 0,
     yestNeedSpend: 0,
+    pillsD2: 0,
+    d2NoData: 0,
     skippedNoSpendCell: 0,
     skippedZeroSpend: 0,
     skippedCurrencyMismatch: 0,
@@ -316,6 +321,7 @@
         cohort:    typeof m.cohort    === 'boolean' ? m.cohort    : true,
         today:     typeof m.today     === 'boolean' ? m.today     : true,
         yesterday: typeof m.yesterday === 'boolean' ? m.yesterday : false,
+        d2:        typeof m.d2        === 'boolean' ? m.d2        : false,
       };
     } catch { /* keep defaults */ }
   }
@@ -667,6 +673,17 @@
     // visited-guard as revenueToday so shared entry objects aren't double-counted.
     if (row.revenueYesterday != null) {
       e.revenueYesterday = (e.revenueYesterday || 0) + row.revenueYesterday;
+    }
+    // D-2 revenue AND spend, both event-date from Adjust. Same null-guard
+    // rationale as revenueYesterday: null means "D-2 fetch didn't run", so the
+    // entry keeps its field undefined and the pill shows a dash — accumulate
+    // only real numbers. Revenue and cost are gated independently in case a row
+    // has one but not the other.
+    if (row.revenueD2 != null) {
+      e.revenueD2 = (e.revenueD2 || 0) + row.revenueD2;
+    }
+    if (row.costD2 != null) {
+      e.costD2 = (e.costD2 || 0) + row.costD2;
     }
     if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
     e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
@@ -1232,6 +1249,10 @@
       n.classList.contains('adjust-pill-yest-mismatch') ||
       n.classList.contains('adjust-pill-yest-offdate');
   }
+  function isD2VariantPill(n) {
+    return n.classList.contains('adjust-pill-d2') ||
+      n.classList.contains('adjust-pill-d2-nodata');
+  }
 
   // Find the first pill for `key` matching `predicate` in nameEl's sibling
   // chain, or null. Used to locate/anchor/remove a specific pill type when the
@@ -1355,6 +1376,61 @@
     pill.dataset.aoxKey = mainKey;
     anchor.parentNode.insertBefore(pill, anchor.nextSibling);
     decoratedYesterdayKey.set(nameEl, tag);
+  }
+
+  // Render the D-2 (two days ago) realtime pill: Adjust D-2 event-date revenue ÷
+  // Adjust D-2 network spend. Unlike the today/yesterday pills, BOTH sides come
+  // from Adjust (costD2 = ad_spend_mode=network cost for that day), so there is
+  // no DOM spend capture, no "cần view" prompt, no timezone-window guard, and no
+  // cross-currency case (numerator and denominator share Adjust's currency). D-2
+  // is a fully closed day, so this ROAS is final, not directional. When the
+  // fetch hasn't populated the row (revenue or cost null) we show a no-data pill
+  // rather than fabricating a 0% — same pipeline-state-visible rule as the others.
+  function maybeRenderD2Pill(nameEl, anchor, data, mainKey) {
+    if (!data || data.ambiguous) return;
+    const rev = (data.revenueD2 == null) ? null : data.revenueD2;
+    const spend = (data.costD2 == null) ? null : data.costD2;
+    const adjCcy = data.adjustCurrency;
+    const hasRatio = rev != null && spend != null && spend > 0;
+
+    const tag = `${mainKey}|d2rev:${rev}|d2spend:${spend}|a:${adjCcy || ''}`;
+    if (decoratedD2Key.get(nameEl) === tag) return;
+
+    const stale = findRowPill(nameEl, mainKey, isD2VariantPill);
+    if (stale) stale.remove();
+
+    const pill = document.createElement('span');
+    if (rev == null && spend == null) {
+      // D-2 fetch hasn't landed for this row (or returned nothing). Show state.
+      pill.className = 'adjust-pill adjust-pill-d2-nodata';
+      pill.textContent = `D-2: –/– — chưa có dữ liệu`;
+      pill.title =
+        `D-2 (hôm kia) ROAS chưa có dữ liệu Adjust cho dòng này.\n` +
+        `Nếu vừa bật pill, bấm Force refresh trong popup để kéo report D-2.`;
+      lastTodayStats.d2NoData = (lastTodayStats.d2NoData || 0) + 1;
+    } else {
+      pill.className = 'adjust-pill adjust-pill-d2';
+      pill.appendChild(document.createTextNode(`D-2: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`));
+      if (hasRatio) {
+        const roas = rev / spend;
+        pill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
+        pill.appendChild(valSpan);
+      }
+      const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+      pill.title =
+        `D-2 realtime ROAS (event-date, two days ago — final, both sides from Adjust)\n` +
+        `Rev (Adjust D-2${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoney(rev)}\n` +
+        `Spend (Adjust D-2${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoney(spend)}` +
+        (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
+      lastTodayStats.pillsD2 = (lastTodayStats.pillsD2 || 0) + 1;
+    }
+    pill.dataset.aoxKey = mainKey;
+    anchor.parentNode.insertBefore(pill, anchor.nextSibling);
+    decoratedD2Key.set(nameEl, tag);
   }
 
   function win2Label(win) {
@@ -1605,6 +1681,18 @@
       if (y) y.remove();
       decoratedYesterdayKey.delete(el);
     }
+    // D-2 pill anchors after the yesterday pill so order is
+    // [cohort?][today?][yesterday?][d2?]. Anchor falls back through whichever
+    // earlier pills are present.
+    if (pillVis.d2) {
+      const yestPillEl = findRowPill(el, key, isYesterdayVariantPill);
+      const todayPillEl = findRowPill(el, key, isTodayVariantPill);
+      maybeRenderD2Pill(el, yestPillEl || todayPillEl || mainPill || el, data, key);
+    } else {
+      const d = findRowPill(el, key, isD2VariantPill);
+      if (d) d.remove();
+      decoratedD2Key.delete(el);
+    }
   }
 
   // Remove pills currently anchored to `el` that do NOT belong to `key`.
@@ -1636,11 +1724,12 @@
     if (removed) {
       // Force a clean rebuild on this pass — the dedup WeakMaps may still claim
       // this node is decorated for the now-removed (foreign) key. Must clear ALL
-      // three (cohort/today/yesterday) or a recycled node can stale-skip the
-      // yesterday pill and render it missing after scrolling back.
+      // four (cohort/today/yesterday/d2) or a recycled node can stale-skip a
+      // realtime pill and render it missing after scrolling back.
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
       decoratedYesterdayKey.delete(el);
+      decoratedD2Key.delete(el);
     }
   }
 
@@ -2179,6 +2268,7 @@
       pillsRenderedEstSpendDown: 0, pillsRenderedEstSpendUp: 0,
       pillsNeedYesterday: 0, yestCaptured: 0,
       pillsYesterday: 0, yestNeedSpend: 0,
+      pillsD2: 0, d2NoData: 0,
       skippedNoSpendCell: 0, skippedZeroSpend: 0,
       skippedCurrencyMismatch: 0, skippedNoAdjustData: 0,
       skippedAmbiguous: 0, skippedAbbreviated: 0,
@@ -2237,6 +2327,7 @@
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
       decoratedYesterdayKey.delete(el);
+      decoratedD2Key.delete(el);
     });
   }
 
@@ -2406,9 +2497,12 @@
     // higher-priority condition gates EVERY row, so surfacing it first avoids
     // the user fixing a per-row issue while a global block still hides pills.
     const t = lastTodayStats;
-    if (!t.columnFound) {
+    // The Amount-spent column is only needed by the Today / Yesterday pills
+    // (they read spend from the UI). The D-2 pill sources spend from Adjust, so
+    // don't nag about the column when only cohort / D-2 are enabled.
+    if (!t.columnFound && (pillVis.today || pillVis.yesterday)) {
       lines.push(`⚠ Today ROAS disabled — enable "Amount spent" column in this Meta view.`);
-    } else if (t.metaDateIsToday === false) {
+    } else if (t.metaDateIsToday === false && (pillVis.today || pillVis.yesterday)) {
       const label = t.metaDateLabel || 'unknown';
       lines.push(`⚠ Today ROAS not computed — Meta UI date filter is "${label}". Switch to Today for live ROAS.`);
     } else if (t.skippedCurrencyMismatch > 0 && t.pillsRendered === 0) {

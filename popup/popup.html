@@ -61,6 +61,7 @@
   .pill-tag-cohort { background: #f5f5f5; color: #424242; border: 1px solid #ddd; }
   .pill-tag-today { background: #eaf3ff; color: #0b3d8c; border: 1px solid #b8d1ff; }
   .pill-tag-yest { background: #f3ecff; color: #4a2a8c; border: 1px solid #d3c2ff; }
+  .pill-tag-d2 { background: #e6f7f1; color: #0b6b4f; border: 1px solid #b3e6d5; }
   .pills-hint { font-size: 10px; color: #888; margin-top: 4px; line-height: 1.4; }
 </style>
 </head>
@@ -101,15 +102,21 @@
         <td><input type="checkbox" id="ttPillToday" title="TikTok: today realtime pill" /></td>
       </tr>
       <tr>
-        <td><span class="pill-tag pill-tag-yest">Y'day</span> Realtime hôm qua</td>
+        <td><span class="pill-tag pill-tag-yest">Y'day</span> Realtime hôm qua (D-1)</td>
         <td><input type="checkbox" id="pillYesterday" title="Meta: yesterday realtime pill" /></td>
         <td><input type="checkbox" id="ttPillYesterday" title="TikTok: yesterday realtime pill" /></td>
       </tr>
+      <tr>
+        <td><span class="pill-tag pill-tag-d2">D-2</span> Hôm kia (rev+spend Adjust)</td>
+        <td><input type="checkbox" id="pillD2" title="Meta: D-2 pill (Adjust revenue ÷ Adjust spend)" /></td>
+        <td><input type="checkbox" id="ttPillD2" title="TikTok: D-2 pill (Adjust revenue ÷ Adjust spend)" /></td>
+      </tr>
     </table>
     <div class="pills-hint">
-      Bật cái nào hiện cái đó trên bảng tương ứng. Yesterday cần ghé view
-      "Yesterday" 1 lần để đọc spend; bật nó (ở bất kỳ bên nào) sẽ tự
-      force-sync để kéo revenue hôm qua.
+      Bật cái nào hiện cái đó trên bảng tương ứng. Yesterday (D-1) cần ghé view
+      "Yesterday" 1 lần để đọc spend. D-2 (hôm kia) lấy cả revenue lẫn spend từ
+      Adjust nên không cần ghé view nào. Bật D-1/D-2 (ở bất kỳ bên nào) sẽ tự
+      force-sync để kéo dữ liệu.
     </div>
   </div>
 

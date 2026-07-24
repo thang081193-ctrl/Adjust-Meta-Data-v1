@@ -50,6 +50,15 @@
 .adjust-pill-yest-offdate   { background: #f3ecff; color: #4a2a8c; border: 1px dashed #9a6ad9; }
 .adjust-pill-yest-offdate::before { content: "⚠ "; }
 
+/* D-2 pill (optional fourth sibling): Adjust D-2 event-date revenue ÷ Adjust
+   D-2 network spend — both sides Adjust-sourced, no UI capture needed. Teal
+   tint to separate it from the purple Yesterday pill. No currency-mismatch or
+   need-view states exist for this pill; only a no-data (nodata) variant when
+   the D-2 report returned nothing for the row. */
+.adjust-pill-d2        { background: #e6f7f1; color: #0b6b4f; border-color: #b3e6d5; }
+.adjust-pill-d2-nodata { background: #e6f7f1; color: #0b6b4f; border: 1px dashed #5cbfa0; }
+.adjust-pill-d2-nodata::before { content: "⚠ "; }
+
 /* Banner = small draggable badge that expands into a details panel on click.
    Default position is bottom-right; once the user drags it, the new position
    is saved to localStorage and restored across reloads. */

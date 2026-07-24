@@ -27,7 +27,11 @@ const CACHE_KEY = 'campaignDataCache';
 //     the optional Meta Yesterday realtime pill (Adjust yesterday rev ÷ Meta
 //     yesterday spend). Only populated when that pill's toggle is on; 0
 //     otherwise. Discard v5 caches so the field is present on next sync.
-const CACHE_SCHEMA_VERSION = 6;
+// v7: added per-row revenueD2 + costD2 (event-date gross + Adjust network
+//     spend for two days ago) powering the optional D-2 pill. Both sides of
+//     that pill's ratio come from Adjust — no UI spend capture. Only populated
+//     when a D-2 toggle is on; null otherwise.
+const CACHE_SCHEMA_VERSION = 7;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Async pattern: return true to keep channel open.

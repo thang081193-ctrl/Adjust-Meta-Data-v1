@@ -248,10 +248,10 @@ function mergeThresholds(stored) {
 // both checkbox sets from the DOM (which loadPillVisibility already seeded
 // from storage) keeps the write total and clobber-free.
 const PILL_PLATFORMS = {
-  meta:   { cohort: 'pillCohort',   today: 'pillToday',   yesterday: 'pillYesterday' },
-  tiktok: { cohort: 'ttPillCohort', today: 'ttPillToday', yesterday: 'ttPillYesterday' },
+  meta:   { cohort: 'pillCohort',   today: 'pillToday',   yesterday: 'pillYesterday',   d2: 'pillD2' },
+  tiktok: { cohort: 'ttPillCohort', today: 'ttPillToday', yesterday: 'ttPillYesterday', d2: 'ttPillD2' },
 };
-const DEFAULT_PILL_VIS = { cohort: true, today: true, yesterday: false };
+const DEFAULT_PILL_VIS = { cohort: true, today: true, yesterday: false, d2: false };
 
 function readPillVis(stored, platform) {
   const m = stored?.[platform] || {};
@@ -259,6 +259,7 @@ function readPillVis(stored, platform) {
     cohort:    typeof m.cohort    === 'boolean' ? m.cohort    : DEFAULT_PILL_VIS.cohort,
     today:     typeof m.today     === 'boolean' ? m.today     : DEFAULT_PILL_VIS.today,
     yesterday: typeof m.yesterday === 'boolean' ? m.yesterday : DEFAULT_PILL_VIS.yesterday,
+    d2:        typeof m.d2        === 'boolean' ? m.d2        : DEFAULT_PILL_VIS.d2,
   };
 }
 
@@ -268,6 +269,7 @@ function loadPillVisibility(prefetched) {
     $(ids.cohort).checked = v.cohort;
     $(ids.today).checked = v.today;
     $(ids.yesterday).checked = v.yesterday;
+    $(ids.d2).checked = v.d2;
   }
 }
 
@@ -278,6 +280,7 @@ function currentPillVis() {
       cohort: $(ids.cohort).checked,
       today: $(ids.today).checked,
       yesterday: $(ids.yesterday).checked,
+      d2: $(ids.d2).checked,
     };
   }
   return out;
@@ -287,15 +290,19 @@ async function savePillVisibility() {
   const stored = (await chrome.storage.local.get('pillVisibility')).pillVisibility;
   const prevYesterday = Object.keys(PILL_PLATFORMS)
     .some(p => readPillVis(stored, p).yesterday);
+  const prevD2 = Object.keys(PILL_PLATFORMS)
+    .some(p => readPillVis(stored, p).d2);
   const next = currentPillVis();
   const nextYesterday = Object.values(next).some(v => v.yesterday);
+  const nextD2 = Object.values(next).some(v => v.d2);
 
   await chrome.storage.local.set({ pillVisibility: next });
-  // Yesterday OFF→ON needs the yesterday event-date report (only fetched when
-  // at least one platform's toggle is on). Force a sync so the pill has data
-  // immediately. Other toggles are pure client-side gating — the content
-  // scripts re-decorate on the storage change without a refetch.
-  if (nextYesterday && !prevYesterday) {
+  // Yesterday / D-2 OFF→ON each needs its own event-date report (only fetched
+  // when at least one platform's toggle is on). Force a sync so the newly
+  // enabled pill has data immediately. Other toggles are pure client-side
+  // gating — the content scripts re-decorate on the storage change without a
+  // refetch.
+  if ((nextYesterday && !prevYesterday) || (nextD2 && !prevD2)) {
     doSync(true);
   } else {
     $('status').textContent = 'Pill visibility saved.';

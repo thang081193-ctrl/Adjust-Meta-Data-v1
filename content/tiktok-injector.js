@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.5.1-tt-thresh-parity';
+  const INJECTOR_VERSION = 'v0.5.2-tt-d2-pill';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -148,6 +148,8 @@
       ttDateIsYesterday: null,
       yestCaptured: 0, pillsYesterday: 0, yestNeedSpend: 0,
       skippedYestCurrencyMismatch: 0, sampleRevYesterday: null,
+      // D-2 pill counters (both sides Adjust-sourced, no scraped spend).
+      pillsD2: 0, d2NoData: 0, sampleRevD2: null,
     };
   }
   let lastTodayStats = createEmptyTodayStats();
@@ -162,6 +164,8 @@
   const YEST_PILL_CLASS_NORMAL    = 'adjust-pill adjust-pill-yesterday';
   const YEST_PILL_CLASS_OFFDATE   = 'adjust-pill adjust-pill-yest-offdate';
   const YEST_PILL_CLASS_MISMATCH  = 'adjust-pill adjust-pill-yest-mismatch';
+  const D2_PILL_CLASS_NORMAL      = 'adjust-pill adjust-pill-d2';
+  const D2_PILL_CLASS_NODATA      = 'adjust-pill adjust-pill-d2-nodata';
   // Per-pass caches populated at the start of decorateAllVisibleRows.
   let currentCostColumn = null;
   let currentTikTokDate = null;
@@ -179,6 +183,11 @@
   // independently without disturbing the other two.
   const cellToYesterdayPill = new Map();
   const decoratedYesterdayKey = new WeakMap();
+
+  // D-2 pill: a FOURTH position:fixed sibling. Both sides (revenue + spend) come
+  // from Adjust, so unlike the yesterday pill it needs no scraped-spend cache.
+  const cellToD2Pill = new Map();
+  const decoratedD2Key = new WeakMap();
 
   // TikTok exposes no spend API, so yesterday's spend can only be scraped from
   // the table while the date picker is parked on Yesterday. Harvested values
@@ -639,6 +648,16 @@
     // byName/byComposite/byAdId, so without it revenue triple-counts.
     if (row.revenueYesterday != null) {
       e.revenueYesterday = (e.revenueYesterday || 0) + row.revenueYesterday;
+    }
+    // D-2 revenue AND spend, both event-date from Adjust (see fetchD2GrossRevenue).
+    // Same null-guard + visited-guard rationale as revenueYesterday. Revenue and
+    // cost are gated independently so a row with one but not the other still
+    // accumulates what it has.
+    if (row.revenueD2 != null) {
+      e.revenueD2 = (e.revenueD2 || 0) + row.revenueD2;
+    }
+    if (row.costD2 != null) {
+      e.costD2 = (e.costD2 || 0) + row.costD2;
     }
     if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
     e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
@@ -1208,6 +1227,58 @@
     commitYesterdayPill(nameEl, anchorPill, yestPill, yestKey);
   }
 
+  // Build (or refresh) the D-2 (two days ago) pill. BOTH revenue and spend come
+  // from Adjust (costD2 = ad_spend_mode=network cost), so unlike the yesterday
+  // pill there is no scraped-spend cache, no "cần view" prompt, no date-filter
+  // dependency, and no cross-currency case. D-2 is a fully closed day, so this
+  // ROAS is final. When Adjust returned nothing for the row (rev + cost null)
+  // we show a no-data pill rather than fabricating 0% (pipeline-state-visible).
+  function maybeRenderD2Pill(nameEl, anchorPill, data, mainKey) {
+    if (!data || data.ambiguous) return;
+
+    const rev = (data.revenueD2 == null) ? null : data.revenueD2;
+    const spend = (data.costD2 == null) ? null : data.costD2;
+    const adjCcy = data.adjustCurrency;
+    if (lastTodayStats.sampleRevD2 == null && rev != null) lastTodayStats.sampleRevD2 = rev;
+    const hasRatio = rev != null && spend != null && spend > 0;
+
+    const d2Key = `${mainKey}|d2rev:${rev}|d2spend:${spend}|a:${adjCcy || ''}`;
+    if (decoratedD2Key.get(nameEl) === d2Key) return;
+
+    const d2Pill = document.createElement('span');
+    if (rev == null && spend == null) {
+      d2Pill.className = D2_PILL_CLASS_NODATA;
+      d2Pill.textContent = `D-2: –/– — chưa có dữ liệu`;
+      d2Pill.title =
+        `D-2 (hôm kia) ROAS chưa có dữ liệu Adjust cho dòng này.\n` +
+        `Nếu vừa bật pill, bấm Force refresh trong popup để kéo report D-2.`;
+      lastTodayStats.d2NoData++;
+    } else {
+      d2Pill.className = D2_PILL_CLASS_NORMAL;
+      d2Pill.appendChild(document.createTextNode(
+        `D-2: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(spend)}`
+      ));
+      if (hasRatio) {
+        const roas = rev / spend;
+        d2Pill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
+        d2Pill.appendChild(valSpan);
+      }
+      const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+      d2Pill.title =
+        `D-2 realtime ROAS (event-date, two days ago — final, both sides from Adjust)\n` +
+        `Rev (Adjust D-2${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(rev)}\n` +
+        `Spend (Adjust D-2${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(spend)}` +
+        (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
+      lastTodayStats.pillsD2++;
+    }
+
+    commitD2Pill(nameEl, anchorPill, d2Pill, d2Key);
+  }
+
   // Final commit step shared by both render branches: drop any stale pill,
   // apply position-fixed styling, position once on the current frame, attach
   // to body, register in the tracking Maps, invalidate the rAF early-exit
@@ -1251,9 +1322,29 @@
     yestPill.style.top = '0';
     document.body.appendChild(yestPill);
     yestPill._aoxWidth = yestPill.offsetWidth;
+    // Reserve the yesterday column's slot so the D-2 pill clears it (grows only).
+    if (yestPill._aoxWidth > maxYesterdayPillWidth) maxYesterdayPillWidth = yestPill._aoxWidth;
     positionYesterdayPillToCell(nameEl, anchorPill, yestPill);
     cellToYesterdayPill.set(nameEl, yestPill);
     decoratedYesterdayKey.set(nameEl, yestKey);
+    lastPositioned.delete(nameEl);
+    ensureRepositionLoop();
+  }
+
+  // Same contract, for the fourth column (D-2).
+  function commitD2Pill(nameEl, anchorPill, d2Pill, d2Key) {
+    const stale = cellToD2Pill.get(nameEl);
+    if (stale) { stale.remove(); cellToD2Pill.delete(nameEl); }
+    d2Pill.style.position = 'fixed';
+    d2Pill.style.zIndex = '99999';
+    d2Pill.style.margin = '0';
+    d2Pill.style.left = '-99999px';
+    d2Pill.style.top = '0';
+    document.body.appendChild(d2Pill);
+    d2Pill._aoxWidth = d2Pill.offsetWidth;
+    positionD2PillToCell(nameEl, anchorPill, d2Pill);
+    cellToD2Pill.set(nameEl, d2Pill);
+    decoratedD2Key.set(nameEl, d2Key);
     lastPositioned.delete(nameEl);
     ensureRepositionLoop();
   }
@@ -1347,6 +1438,45 @@
     yestPill.style.display = '';
     yestPill.style.left = Math.round(leftAnchor) + 'px';
     yestPill.style.top = Math.round(cr.top + (cr.height / 2) - 9) + 'px';
+  }
+
+  // Fifth-in-line column (D-2), same fixed-slot discipline. Chains past the
+  // main → today → yesterday slots so all four stay straight. Any earlier pill
+  // toggled off contributes a 0-width slot, so the D-2 pill slides left into the
+  // vacated gap instead of leaving a hole.
+  function positionD2PillToCell(cell, anchorPill, d2Pill) {
+    const cr = cell.getBoundingClientRect();
+    const offscreen = cr.width === 0 || cr.height === 0
+      || cr.bottom < 0 || cr.top > window.innerHeight;
+    if (offscreen) {
+      d2Pill.style.display = 'none';
+      return;
+    }
+    let leftAnchor;
+    if (mainPillAnchorX != null) {
+      const todaySlot = mainPillAnchorX + (maxMainPillWidth > 0 ? maxMainPillWidth + 6 : 0);
+      const yestSlot = maxTodayPillWidth > 0 ? todaySlot + maxTodayPillWidth + 6 : todaySlot;
+      leftAnchor = maxYesterdayPillWidth > 0 ? yestSlot + maxYesterdayPillWidth + 6 : yestSlot;
+    } else {
+      // Pre-anchor fallback: chain off whatever pill we were handed. The next
+      // rAF tick tightens placement once the table-wide anchors are computed.
+      let anchorWidth = anchorPill && anchorPill._aoxWidth || 0;
+      if (anchorWidth === 0 && anchorPill && anchorPill.isConnected) {
+        anchorWidth = anchorPill.offsetWidth;
+        if (anchorWidth > 0) anchorPill._aoxWidth = anchorWidth;
+      }
+      const cached = lastPositioned.get(cell);
+      if (cached && !cached.hidden && anchorWidth > 0) {
+        leftAnchor = cached.left + anchorWidth + 4;
+      } else {
+        const column = getColumnAncestor(cell);
+        const colRight = column ? column.getBoundingClientRect().right : cr.right;
+        leftAnchor = colRight + 330;
+      }
+    }
+    d2Pill.style.display = '';
+    d2Pill.style.left = Math.round(leftAnchor) + 'px';
+    d2Pill.style.top = Math.round(cr.top + (cr.height / 2) - 9) + 'px';
   }
 
   function logDomDiagnostics() {
@@ -1543,6 +1673,12 @@
       cellToYesterdayPill.delete(el);
       decoratedYesterdayKey.delete(el);
     }
+    const staleD2 = cellToD2Pill.get(el);
+    if (staleD2) {
+      staleD2.remove();
+      cellToD2Pill.delete(el);
+      decoratedD2Key.delete(el);
+    }
 
     let pill = null;
     if (pillVis.cohort) {
@@ -1613,6 +1749,15 @@
       if (y) { y.remove(); cellToYesterdayPill.delete(el); }
       decoratedYesterdayKey.delete(el);
     }
+
+    if (pillVis.d2) {
+      const anchor = cellToYesterdayPill.get(el) || cellToTodayPill.get(el) || mainPill;
+      maybeRenderD2Pill(el, anchor, data, key);
+    } else {
+      const d = cellToD2Pill.get(el);
+      if (d) { d.remove(); cellToD2Pill.delete(el); }
+      decoratedD2Key.delete(el);
+    }
   }
 
   // Cache the column ancestor per leaf cell. DOM structure for a row is
@@ -1633,6 +1778,9 @@
   // the yesterday column starts clear of it. Grows only, like maxMainPillWidth:
   // shrinking it mid-session would make the columns jitter as rows scroll.
   let maxTodayPillWidth = 0;
+  // Widest yesterday pill — reserves the yesterday column's slot so the D-2
+  // column starts clear of it. Same grow-only discipline.
+  let maxYesterdayPillWidth = 0;
 
   // Median (not max) of the visible name cells' column right edges: robust to
   // the occasional row where findColumnAncestor walks up to an over-wide
@@ -1731,11 +1879,13 @@
     const cells = new Set(cellToPill.keys());
     for (const cell of cellToTodayPill.keys()) cells.add(cell);
     for (const cell of cellToYesterdayPill.keys()) cells.add(cell);
+    for (const cell of cellToD2Pill.keys()) cells.add(cell);
     return cells;
   }
 
   function hasLivePills() {
-    return cellToPill.size > 0 || cellToTodayPill.size > 0 || cellToYesterdayPill.size > 0;
+    return cellToPill.size > 0 || cellToTodayPill.size > 0
+      || cellToYesterdayPill.size > 0 || cellToD2Pill.size > 0;
   }
 
   function repositionLoopTick() {
@@ -1777,6 +1927,8 @@
       if (todayPill) positionTodayPillToCell(cell, pill, todayPill);
       const yestPill = cellToYesterdayPill.get(cell);
       if (yestPill) positionYesterdayPillToCell(cell, todayPill || pill, yestPill);
+      const d2Pill = cellToD2Pill.get(cell);
+      if (d2Pill) positionD2PillToCell(cell, yestPill || todayPill || pill, d2Pill);
     }
 
     if (hasLivePills()) {
@@ -2054,7 +2206,7 @@
     // higher-priority condition gates EVERY row, so surfacing it first avoids
     // the user fixing a per-row issue while a global block still hides pills.
     const t = lastTodayStats;
-    if (!pillVis.cohort && !pillVis.today && !pillVis.yesterday) {
+    if (!pillVis.cohort && !pillVis.today && !pillVis.yesterday && !pillVis.d2) {
       lines.push(`ⓘ All pills are hidden — re-enable them in the extension popup ("Pills shown").`);
     } else if (!t.columnFound && (pillVis.today || pillVis.yesterday)) {
       lines.push(`⚠ Today ROAS disabled — enable the "Cost" / "Spend" column in this TikTok view.`);
@@ -2138,14 +2290,17 @@
     cellToTodayPill.clear();
     for (const [cell, pill] of cellToYesterdayPill) pill.remove();
     cellToYesterdayPill.clear();
+    for (const [cell, pill] of cellToD2Pill) pill.remove();
+    cellToD2Pill.clear();
     document.querySelectorAll('.adjust-pill').forEach(p => p.remove());
     pickNameCandidates().forEach(el => {
       decoratedKey.delete(el);
       decoratedTodayKey.delete(el);
-      // Omitting this one lets a recycled virtualized row stale-skip the
-      // yesterday pill into permanent absence — the same class of bug the
+      // Omitting these lets a recycled virtualized row stale-skip the
+      // yesterday/D-2 pill into permanent absence — the same class of bug the
       // v0.4.4 recycle regression was.
       decoratedYesterdayKey.delete(el);
+      decoratedD2Key.delete(el);
     });
   }
 
@@ -2174,6 +2329,12 @@
       yestPill.remove();
       cellToYesterdayPill.delete(cell);
       decoratedYesterdayKey.delete(cell);
+    }
+    const d2Pill = cellToD2Pill.get(cell);
+    if (d2Pill) {
+      d2Pill.remove();
+      cellToD2Pill.delete(cell);
+      decoratedD2Key.delete(cell);
     }
   }
 
@@ -2210,6 +2371,13 @@
       decoratedYesterdayKey.delete(cell);
       removed++;
     }
+    for (const [cell, pill] of cellToD2Pill) {
+      if (cell.isConnected) continue;
+      pill.remove();
+      cellToD2Pill.delete(cell);
+      decoratedD2Key.delete(cell);
+      removed++;
+    }
     return removed;
   }
 
@@ -2225,6 +2393,7 @@
     for (const pill of cellToPill.values()) live.add(pill);
     for (const pill of cellToTodayPill.values()) live.add(pill);
     for (const pill of cellToYesterdayPill.values()) live.add(pill);
+    for (const pill of cellToD2Pill.values()) live.add(pill);
     let removed = 0;
     document.querySelectorAll('.adjust-pill').forEach(node => {
       if (!live.has(node)) { node.remove(); removed++; }
@@ -2261,7 +2430,7 @@
   // migratePillsHiddenLegacy() below removes the dead localStorage key and any
   // <style> node an older build left behind, so upgrading users are not stuck
   // with invisible pills.
-  let pillVis = { cohort: true, today: true, yesterday: false };
+  let pillVis = { cohort: true, today: true, yesterday: false, d2: false };
 
   async function loadPillVisibility() {
     try {
@@ -2271,6 +2440,7 @@
         cohort:    typeof t.cohort    === 'boolean' ? t.cohort    : true,
         today:     typeof t.today     === 'boolean' ? t.today     : true,
         yesterday: typeof t.yesterday === 'boolean' ? t.yesterday : false,
+        d2:        typeof t.d2        === 'boolean' ? t.d2        : false,
       };
     } catch { /* keep defaults */ }
   }
@@ -2314,7 +2484,8 @@
       `%c[AOX-TT ${INJECTOR_VERSION}]%c pills enabled → ` +
       `cohort:${pillVis.cohort ? 'on' : 'OFF'} ` +
       `today:${pillVis.today ? 'on' : 'OFF'} ` +
-      `yesterday:${pillVis.yesterday ? 'on' : 'OFF'}`,
+      `yesterday:${pillVis.yesterday ? 'on' : 'OFF'} ` +
+      `d2:${pillVis.d2 ? 'on' : 'OFF'}`,
       'background:#0066ff;color:#fff;padding:2px 6px;border-radius:3px;font-weight:bold',
       'color:#0066ff'
     );
