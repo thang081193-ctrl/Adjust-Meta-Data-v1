@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.5.2-tt-d2-pill';
+  const INJECTOR_VERSION = 'v0.5.3-adjust-retry-partial-sync';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -95,6 +95,9 @@
   let campByIdIndex = new Map();
   let lastSyncAt = null;
   let sourceLabel = '';
+  // Pipeline failures the last sync survived (cache.syncWarnings, v8+). Shown
+  // in the banner so partial data is always labeled as partial.
+  let syncWarnings = [];
   // True once a real cache object has been received and indices built. The
   // first GET_CACHED at init can race a cold service worker and return null,
   // which leaves indices empty; the retry loop reloads until this flips true.
@@ -318,6 +321,7 @@
 
       lastSyncAt = cached.lastSyncAt;
       sourceLabel = cached.sourceLabel;
+      syncWarnings = Array.isArray(cached.syncWarnings) ? cached.syncWarnings : [];
       dataLoaded = true;
 
       // Post-build: attach revenueToday + adjustCurrency onto each index
@@ -328,7 +332,7 @@
 
       dispatchBridgeKnownIds();
 
-      showBanner(buildBannerText(), cached.isStale ? 'warn' : 'ok');
+      showBanner(buildBannerText(), (cached.isStale || syncWarnings.length) ? 'warn' : 'ok');
       removeAllPills();
       ensureObserving();
       decorateAllVisibleRows();
@@ -2201,6 +2205,11 @@
     const ageMin = Math.round((Date.now() - lastSyncAt) / 60000);
     const base = `Adjust [TikTok]: ${campaignIndex.size} campaigns / ${adsetIndex.size} ad sets / ${adIndex.size} ads · synced ${ageMin}m ago · ${sourceLabel}`;
     const lines = [base];
+    // Partial-sync warning first — it explains every downstream "pill missing"
+    // symptom, so it must not be buried under per-row guidance.
+    if (syncWarnings.length) {
+      lines.push(`⚠ Partial sync — ${syncWarnings.length} Adjust report(s) failed, affected pills show no data. First: ${syncWarnings[0]} · Force refresh to retry.`);
+    }
     // Today-pill banner lines (at most one). Priority: column-missing wins
     // over off-date wins over currency-mismatch wins over abbreviation. Each
     // higher-priority condition gates EVERY row, so surfacing it first avoids

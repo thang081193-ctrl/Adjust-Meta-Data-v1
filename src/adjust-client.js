@@ -24,16 +24,106 @@ const ADJUST_BASE = 'https://automate.adjust.com/reports-service/report';
 // without manual setTimeout/clear bookkeeping.
 const FETCH_TIMEOUT_MS = 60_000;
 
-function adjustFetch(url, apiToken) {
-  return fetch(url, {
-    method: 'GET',
-    credentials: 'omit',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      Accept: 'application/json',
-    },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+// ---- Concurrency gate + retry (v0.9.5) ----
+// The D-2 pill (v0.9.4) doubled a sync's parallel report calls from 6 to 12
+// (cohort ×3 + today ×3 + D-2 cohort ×3 + D-2 event-date ×3; +3 more with the
+// Yesterday pill on). Under that burst Adjust's report generator started
+// replying HTTP 500 {"error_desc":"Internal Service Error: TimeoutError"} —
+// their backend timing out building 12 concurrent limit=10000 reports, not a
+// client bug. Two layers of defense (see
+// docs/findings/adjust_500_concurrency_retry.md):
+//   1. At most MAX_CONCURRENT report requests in flight; the rest queue.
+//   2. Transient failures (429/5xx, network drop) retry with backoff.
+// Client-side 60s aborts are NOT retried: each attempt already held the
+// popup's Force-refresh spinner for the full FETCH_TIMEOUT_MS.
+const MAX_CONCURRENT = 3;
+const RETRY_ATTEMPTS = 3;          // total tries per request
+const RETRY_BASE_DELAY_MS = 1000;  // 1s, then 3s (×3 per retry) + jitter
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+let inFlight = 0;
+const slotQueue = [];
+
+async function acquireSlot() {
+  if (inFlight < MAX_CONCURRENT) { inFlight++; return; }
+  // releaseSlot hands the slot to us directly (no inFlight-- / ++ pair), so
+  // a late acquireSlot can never sneak past a queued waiter and exceed the cap.
+  await new Promise((resolve) => slotQueue.push(resolve));
+}
+
+function releaseSlot() {
+  const next = slotQueue.shift();
+  if (next) next();
+  else inFlight--;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function backoff(attempt, label, msg) {
+  const delayMs = RETRY_BASE_DELAY_MS * Math.pow(3, attempt - 1) + Math.random() * 400;
+  console.warn(
+    `[Adjust Overlay] ${label}: transient failure (attempt ${attempt}/${RETRY_ATTEMPTS}), ` +
+      `retrying in ${Math.round(delayMs)}ms — ${msg}`
+  );
+  await sleep(delayMs);
+}
+
+// One Adjust report request → parsed rows. Owns the concurrency slot, the
+// retry loop, and error formatting. `label` prefixes error messages so the
+// popup/banner shows which pipeline failed (e.g. "Adjust API" for cohort,
+// "Adjust today fetch" for event-date).
+//
+// credentials: 'omit' forbids the browser from attaching any adjust.com
+// cookies. Without this, a stale session cookie in the profile (e.g. from
+// a previous Adjust login) gets sent alongside our Bearer token, and Adjust
+// rejects the request with "It is impossible to check account ownership!"
+// because the cookie identifies user A while the token identifies user B.
+async function fetchAdjustRows(url, apiToken, label) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+    let res;
+    await acquireSlot();
+    try {
+      res = await fetch(url, {
+        method: 'GET',
+        credentials: 'omit',
+        headers: {
+          Authorization: `Bearer ${apiToken}`,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      releaseSlot();
+      if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+        throw new Error(`${label} timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
+      }
+      lastErr = new Error(`${label} network error: ${err.message}`);
+      if (attempt < RETRY_ATTEMPTS) { await backoff(attempt, label, err.message); continue; }
+      throw lastErr;
+    }
+    try {
+      if (res.ok) {
+        const json = await res.json();
+        return json?.rows || [];
+      }
+      const body = await res.text().catch(() => '');
+      lastErr = new Error(
+        `${label} failed: ${res.status} ${res.statusText}` +
+          (body ? ` — ${body.slice(0, 200)}` : '')
+      );
+    } finally {
+      // Slot released before the backoff sleep so queued requests aren't
+      // starved while this one waits out its retry delay.
+      releaseSlot();
+    }
+    if (RETRYABLE_STATUS.has(res.status) && attempt < RETRY_ATTEMPTS) {
+      await backoff(attempt, label, lastErr.message);
+      continue;
+    }
+    throw lastErr;
+  }
+  throw lastErr;
 }
 
 // Adjust channel ids per ad network. Verified from the dashboard URL's
@@ -157,33 +247,7 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
     if (cleaned) params.set('app_token__in', cleaned);
   }
 
-  const url = `${ADJUST_BASE}?${params}`;
-
-  // credentials: 'omit' forbids the browser from attaching any adjust.com
-  // cookies. Without this, a stale session cookie in the profile (e.g. from
-  // a previous Adjust login) gets sent alongside our Bearer token, and Adjust
-  // rejects the request with "It is impossible to check account ownership!"
-  // because the cookie identifies user A while the token identifies user B.
-  let res;
-  try {
-    res = await adjustFetch(url, apiToken);
-  } catch (err) {
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      throw new Error(`Adjust API timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
-    }
-    throw err;
-  }
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(
-      `Adjust API failed: ${res.status} ${res.statusText}` +
-        (body ? ` — ${body.slice(0, 200)}` : '')
-    );
-  }
-
-  const json = await res.json();
-  return json?.rows || [];
+  return fetchAdjustRows(`${ADJUST_BASE}?${params}`, apiToken, 'Adjust API');
 }
 
 // Realtime "Today" revenue, event-date attribution (NOT cohort). Used by the
@@ -251,23 +315,27 @@ export async function fetchYesterdayGrossRevenue({ apiToken, utcOffset = '+07:00
 export async function fetchD2GrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
   const iso = isoDateDaysAgoAtOffset(2, utcOffset);
   const range = `${iso}:${iso}`;
-  // Cost (and cohort-revenue fallback) come from the proven cohort endpoint —
-  // it accepts ISO ranges and exposes both `cost` and `cohort_all_revenue`.
-  const costRowsPromise = fetchCampaignROAS({ apiToken, utcOffset, datePeriod: range, appTokens });
-  // Prefer event-date revenue (parity with today/yesterday). The event-date
-  // endpoint has only ever been exercised with 'today'/'yesterday' keywords, so
-  // if it rejects an explicit range we fall back to the cohort endpoint's
-  // cohort_all_revenue rather than leave the pill showing dashes.
-  let revRows = null;
-  try {
-    revRows = await fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod: range });
-  } catch (err) {
-    console.warn('[Adjust Overlay] D-2 event-date revenue unavailable, using cohort revenue:', err.message);
+  // allSettled (not a floating promise + sequential await) so a cost-side
+  // rejection can never fire as an `unhandledrejection` in the service worker
+  // while we're still awaiting the revenue side. Cost is required — its
+  // failure rethrows. Revenue is best-effort: the event-date endpoint has only
+  // ever been exercised with 'today'/'yesterday' keywords, so if it rejects an
+  // explicit range we fall back to the cohort endpoint's cohort_all_revenue
+  // rather than leave the pill showing dashes.
+  const [costRes, revRes] = await Promise.allSettled([
+    // Cost (and cohort-revenue fallback) come from the proven cohort endpoint —
+    // it accepts ISO ranges and exposes both `cost` and `cohort_all_revenue`.
+    fetchCampaignROAS({ apiToken, utcOffset, datePeriod: range, appTokens }),
+    fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod: range }),
+  ]);
+  if (costRes.status === 'rejected') throw costRes.reason;
+  const costRows = costRes.value;
+  if (revRes.status === 'rejected') {
+    console.warn('[Adjust Overlay] D-2 event-date revenue unavailable, using cohort revenue:',
+      revRes.reason?.message);
+    return costRows.map(c => ({ ...c, revenueD2: c.cohortAllRevenue, costD2: c.cost }));
   }
-  const costRows = await costRowsPromise;
-  return revRows
-    ? joinD2RevenueCost(revRows, costRows)
-    : costRows.map(c => ({ ...c, revenueD2: c.cohortAllRevenue, costD2: c.cost }));
+  return joinD2RevenueCost(revRes.value, costRows);
 }
 
 // Join D-2 event-date revenue rows with D-2 cohort-endpoint cost rows into one
@@ -394,24 +462,7 @@ async function fetchGrossRevenueAtLevel({ apiToken, utcOffset, dimensions, appTo
     if (cleaned) params.set('app_token__in', cleaned);
   }
 
-  let res;
-  try {
-    res = await adjustFetch(`${ADJUST_BASE}?${params}`, apiToken);
-  } catch (err) {
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      throw new Error(`Adjust ${datePeriod} fetch timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
-    }
-    throw err;
-  }
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(
-      `Adjust ${datePeriod} fetch failed: ${res.status} ${res.statusText}` +
-        (body ? ` — ${body.slice(0, 200)}` : '')
-    );
-  }
-  const json = await res.json();
-  return json?.rows || [];
+  return fetchAdjustRows(`${ADJUST_BASE}?${params}`, apiToken, `Adjust ${datePeriod} fetch`);
 }
 
 function toGrossRow(row, level) {

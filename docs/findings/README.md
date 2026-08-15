@@ -12,6 +12,7 @@ To re-load these into a Claude Code session's memory on a new machine, copy the 
 - [Adjust v2 IAA metric is `ad_revenue`](adjust_iaa_metric_name.md) — `network_revenue` / `all_revenue` rejected or silently empty; `revenue` covers IAP only. Request `metrics=revenue,ad_revenue` for IAA apps.
 - [Meta URL `date` param encodes preset as comma suffix](meta_url_date_param_format.md) — `date=<range>,<preset>` when user clicks a preset chip; the range can be stale, the suffix is the truth. Required parsing logic for any date-filter detection.
 - [Today pill ≠ Adjust UI "All revenue (cohort)"](today_pill_vs_adjust_ui_metric_diff.md) — pill uses event-date `revenue+ad_revenue` to match Meta's event-date spend; Adjust UI default is cohort. Numbers won't match for established apps and that's by design.
+- [Adjust 500 TimeoutError under parallel report bursts](adjust_500_concurrency_retry.md) — 12+ concurrent report calls make Adjust's generator time out server-side (HTTP 500 service_error). Fix: ≤3 concurrent + retry/backoff on 5xx + partial-sync with labeled syncWarnings instead of all-or-nothing.
 
 ## Collaboration preferences
 

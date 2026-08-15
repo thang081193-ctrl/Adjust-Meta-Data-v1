@@ -7,7 +7,11 @@ import { canonicalKey } from './matcher.js';
 
 /**
  * Common interface every data source must implement.
- *   fetchAll(): Promise<Array<{campaignName, network, roas: {d0, d3, d7, allTime}}>>
+ *   fetchAll(): Promise<{
+ *     campaigns: Array<{campaignName, network, roas: {d0, d3, d7, allTime}}>,
+ *     warnings: string[],   // per-pipeline fetch failures survived by partial sync
+ *   }>
+ * (Legacy sources returning a bare array are still normalized by background.js.)
  */
 
 export class AdjustDirectDataSource {
@@ -24,17 +28,50 @@ export class AdjustDirectDataSource {
   }
 
   async fetchAll() {
-    // Parallel: cohort pipeline + today-revenue pipeline + optional
-    // yesterday-revenue pipeline. Each realtime fetch is allowed to fail
-    // without taking down the cohort pills — that pill simply won't render.
-    // This keeps the existing user experience intact if Adjust changes the
-    // realtime endpoint shape.
+    // Parallel: cohort pipeline + today-revenue pipeline + optional yesterday
+    // / D-2 pipelines. EVERY pipeline is allowed to fail individually — its
+    // pills simply won't render — as long as at least one succeeded. Only when
+    // every pipeline that ran failed do we throw (a partial sync with visible
+    // warnings beats a 19-hour-old cache; total failure must still surface as
+    // an error, never as an empty-but-"fresh" cache). Each failure is recorded
+    // in `warnings`, which background.js persists as cache.syncWarnings and
+    // the popup + injector banners display — per the "never fail silently"
+    // rule, partial data is always labeled as partial.
     //
     // yesterdayAvailable tracks whether the yesterday fetch actually SUCCEEDED
     // (toggle on AND no error). When it didn't, mergeRealtimeInto leaves
     // revenueYesterday null (not 0) so the pill shows a "no data" dash instead
     // of a fabricated red 0% — distinguishing a failed/absent fetch from a
-    // genuine zero-revenue day.
+    // genuine zero-revenue day. Same contract for cohort / today / D-2.
+    const warnings = [];
+
+    let cohortAvailable = false;
+    let cohortError = null;
+    const cohortPromise = fetchCampaignROAS({
+      apiToken: this.apiToken,
+      utcOffset: this.utcOffset,
+      datePeriod: this.datePeriod,
+      appTokens: this.appTokens,
+    }).then(rows => { cohortAvailable = true; return rows; })
+      .catch(err => {
+        console.warn('[Adjust Overlay] cohort ROAS fetch failed:', err.message);
+        cohortError = err;
+        warnings.push(`Cohort ROAS: ${err.message}`);
+        return [];
+      });
+
+    let todayAvailable = false;
+    const todayPromise = fetchTodayGrossRevenue({
+      apiToken: this.apiToken,
+      utcOffset: this.utcOffset,
+      appTokens: this.appTokens,
+    }).then(rows => { todayAvailable = true; return rows; })
+      .catch(err => {
+        console.warn('[Adjust Overlay] today-revenue fetch failed:', err.message);
+        warnings.push(`Today revenue: ${err.message}`);
+        return [];
+      });
+
     let yesterdayAvailable = false;
     const yesterdayPromise = this.fetchYesterday
       ? fetchYesterdayGrossRevenue({
@@ -44,13 +81,11 @@ export class AdjustDirectDataSource {
         }).then(rows => { yesterdayAvailable = true; return rows; })
           .catch(err => {
             console.warn('[Adjust Overlay] yesterday-revenue fetch failed:', err.message);
+            warnings.push(`Yesterday revenue: ${err.message}`);
             return [];
           })
       : Promise.resolve([]);
 
-    // Same success-tracking contract for the D-2 (two days ago) pipeline:
-    // revenueD2/costD2 stay null unless the fetch ran AND succeeded, so the
-    // pill can show a "no data" dash instead of a fabricated 0%.
     let d2Available = false;
     const d2Promise = this.fetchD2
       ? fetchD2GrossRevenue({
@@ -60,29 +95,27 @@ export class AdjustDirectDataSource {
         }).then(rows => { d2Available = true; return rows; })
           .catch(err => {
             console.warn('[Adjust Overlay] D-2 revenue fetch failed:', err.message);
+            warnings.push(`D-2 revenue: ${err.message}`);
             return [];
           })
       : Promise.resolve([]);
 
     const [cohortRows, todayRows, yesterdayRows, d2Rows] = await Promise.all([
-      fetchCampaignROAS({
-        apiToken: this.apiToken,
-        utcOffset: this.utcOffset,
-        datePeriod: this.datePeriod,
-        appTokens: this.appTokens,
-      }),
-      fetchTodayGrossRevenue({
-        apiToken: this.apiToken,
-        utcOffset: this.utcOffset,
-        appTokens: this.appTokens,
-      }).catch(err => {
-        console.warn('[Adjust Overlay] today-revenue fetch failed:', err.message);
-        return [];
-      }),
-      yesterdayPromise,
-      d2Promise,
+      cohortPromise, todayPromise, yesterdayPromise, d2Promise,
     ]);
-    return mergeRealtimeInto(cohortRows, todayRows, yesterdayRows, yesterdayAvailable, d2Rows, d2Available);
+
+    // Nothing succeeded → this is a failed sync, not a partial one. Prefer the
+    // cohort error (primary pipeline, most descriptive for the popup).
+    if (!cohortAvailable && !todayAvailable && !yesterdayAvailable && !d2Available) {
+      throw cohortError || new Error(warnings[0] || 'All Adjust fetches failed');
+    }
+
+    return {
+      campaigns: mergeRealtimeInto(
+        cohortRows, todayRows, yesterdayRows, yesterdayAvailable, d2Rows, d2Available
+      ),
+      warnings,
+    };
   }
 
   describe() {

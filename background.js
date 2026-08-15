@@ -4,7 +4,10 @@
 // Cache policy (per Pham's accuracy requirement):
 // - TTL_MS = 5 minutes during active session.
 // - Force refresh from popup ALWAYS bypasses cache.
-// - On fetch error, we throw - never serve stale silently.
+// - On TOTAL fetch failure, we throw - never serve stale silently. A PARTIAL
+//   failure (some Adjust pipelines 500'd, at least one succeeded) caches what
+//   succeeded plus syncWarnings[], which popup + injector banners display —
+//   partial data is always labeled, never silent.
 // - lastSyncAt timestamp is persisted and surfaced to UI.
 
 import { createDataSource } from './src/data-source.js';
@@ -31,7 +34,11 @@ const CACHE_KEY = 'campaignDataCache';
 //     spend for two days ago) powering the optional D-2 pill. Both sides of
 //     that pill's ratio come from Adjust — no UI spend capture. Only populated
 //     when a D-2 toggle is on; null otherwise.
-const CACHE_SCHEMA_VERSION = 7;
+// v8: added top-level syncWarnings[] (pipeline failures survived by partial
+//     sync — v0.9.5's answer to Adjust 500 TimeoutError under 12 parallel
+//     report calls). Row shape unchanged; bump is bookkeeping so a live cache
+//     unambiguously identifies the build that wrote it.
+const CACHE_SCHEMA_VERSION = 8;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Async pattern: return true to keep channel open.
@@ -68,10 +75,19 @@ async function syncIfStale() {
 async function forceSync() {
   const source = await createDataSource();
   // Let exceptions propagate - caller will see error, no stale fallback.
-  const campaigns = await source.fetchAll();
+  // AdjustDirectDataSource returns { campaigns, warnings }; the JM-AM stub
+  // (or any legacy source) may return a bare array — normalize both shapes.
+  const result = await source.fetchAll();
+  const campaigns = Array.isArray(result) ? result : result.campaigns;
+  const syncWarnings =
+    !Array.isArray(result) && Array.isArray(result.warnings) ? result.warnings : [];
+  if (syncWarnings.length) {
+    console.warn('[Adjust Overlay] partial sync —', syncWarnings.length, 'pipeline(s) failed:', syncWarnings);
+  }
   const stored = {
     schemaVersion: CACHE_SCHEMA_VERSION,
     campaigns,
+    syncWarnings,
     lastSyncAt: Date.now(),
     sourceLabel: source.describe(),
   };

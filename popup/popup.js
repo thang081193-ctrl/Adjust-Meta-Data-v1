@@ -7,8 +7,10 @@ async function refreshStatus() {
   const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
   if (!cached) {
     $('status').textContent = 'No data yet. Configure tokens below and Sync.';
+    $('warnings').style.display = 'none';
     return;
   }
+  renderSyncWarnings(cached.syncWarnings);
   const ageMin = Math.round(cached.ageMs / 60000);
   // Cached array now mixes 'campaign'- and 'ad'-level rows. Show counts of
   // each. Decision groups classify ad-level rows since ads are the unit the
@@ -17,6 +19,23 @@ async function refreshStatus() {
   const adRows = cached.campaigns.filter(r => r.level === 'ad');
   $('status').textContent = `${campaignRows.length} campaigns · ${adRows.length} ads · synced ${ageMin}m ago${cached.isStale ? ' · STALE' : ''}`;
   renderGroups(adRows.length ? adRows : campaignRows);
+}
+
+// Partial-sync banner. background.js caches whatever pipelines succeeded and
+// records the failed ones in syncWarnings — per the "never fail silently"
+// rule, partial data must always be labeled as partial.
+function renderSyncWarnings(warnings) {
+  const el = $('warnings');
+  const list = Array.isArray(warnings) ? warnings : [];
+  if (!list.length) {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'block';
+  el.textContent =
+    '⚠ Partial sync — some Adjust reports failed (pills for them show dashes):\n' +
+    list.map((w) => `• ${w}`).join('\n') +
+    '\nRetry with Force refresh.';
 }
 
 function renderGroups(campaigns) {

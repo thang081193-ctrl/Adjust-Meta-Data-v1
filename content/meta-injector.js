@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.9.4-meta-d2-pill';
+  const INJECTOR_VERSION = 'v0.9.5-adjust-retry-partial-sync';
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -90,6 +90,9 @@
   let adsetByIdIndex = new Map();
   let lastSyncAt = null;
   let sourceLabel = '';
+  // Pipeline failures the last sync survived (cache.syncWarnings, v8+). Shown
+  // in the banner so partial data is always labeled as partial.
+  let syncWarnings = [];
 
   // Color thresholds — overridable per-platform from popup Settings. Defaults
   // mirror what the popup writes when the user hasn't customized yet.
@@ -367,6 +370,7 @@
       adByIdIndex = adBuilt.byAdId;
       lastSyncAt = cached.lastSyncAt;
       sourceLabel = cached.sourceLabel;
+      syncWarnings = Array.isArray(cached.syncWarnings) ? cached.syncWarnings : [];
 
       // Post-build: attach revenueToday + adjustCurrency onto each index entry
       // by summing the per-row `revenueToday` field that data-source.js merged
@@ -379,7 +383,7 @@
       // which digit strings to look for on subsequent row scans.
       dispatchBridgeKnownIds();
 
-      showBanner(buildBannerText(), cached.isStale ? 'warn' : 'ok');
+      showBanner(buildBannerText(), (cached.isStale || syncWarnings.length) ? 'warn' : 'ok');
       // Clear before redecorating — otherwise after a sync, existing pills
       // would short-circuit the dedup check and keep showing stale ROAS.
       removeAllPills();
@@ -2487,6 +2491,11 @@
     const ageMin = Math.round((Date.now() - lastSyncAt) / 60000);
     const base = `Adjust data: ${campaignIndex.size} campaigns / ${adsetIndex.size} ad sets / ${adIndex.size} ads · synced ${ageMin}m ago · ${sourceLabel}`;
     const lines = [base];
+    // Partial-sync warning first — it explains every downstream "pill missing"
+    // symptom, so it must not be buried under per-row guidance.
+    if (syncWarnings.length) {
+      lines.push(`⚠ Partial sync — ${syncWarnings.length} Adjust report(s) failed, affected pills show no data. First: ${syncWarnings[0]} · Force refresh to retry.`);
+    }
     const s = lastDecorateStats;
     if (s.stillAmbiguous > 0) {
       // Tell the user exactly what to enable so the per-row pill becomes accurate.
