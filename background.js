@@ -38,7 +38,21 @@ const CACHE_KEY = 'campaignDataCache';
 //     sync — v0.9.5's answer to Adjust 500 TimeoutError under 12 parallel
 //     report calls). Row shape unchanged; bump is bookkeeping so a live cache
 //     unambiguously identifies the build that wrote it.
-const CACHE_SCHEMA_VERSION = 8;
+// v9: multi-Adjust-account. Rows carry accountId + accountLabel (which Adjust
+//     account they came from), and the cache gains top-level accountsStatus[]
+//     (per-account ok / row count / error) plus activeAccountId so the popup
+//     and both injectors can say WHICH Adjust is on screen. Discard v8 caches:
+//     their rows have no account tag, so a v9 reader could not tell a
+//     single-account cache from a merged one.
+// v10: Google Ads channel added to the fetch (partner_7) and EVERY injector now
+//     filters rows by channel before indexing (Meta previously indexed all
+//     rows). Row shape unchanged; discard v9 caches so the first post-upgrade
+//     paint already includes Google rows instead of waiting out the TTL.
+// v11: rows gain costYesterday (Adjust network spend for D-1). The Yesterday
+//     pill's denominator now comes from Adjust like D-2's; the scraped-UI
+//     spend survives only as an injector-side fallback. Discard v10 caches so
+//     the field exists after the first post-upgrade sync.
+const CACHE_SCHEMA_VERSION = 11;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // Async pattern: return true to keep channel open.
@@ -81,6 +95,11 @@ async function forceSync() {
   const campaigns = Array.isArray(result) ? result : result.campaigns;
   const syncWarnings =
     !Array.isArray(result) && Array.isArray(result.warnings) ? result.warnings : [];
+  // Per-account outcome (v9). Persisted so the popup can render a row per
+  // Adjust account — "Adjust cũ ✓ 812 rows / Adjust mới ✗ 500" — instead of a
+  // single opaque count that hides one account being completely down.
+  const accountsStatus =
+    !Array.isArray(result) && Array.isArray(result.accountsStatus) ? result.accountsStatus : [];
   if (syncWarnings.length) {
     console.warn('[Adjust Overlay] partial sync —', syncWarnings.length, 'pipeline(s) failed:', syncWarnings);
   }
@@ -88,6 +107,7 @@ async function forceSync() {
     schemaVersion: CACHE_SCHEMA_VERSION,
     campaigns,
     syncWarnings,
+    accountsStatus,
     lastSyncAt: Date.now(),
     sourceLabel: source.describe(),
   };

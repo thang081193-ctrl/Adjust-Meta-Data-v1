@@ -32,7 +32,12 @@ const FETCH_TIMEOUT_MS = 60_000;
 // their backend timing out building 12 concurrent limit=10000 reports, not a
 // client bug. Two layers of defense (see
 // docs/findings/adjust_500_concurrency_retry.md):
-//   1. At most MAX_CONCURRENT report requests in flight; the rest queue.
+//   1. At most MAX_CONCURRENT report requests in flight PER ADJUST ACCOUNT
+//      (API token); the rest queue. The overload this cap guards against is
+//      per-account — it is that account's report generator that chokes — so
+//      with multi-account (v0.10) the gate is keyed by token. A single global
+//      gate made "Cả 2 (gộp)" queue both accounts through 3 shared slots,
+//      roughly doubling sync wall-clock while protecting nothing.
 //   2. Transient failures (429/5xx, network drop) retry with backoff.
 // Client-side 60s aborts are NOT retried: each attempt already held the
 // popup's Force-refresh spinner for the full FETCH_TIMEOUT_MS.
@@ -41,20 +46,30 @@ const RETRY_ATTEMPTS = 3;          // total tries per request
 const RETRY_BASE_DELAY_MS = 1000;  // 1s, then 3s (×3 per retry) + jitter
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
-let inFlight = 0;
-const slotQueue = [];
+// token → { inFlight, queue }. One entry per distinct API token seen this
+// service-worker lifetime (2-3 in practice), never pruned — the gate must
+// outlive individual syncs.
+const gates = new Map();
 
-async function acquireSlot() {
-  if (inFlight < MAX_CONCURRENT) { inFlight++; return; }
-  // releaseSlot hands the slot to us directly (no inFlight-- / ++ pair), so
-  // a late acquireSlot can never sneak past a queued waiter and exceed the cap.
-  await new Promise((resolve) => slotQueue.push(resolve));
+function gateFor(token) {
+  let g = gates.get(token);
+  if (!g) { g = { inFlight: 0, queue: [] }; gates.set(token, g); }
+  return g;
 }
 
-function releaseSlot() {
-  const next = slotQueue.shift();
+async function acquireSlot(token) {
+  const g = gateFor(token);
+  if (g.inFlight < MAX_CONCURRENT) { g.inFlight++; return; }
+  // releaseSlot hands the slot to us directly (no inFlight-- / ++ pair), so
+  // a late acquireSlot can never sneak past a queued waiter and exceed the cap.
+  await new Promise((resolve) => g.queue.push(resolve));
+}
+
+function releaseSlot(token) {
+  const g = gateFor(token);
+  const next = g.queue.shift();
   if (next) next();
-  else inFlight--;
+  else g.inFlight--;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -82,7 +97,7 @@ async function fetchAdjustRows(url, apiToken, label) {
   let lastErr = null;
   for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
     let res;
-    await acquireSlot();
+    await acquireSlot(apiToken);
     try {
       res = await fetch(url, {
         method: 'GET',
@@ -94,7 +109,7 @@ async function fetchAdjustRows(url, apiToken, label) {
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
     } catch (err) {
-      releaseSlot();
+      releaseSlot(apiToken);
       if (err.name === 'TimeoutError' || err.name === 'AbortError') {
         throw new Error(`${label} timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
       }
@@ -108,14 +123,27 @@ async function fetchAdjustRows(url, apiToken, label) {
         return json?.rows || [];
       }
       const body = await res.text().catch(() => '');
-      lastErr = new Error(
+      let msg =
         `${label} failed: ${res.status} ${res.statusText}` +
-          (body ? ` — ${body.slice(0, 200)}` : '')
-      );
+        (body ? ` — ${body.slice(0, 200)}` : '');
+      // "It is impossible to check account ownership!" is Adjust's identity-
+      // mismatch error. Cookies are already omitted (credentials: 'omit'
+      // above), so with multi-account configs the remaining cause is a card
+      // pairing an API token with app_token__in values minted by a DIFFERENT
+      // account — the token cannot prove ownership of those apps. Decode it
+      // here, in the popup's language, because the raw JSON body gives the
+      // user nothing to act on.
+      if (res.status === 401 && /account ownership/i.test(body)) {
+        msg +=
+          '\n→ Token và App tokens không cùng một Adjust account. Mỗi card trong ' +
+          'popup phải dùng app tokens CỦA CHÍNH account đó — app token của account ' +
+          'kia sẽ bị Adjust từ chối đúng kiểu này.';
+      }
+      lastErr = new Error(msg);
     } finally {
       // Slot released before the backoff sleep so queued requests aren't
       // starved while this one waits out its retry delay.
-      releaseSlot();
+      releaseSlot(apiToken);
     }
     if (RETRYABLE_STATUS.has(res.status) && attempt < RETRY_ATTEMPTS) {
       await backoff(attempt, label, lastErr.message);
@@ -141,6 +169,13 @@ const NETWORK_CHANNEL_IDS = [
                    // URL 2026-05-08 — sent without 'partner_' prefix, contains
                    // newer trackers `1z*`/`20*+` that hold install/revenue
                    // data for the post-cutoff TikTok integration).
+  'partner_254',   // Google Ads. VERIFIED 2026-09-01 via the reports-service
+                   // filters_data endpoint (channel-probe step C): the account
+                   // maps {"id":"partner_254","name":"Google Ads"}. The first
+                   // guess (partner_7, Adjust's classic AdWords id) returned
+                   // zero rows for this account — if Google rows ever go
+                   // missing again, re-run channel-probe before suspecting
+                   // client code.
 ];
 
 /**
@@ -203,7 +238,28 @@ export async function fetchCampaignROAS({
   return out;
 }
 
-async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTokens }) {
+// Metric sets for the cohort/report endpoint.
+//
+// COHORT_METRICS is what the main ROAS pipeline needs. The roas_dN columns are
+// COHORT metrics: Adjust has to walk each install cohort forward N days to
+// build them, which is what makes those reports slow (30s+ over 11 app tokens).
+//
+// SPEND_METRICS is the D-2 pill's denominator and nothing else. Before v0.10 the
+// D-2 pipeline reused the full cohort request just to read `cost` out of it,
+// paying for three roas_dN cohort walks per level it then threw away — that made
+// D-2 the heaviest of the four pipelines and the first to hit Adjust's
+// server-side report timeout (HTTP 500 / client 60s abort), which took the whole
+// D-2 pill down with it. `cost` and `installs` are base (non-cohort) metrics, so
+// this report builds in a fraction of the time.
+// See docs/findings/adjust_d2_pipeline.md.
+const COHORT_METRICS = 'cost,roas_d0,roas_d3,roas_d7,cohort_all_revenue,installs';
+const SPEND_METRICS = 'cost,installs';
+
+async function fetchAtLevel({
+  apiToken, utcOffset, datePeriod, dimensions, appTokens,
+  metrics = COHORT_METRICS,
+  label = 'Adjust API',
+}) {
   const params = new URLSearchParams({
     format_dates: 'false',
     full_data: 'true',
@@ -226,7 +282,7 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
     limit: '10000',
     // roas_d3 may or may not be supported by the account; if missing it parses
     // to null and the decision engine treats it as incomplete data.
-    metrics: 'cost,roas_d0,roas_d3,roas_d7,cohort_all_revenue,installs',
+    metrics,
     reattributed: 'all',
     sandbox: 'false',
     sdk_signature_enforcement_status: 'all',
@@ -247,7 +303,7 @@ async function fetchAtLevel({ apiToken, utcOffset, datePeriod, dimensions, appTo
     if (cleaned) params.set('app_token__in', cleaned);
   }
 
-  return fetchAdjustRows(`${ADJUST_BASE}?${params}`, apiToken, 'Adjust API');
+  return fetchAdjustRows(`${ADJUST_BASE}?${params}`, apiToken, label);
 }
 
 // Realtime "Today" revenue, event-date attribution (NOT cohort). Used by the
@@ -271,95 +327,162 @@ export async function fetchTodayGrossRevenue({ apiToken, utcOffset = '+07:00', a
   return rows;
 }
 
-// Realtime "Yesterday" revenue, event-date attribution (NOT cohort). Powers the
-// optional Yesterday realtime pill (Adjust yesterday gross rev ÷ Meta yesterday
-// spend read from the DOM). This uses the SAME event-date endpoint as the today
-// fetch — the key property is that event-date revenue is available in near-real
-// time and is NOT gated by Adjust's once-a-day cohort finalization (the post-9am
-// pull). So the user gets a directional yesterday ROAS well before cohort
-// roas_d0 for yesterday's installs matures.
+// Realtime "Yesterday" (D-1) revenue AND spend, both from Adjust. Same engine
+// as the D-2 fetch below (fetchDayRevenueAndSpend).
 //
-// NOTE: a previous fetchYesterdayGrossRevenue was removed in v0.8.1 because the
-// LA-timezone today-pill switched to a BKT-anchored model that no longer needed
-// yesterday REVENUE (only yesterday SPEND). This re-introduction serves a
-// different purpose (the Yesterday pill), so callers gate it behind that pill's
-// toggle to avoid paying the extra report call when the pill is off.
+// HISTORY: until v0.12 this returned event-date REVENUE only, and the pill
+// divided it by spend scraped from the ads-manager UI while the user parked
+// the date picker on "Yesterday" (the "cần view Yesterday" prompt). The D-2
+// pill then proved Adjust's ad_spend_mode=network `cost` is a sound
+// denominator for a CLOSED day — and yesterday is just as closed as D-2 — so
+// the scrape became pure friction: on Google Ads there isn't even a guaranteed
+// Cost column to scrape. Both sides now come from Adjust; the injectors keep
+// the UI-capture path only as a fallback for rows whose Adjust spend half
+// failed.
+//
+// @returns {Promise<{rows, warnings, revOk, costOk}>} — rows carry
+//   revenueYesterday + costYesterday; a null half follows the D-2 contract
+//   (null = "no answer", never a fabricated 0).
 export async function fetchYesterdayGrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
-  const rows = await fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod: 'yesterday' });
-  for (const r of rows) { r.revenueYesterday = r.revenue; }
-  return rows;
+  const res = await fetchDayRevenueAndSpend({
+    apiToken, utcOffset, appTokens, datePeriod: 'yesterday', dayLabel: 'Yesterday',
+  });
+  for (const r of res.rows) {
+    r.revenueYesterday = r.dayRevenue;
+    r.costYesterday = r.dayCost;
+  }
+  return res;
 }
 
-// Realtime "D-2" (two days ago) revenue AND cost. Powers the optional D-2 pill.
-// Unlike the Yesterday pill — whose spend must be scraped from the ads-manager
-// UI because "yesterday" has a picker preset the user can park on — D-2 has NO
-// preset in either Meta or TikTok, so requiring a daily custom-range visit would
-// make the pill useless. Instead BOTH sides of the ratio come from Adjust, which
-// also removes the currency-mismatch and timezone-window guards the UI-spend
-// pills need.
-//
-// Two endpoints, because they carry different metrics:
-//   • Revenue: the EVENT-DATE report (same as today/yesterday). That endpoint
-//     is finicky about metrics — `cost`, `currency`, `all_revenue`,
-//     `network_revenue` all return HTTP 400 "Unsupported metric" (verified
-//     2026-05-11), so we must NOT ask it for cost.
-//   • Cost: the COHORT report (fetchCampaignROAS), which DOES expose `cost`
-//     (ad_spend_mode=network) and accepts explicit ISO ranges. D-2 spend is
-//     just network spend in that day's window — independent of cohort maturity —
-//     so the cohort endpoint's cost is the correct denominator.
-// We fetch both for the same single-day range and join per row.
+// Realtime "D-2" (two days ago) revenue AND spend. Powers the optional D-2
+// pill. Both sides of the ratio come from Adjust, which removes the
+// currency-mismatch and timezone-window guards the UI-spend pills need.
 //
 // Adjust has no 'two_days_ago' keyword — we pass an explicit single-day range
 // computed on the reporting offset, matching the calendar the 'yesterday'
 // keyword uses.
+//
+// @returns {Promise<{rows, warnings, date, revOk, costOk}>}
 export async function fetchD2GrossRevenue({ apiToken, utcOffset = '+07:00', appTokens }) {
   const iso = isoDateDaysAgoAtOffset(2, utcOffset);
-  const range = `${iso}:${iso}`;
-  // allSettled (not a floating promise + sequential await) so a cost-side
-  // rejection can never fire as an `unhandledrejection` in the service worker
-  // while we're still awaiting the revenue side. Cost is required — its
-  // failure rethrows. Revenue is best-effort: the event-date endpoint has only
-  // ever been exercised with 'today'/'yesterday' keywords, so if it rejects an
-  // explicit range we fall back to the cohort endpoint's cohort_all_revenue
-  // rather than leave the pill showing dashes.
-  const [costRes, revRes] = await Promise.allSettled([
-    // Cost (and cohort-revenue fallback) come from the proven cohort endpoint —
-    // it accepts ISO ranges and exposes both `cost` and `cohort_all_revenue`.
-    fetchCampaignROAS({ apiToken, utcOffset, datePeriod: range, appTokens }),
-    fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod: range }),
-  ]);
-  if (costRes.status === 'rejected') throw costRes.reason;
-  const costRows = costRes.value;
-  if (revRes.status === 'rejected') {
-    console.warn('[Adjust Overlay] D-2 event-date revenue unavailable, using cohort revenue:',
-      revRes.reason?.message);
-    return costRows.map(c => ({ ...c, revenueD2: c.cohortAllRevenue, costD2: c.cost }));
+  const res = await fetchDayRevenueAndSpend({
+    apiToken, utcOffset, appTokens, datePeriod: `${iso}:${iso}`, dayLabel: `D-2 (${iso})`,
+  });
+  for (const r of res.rows) {
+    r.revenueD2 = r.dayRevenue;
+    r.costD2 = r.dayCost;
   }
-  return joinD2RevenueCost(revRes.value, costRows);
+  return { ...res, date: iso };
 }
 
-// Join D-2 event-date revenue rows with D-2 cohort-endpoint cost rows into one
-// row set carrying both revenueD2 and costD2. Both sides come from the same
-// account + date range + dimensions, so the full identity tuple (level + every
-// id + every name) matches exactly for the same entity — no canonicalization
-// needed here. Cost-only rows (spend but zero event-date revenue) are emitted
-// with revenueD2 = 0 so the pill shows a truthful "earned nothing on spend".
-function joinD2RevenueCost(revRows, costRows) {
+// Shared engine for the closed-day pills (Yesterday, D-2): event-date revenue
+// + network spend for one date_period, fetched in parallel and joined per row.
+//
+// Two endpoints, because they carry different metrics:
+//   • Revenue: the EVENT-DATE report (same as the today fetch). That endpoint
+//     is finicky about metrics — `cost`, `currency`, `all_revenue`,
+//     `network_revenue` all return HTTP 400 "Unsupported metric" (verified
+//     2026-05-11), so we must NOT ask it for cost.
+//   • Spend: the cohort/report endpoint asked for SPEND_METRICS only. `cost`
+//     (ad_spend_mode=network) is a base metric there and accepts both the
+//     'yesterday' keyword and explicit ISO ranges. Spend in a closed day's
+//     window is independent of cohort maturity — the correct denominator.
+//
+// FAILURE POLICY (v0.10, formerly D-2-only — see
+// docs/findings/adjust_d2_pipeline.md): both sides are INDEPENDENTLY
+// best-effort. A half-failure still returns rows — one side populated, the
+// other null — plus a warning naming the failed side. Only when BOTH sides
+// fail does this throw. allSettled (not a floating promise + sequential
+// await) so a spend-side rejection can never fire as an `unhandledrejection`
+// in the service worker while we're still awaiting the revenue side.
+async function fetchDayRevenueAndSpend({ apiToken, utcOffset, appTokens, datePeriod, dayLabel }) {
+  const [costRes, revRes] = await Promise.allSettled([
+    fetchDaySpend({ apiToken, utcOffset, appTokens, datePeriod, dayLabel }),
+    fetchGrossRevenue({ apiToken, utcOffset, appTokens, datePeriod }),
+  ]);
+  const costOk = costRes.status === 'fulfilled';
+  const revOk = revRes.status === 'fulfilled';
+
+  if (!costOk && !revOk) {
+    throw new Error(
+      `${dayLabel} both sides failed — spend: ${costRes.reason?.message}; ` +
+        `revenue: ${revRes.reason?.message}`
+    );
+  }
+
+  const warnings = [];
+  if (!costOk) {
+    console.warn(`[Adjust Overlay] ${dayLabel} spend fetch failed:`, costRes.reason?.message);
+    warnings.push(`${dayLabel} spend: ${costRes.reason?.message}`);
+  }
+  if (!revOk) {
+    console.warn(`[Adjust Overlay] ${dayLabel} event-date revenue failed:`, revRes.reason?.message);
+    warnings.push(`${dayLabel} revenue: ${revRes.reason?.message}`);
+  }
+
+  const rows = joinDayRevenueSpend(
+    revOk ? revRes.value : [],
+    costOk ? costRes.value : [],
+    { revOk, costOk }
+  );
+  return { rows, warnings, revOk, costOk };
+}
+
+// Spend only. Same three grouping levels as the cohort pipeline so the join
+// below has a counterpart row at every level the pills decorate, but asking
+// for SPEND_METRICS instead of the full cohort metric set — see the constant's
+// comment for why that matters.
+async function fetchDaySpend({ apiToken, utcOffset, appTokens, datePeriod, dayLabel }) {
+  const label = `Adjust ${dayLabel} spend fetch`;
+  const [campaignRows, adsetRows, adRows] = await Promise.all([
+    fetchAtLevel({
+      apiToken, utcOffset, datePeriod, appTokens, metrics: SPEND_METRICS, label,
+      dimensions: 'channel,campaign_network',
+    }),
+    fetchAtLevel({
+      apiToken, utcOffset, datePeriod, appTokens, metrics: SPEND_METRICS, label,
+      dimensions: 'channel,campaign_network,adgroup_network',
+    }),
+    fetchAtLevel({
+      apiToken, utcOffset, datePeriod, appTokens, metrics: SPEND_METRICS, label,
+      dimensions: 'channel,campaign_network,adgroup_network,creative_network',
+    }),
+  ]);
+  const out = [];
+  for (const row of campaignRows) out.push(toRow(row, 'campaign'));
+  for (const row of adsetRows) out.push(toRow(row, 'adset'));
+  for (const row of adRows) out.push(toRow(row, 'ad'));
+  return out;
+}
+
+// Join one day's event-date revenue rows with its spend rows into one row set
+// carrying dayRevenue + dayCost (the exported wrappers rename these onto the
+// day-specific fields). Both sides come from the same account + date range +
+// dimensions, so the full identity tuple matches exactly for the same entity —
+// no canonicalization needed here.
+//
+// The `revOk` / `costOk` flags keep "we asked and the answer was zero"
+// distinct from "we never got an answer". A spend row with no revenue
+// counterpart means 0 revenue ONLY when the revenue fetch actually succeeded;
+// if that side failed the field stays null so the pill renders a dash instead
+// of a fabricated red 0%. Same rule mirrored for the spend side.
+function joinDayRevenueSpend(revRows, costRows, { revOk = true, costOk = true } = {}) {
+  const revMiss = revOk ? 0 : null;
   // Primary index: full identity tuple. Secondary: level + strongest id — a
   // safety net for the occasional row where the two endpoints disagree on a
   // name (whitespace) or one side carries a creative_id_network the other nulls.
   const costByTuple = new Map();
   const costById = new Map();
   for (const c of costRows) {
-    costByTuple.set(d2TupleKey(c), c);
-    const idk = d2IdKey(c);
+    costByTuple.set(dayTupleKey(c), c);
+    const idk = dayIdKey(c);
     if (idk) costById.set(idk, c);
   }
 
   const usedCost = new Set();
   const matchCost = (r) => {
-    let c = costByTuple.get(d2TupleKey(r));
-    if (!c) { const idk = d2IdKey(r); c = idk ? costById.get(idk) : null; }
+    let c = costByTuple.get(dayTupleKey(r));
+    if (!c) { const idk = dayIdKey(r); c = idk ? costById.get(idk) : null; }
     return c || null;
   };
 
@@ -367,7 +490,10 @@ function joinD2RevenueCost(revRows, costRows) {
   for (const r of revRows) {
     const c = matchCost(r);
     if (c) usedCost.add(c);
-    out.push({ ...r, revenueD2: r.revenue, costD2: c ? c.cost : null });
+    // No spend counterpart → null, never 0: a 0 denominator would render as a
+    // real "spent nothing" reading, and we cannot tell that apart from Adjust
+    // simply not returning a spend row for this entity.
+    out.push({ ...r, dayRevenue: r.revenue, dayCost: c ? c.cost : null });
   }
   for (const c of costRows) {
     if (usedCost.has(c)) continue;
@@ -381,14 +507,14 @@ function joinD2RevenueCost(revRows, costRows) {
       adId: c.adId,
       network: c.network,
       currency: null,
-      revenueD2: 0,
-      costD2: c.cost,
+      dayRevenue: revMiss,
+      dayCost: c.cost,
     });
   }
   return out;
 }
 
-function d2TupleKey(r) {
+function dayTupleKey(r) {
   return [
     r.level,
     r.campaignId || '', r.adsetId || '', r.adId || '',
@@ -396,7 +522,7 @@ function d2TupleKey(r) {
   ].join('::');
 }
 
-function d2IdKey(r) {
+function dayIdKey(r) {
   const id = r.level === 'ad' ? r.adId : r.level === 'adset' ? r.adsetId : r.campaignId;
   return id ? `${r.level}::${id}` : null;
 }

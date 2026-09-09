@@ -1,16 +1,31 @@
 // popup/popup.js
 import { classifyAll, DEFAULT_THRESHOLDS } from '../src/decision-engine.js';
+import {
+  ALL_ACCOUNTS,
+  MAX_ACCOUNTS,
+  makeBlankAccount,
+  normalizeAccounts,
+} from '../src/accounts.js';
 
 const $ = (id) => document.getElementById(id);
+
+// In-memory mirror of dataSourceConfig.accounts. The account cards are built
+// from this, and every edit writes straight back to storage — there is no
+// separate "Save" for accounts because a half-saved token list is the one state
+// that makes the extension look broken for reasons the user can't see.
+let accounts = [];
+let activeAccountId = ALL_ACCOUNTS;
 
 async function refreshStatus() {
   const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
   if (!cached) {
     $('status').textContent = 'No data yet. Configure tokens below and Sync.';
     $('warnings').style.display = 'none';
+    renderAccountStatus(null);
     return;
   }
   renderSyncWarnings(cached.syncWarnings);
+  renderAccountStatus(cached.accountsStatus);
   const ageMin = Math.round(cached.ageMs / 60000);
   // Cached array now mixes 'campaign'- and 'ad'-level rows. Show counts of
   // each. Decision groups classify ad-level rows since ads are the unit the
@@ -143,27 +158,198 @@ async function loadCfg(prefetched) {
     ? prefetched
     : (await chrome.storage.local.get('dataSourceConfig')).dataSourceConfig;
   if (dataSourceConfig?.kind === 'adjust-direct' || !dataSourceConfig) {
-    $('apiToken').value = dataSourceConfig?.apiToken || '';
     $('utcOffset').value = offsetLabelFor(dataSourceConfig?.utcOffset || '+07:00');
     $('accountTimezone').value = dataSourceConfig?.accountTimezone || '';
     $('datePeriod').value = dataSourceConfig?.datePeriod || 'rolling30';
-    $('appTokens').value = dataSourceConfig?.appTokens || '';
   }
   syncPeriodButtons(dataSourceConfig?.datePeriod || 'rolling30');
 }
 
+// Saves the SHARED settings only. Accounts have their own write path
+// (persistAccounts) so a token edit is never lost by forgetting this button.
 async function saveCfg() {
+  const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
   const cfg = {
+    ...(dataSourceConfig || {}),
     kind: 'adjust-direct',
-    apiToken: $('apiToken').value.trim(),
     utcOffset: parseOffsetInput($('utcOffset').value),
     accountTimezone: $('accountTimezone').value.trim(),
     datePeriod: $('datePeriod').value.trim() || 'rolling30',
-    appTokens: $('appTokens').value.trim(),
+    accounts,
+    activeAccountId,
   };
+  // The pre-v0.10 top-level token fields are migrated into accounts[0] on load;
+  // drop them here so a stale copy can never resurrect a retired token.
+  delete cfg.apiToken;
+  delete cfg.appTokens;
   await chrome.storage.local.set({ dataSourceConfig: cfg });
   $('status').textContent = 'Config saved. Click Sync.';
   syncPeriodButtons(cfg.datePeriod);
+}
+
+// ---- Adjust accounts ----
+// The user's apps are split across more than one Adjust account, and an API
+// token only ever sees its own account's apps. Each card is one account; the
+// dropdown at the top picks which one(s) a sync pulls and the pills show.
+
+async function persistAccounts({ resync = false, statusText = '' } = {}) {
+  const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
+  const cfg = {
+    ...(dataSourceConfig || {}),
+    kind: 'adjust-direct',
+    accounts,
+    activeAccountId,
+  };
+  delete cfg.apiToken;
+  delete cfg.appTokens;
+  await chrome.storage.local.set({ dataSourceConfig: cfg });
+  if (resync) doSync(true);
+  else if (statusText) $('status').textContent = statusText;
+}
+
+function renderAccountPicker() {
+  const sel = $('activeAccount');
+  sel.replaceChildren();
+  // The merged option only makes sense with more than one account configured —
+  // otherwise it is an identical duplicate of the single account's entry.
+  if (accounts.length > 1) {
+    const opt = document.createElement('option');
+    opt.value = ALL_ACCOUNTS;
+    opt.textContent = `Cả ${accounts.length} (gộp)`;
+    sel.appendChild(opt);
+  }
+  for (const a of accounts) {
+    const opt = document.createElement('option');
+    opt.value = a.id;
+    opt.textContent = a.apiToken ? a.label : `${a.label} (chưa có token)`;
+    sel.appendChild(opt);
+  }
+  // A stored selection pointing at a since-deleted account falls back to "all"
+  // rather than to nothing: an empty fetch would look identical to Adjust being
+  // down.
+  if (activeAccountId !== ALL_ACCOUNTS && !accounts.some((a) => a.id === activeAccountId)) {
+    activeAccountId = ALL_ACCOUNTS;
+  }
+  // With ONE account, "all" and "that account" are the same fetch, so the
+  // dropdown shows the account while storage keeps 'all'. Pinning storage to
+  // the single id would mean adding a second account later left the sync
+  // silently single-account — the exact thing the user came here to fix.
+  sel.value = (activeAccountId === ALL_ACCOUNTS && accounts.length === 1)
+    ? accounts[0].id
+    : activeAccountId;
+}
+
+function renderAccountCards() {
+  const list = $('accountList');
+  list.replaceChildren();
+  for (const [i, a] of accounts.entries()) {
+    const card = document.createElement('div');
+    card.className = 'acct-card';
+
+    const top = document.createElement('div');
+    top.className = 'acct-card-top';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = a.label;
+    nameInput.placeholder = `Adjust ${i + 1}`;
+    nameInput.title = 'Tên hiển thị của account này (chỉ để phân biệt).';
+    nameInput.addEventListener('change', () => {
+      a.label = nameInput.value.trim() || `Adjust ${i + 1}`;
+      nameInput.value = a.label;
+      renderAccountPicker();
+      persistAccounts({ statusText: 'Đã lưu tên account.' });
+    });
+    top.appendChild(nameInput);
+
+    // Removing the last account would leave the popup with no card to type
+    // into, so the button is disabled rather than hidden — a greyed control
+    // explains itself, a missing one looks like a rendering bug.
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.title = accounts.length > 1
+      ? `Xoá account "${a.label}"`
+      : 'Không thể xoá account cuối cùng';
+    del.disabled = accounts.length <= 1;
+    del.addEventListener('click', () => {
+      accounts = accounts.filter((x) => x.id !== a.id);
+      if (activeAccountId === a.id) {
+        activeAccountId = accounts.length > 1 ? ALL_ACCOUNTS : accounts[0].id;
+      }
+      renderAccountPicker();
+      renderAccountCards();
+      persistAccounts({ statusText: 'Đã xoá account. Bấm Sync để cập nhật.' });
+    });
+    top.appendChild(del);
+    card.appendChild(top);
+
+    card.appendChild(accountField({
+      label: 'API token (Adjust → Account Settings → My profile)',
+      type: 'password',
+      value: a.apiToken,
+      placeholder: 'Bearer token của account này',
+      onChange: (v) => {
+        a.apiToken = v;
+        renderAccountPicker();
+        persistAccounts({ statusText: 'Đã lưu token. Bấm Force refresh.' });
+      },
+    }));
+
+    card.appendChild(accountField({
+      label: 'App tokens của account này (comma-separated)',
+      type: 'text',
+      value: a.appTokens,
+      placeholder: 'ví dụ lpz0c08fnitc,b6yjkg1hc7wg',
+      title: 'Copy từ URL Adjust Datascape: app_token__in="...". Bỏ trống = tất cả app của account, dùng tracker filter mặc định (thường thiếu network mới như TikTok).',
+      onChange: (v) => {
+        a.appTokens = v;
+        persistAccounts({ statusText: 'Đã lưu app tokens. Bấm Force refresh.' });
+      },
+    }));
+
+    list.appendChild(card);
+  }
+  $('addAccount').disabled = accounts.length >= MAX_ACCOUNTS;
+}
+
+function accountField({ label, type, value, placeholder, title, onChange }) {
+  const wrap = document.createElement('label');
+  wrap.textContent = label;
+  const input = document.createElement('input');
+  input.className = 'f';
+  input.type = type;
+  input.value = value || '';
+  if (placeholder) input.placeholder = placeholder;
+  if (title) input.title = title;
+  input.addEventListener('change', () => onChange(input.value.trim()));
+  wrap.appendChild(input);
+  return wrap;
+}
+
+// Per-account outcome of the last sync (cache.accountsStatus, schema v9+).
+// Rendered even when everything succeeded: seeing the row count per account is
+// how the user confirms the account they just added is actually being pulled.
+function renderAccountStatus(statusList) {
+  const el = $('acctStatus');
+  el.replaceChildren();
+  if (!Array.isArray(statusList) || !statusList.length) {
+    if (accounts.length > 1) {
+      const span = document.createElement('span');
+      span.className = 'muted';
+      span.textContent = 'Chưa có kết quả theo từng account — bấm Sync.';
+      el.appendChild(span);
+    }
+    return;
+  }
+  for (const st of statusList) {
+    const div = document.createElement('div');
+    div.className = st.ok ? 'ok' : 'bad';
+    div.textContent = st.ok
+      ? `✓ ${st.label} — ${st.rows} rows` +
+        (st.warnings?.length ? ` (${st.warnings.length} report lỗi)` : '')
+      : `✗ ${st.label} — ${st.error || 'fetch failed'}`;
+    if (!st.ok && st.error) div.title = st.error;
+    el.appendChild(div);
+  }
 }
 
 // Highlights whichever quick-period button matches the saved value, or none if
@@ -204,6 +390,7 @@ async function pickPeriod(period) {
 const DEFAULT_COLOR_THRESHOLDS = {
   meta:   { pause: 0.60, red: 0.80, green: 1.00 },
   tiktok: { pause: 0.60, red: 0.80, green: 1.00 },
+  google: { pause: 0.60, red: 0.80, green: 1.00 },
 };
 
 async function loadColorThresholds(prefetched) {
@@ -217,6 +404,9 @@ async function loadColorThresholds(prefetched) {
   $('tiktokPause').value = pctOf(t.tiktok.pause);
   $('tiktokRed').value   = pctOf(t.tiktok.red);
   $('tiktokGreen').value = pctOf(t.tiktok.green);
+  $('googlePause').value = pctOf(t.google.pause);
+  $('googleRed').value   = pctOf(t.google.red);
+  $('googleGreen').value = pctOf(t.google.green);
 }
 
 async function saveColorThresholds() {
@@ -231,6 +421,11 @@ async function saveColorThresholds() {
       red:   pctParse($('tiktokRed').value),
       green: pctParse($('tiktokGreen').value),
     },
+    google: {
+      pause: pctParse($('googlePause').value),
+      red:   pctParse($('googleRed').value),
+      green: pctParse($('googleGreen').value),
+    },
   };
   await chrome.storage.local.set({ colorThresholds: cfg });
   $('status').textContent = 'Color thresholds saved.';
@@ -239,6 +434,7 @@ async function saveColorThresholds() {
 function mergeThresholds(stored) {
   const m = stored?.meta || {};
   const t = stored?.tiktok || {};
+  const g = stored?.google || {};
   return {
     meta: {
       pause: numOr(m.pause, DEFAULT_COLOR_THRESHOLDS.meta.pause),
@@ -249,6 +445,11 @@ function mergeThresholds(stored) {
       pause: numOr(t.pause, DEFAULT_COLOR_THRESHOLDS.tiktok.pause),
       red:   numOr(t.red,   DEFAULT_COLOR_THRESHOLDS.tiktok.red),
       green: numOr(t.green, DEFAULT_COLOR_THRESHOLDS.tiktok.green),
+    },
+    google: {
+      pause: numOr(g.pause, DEFAULT_COLOR_THRESHOLDS.google.pause),
+      red:   numOr(g.red,   DEFAULT_COLOR_THRESHOLDS.google.red),
+      green: numOr(g.green, DEFAULT_COLOR_THRESHOLDS.google.green),
     },
   };
 }
@@ -269,6 +470,7 @@ function mergeThresholds(stored) {
 const PILL_PLATFORMS = {
   meta:   { cohort: 'pillCohort',   today: 'pillToday',   yesterday: 'pillYesterday',   d2: 'pillD2' },
   tiktok: { cohort: 'ttPillCohort', today: 'ttPillToday', yesterday: 'ttPillYesterday', d2: 'ttPillD2' },
+  google: { cohort: 'ggPillCohort', today: 'ggPillToday', yesterday: 'ggPillYesterday', d2: 'ggPillD2' },
 };
 const DEFAULT_PILL_VIS = { cohort: true, today: true, yesterday: false, d2: false };
 
@@ -343,6 +545,26 @@ $('sync').addEventListener('click', () => doSync(false));
 $('forceSync').addEventListener('click', () => doSync(true));
 $('saveCfg').addEventListener('click', saveCfg);
 
+// Switching account changes WHICH Adjust the sync pulls, so the cached rows are
+// for the wrong account the instant the selection changes. Force-sync rather
+// than leaving the previous account's pills on screen under a new label.
+$('activeAccount').addEventListener('change', () => {
+  // With a single account the dropdown has no "all" row, so picking the only
+  // option still means "all" — see renderAccountPicker.
+  activeAccountId = accounts.length > 1 ? $('activeAccount').value : ALL_ACCOUNTS;
+  persistAccounts({ resync: true });
+});
+
+$('addAccount').addEventListener('click', () => {
+  if (accounts.length >= MAX_ACCOUNTS) return;
+  accounts = [...accounts, makeBlankAccount(accounts.length)];
+  renderAccountPicker();
+  renderAccountCards();
+  // No resync: a brand-new account has no token yet, so fetching it could only
+  // produce a 401. It joins the next sync once a token is pasted in.
+  persistAccounts({ statusText: 'Thêm account mới — dán API token vào đó.' });
+});
+
 // Re-snap the offset field to its canonical city label once the user commits an
 // edit (blur or datalist pick). Without this, hand-editing just the sign — e.g.
 // flipping "+07:00 — Bangkok" to "-07:00" — leaves the stale cities showing,
@@ -371,7 +593,23 @@ for (const ids of Object.values(PILL_PLATFORMS)) {
     chrome.storage.local.get(['dataSourceConfig', 'colorThresholds', 'pillVisibility']),
     refreshStatus(),
   ]);
+  // Accounts first: renderAccountStatus (already called by refreshStatus) reads
+  // `accounts.length`, and loadCfg no longer owns the token fields.
+  accounts = normalizeAccounts(dataSourceConfig);
+  activeAccountId = dataSourceConfig?.activeAccountId || ALL_ACCOUNTS;
+  renderAccountPicker();
+  renderAccountCards();
+  // Persist the migration result (pre-v0.10 single-token config -> accounts[])
+  // so the next sync reads the new shape even if the user never opens Settings.
+  if (!Array.isArray(dataSourceConfig?.accounts)) {
+    await persistAccounts();
+  }
   loadCfg(dataSourceConfig);
   loadColorThresholds(colorThresholds);
   loadPillVisibility(pillVisibility);
+  // Re-render account status now that `accounts` is populated: the call inside
+  // refreshStatus ran before migration, so a first-run popup would otherwise
+  // show nothing where the per-account lines belong.
+  const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
+  renderAccountStatus(cached?.accountsStatus);
 })();

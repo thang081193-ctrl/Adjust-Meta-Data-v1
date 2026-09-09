@@ -64,12 +64,36 @@
   .pill-tag-yest { background: #f3ecff; color: #4a2a8c; border: 1px solid #d3c2ff; }
   .pill-tag-d2 { background: #e6f7f1; color: #0b6b4f; border: 1px solid #b3e6d5; }
   .pills-hint { font-size: 10px; color: #888; margin-top: 4px; line-height: 1.4; }
+
+  .acct-pick { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; }
+  .acct-pick label { font-size: 12px; font-weight: 600; color: #444; white-space: nowrap; }
+  .acct-pick select { flex: 1; padding: 5px 6px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; }
+  .acct-status-list { font-size: 11px; color: #666; margin: 0 0 6px; line-height: 1.6; }
+  .acct-status-list .ok { color: #1b5e20; }
+  .acct-status-list .bad { color: #b00020; }
+  .acct-status-list .muted { color: #999; }
+
+  .acct-editor { border: 1px solid #d0d7de; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fafbfc; }
+  .acct-editor-head { font-size: 12px; font-weight: 600; color: #444; margin-bottom: 4px; }
+  .acct-card { border: 1px solid #e1e4e8; border-radius: 5px; padding: 7px 8px; margin: 6px 0; background: #fff; }
+  .acct-card-top { display: flex; gap: 6px; align-items: center; }
+  .acct-card-top input { flex: 1; font-size: 12px; font-weight: 600; padding: 3px 5px; border: 1px solid #ddd; border-radius: 3px; }
+  .acct-card-top button { padding: 2px 7px; font-size: 12px; line-height: 1.3; color: #b00020; border-color: #e6c9ce; }
+  .acct-card label { display: block; font-size: 10px; color: #777; margin-top: 6px; }
+  .acct-card input.f { width: 100%; font-size: 11px; padding: 3px 5px; box-sizing: border-box; margin-top: 2px; }
+  .acct-hint { font-size: 10px; color: #888; line-height: 1.45; margin-top: 6px; }
 </style>
 </head>
 <body>
   <h3>Adjust ROAS Overlay</h3>
 
   <div class="status" id="status">Loading…</div>
+
+  <div class="acct-pick">
+    <label for="activeAccount">Adjust:</label>
+    <select id="activeAccount" title="Chọn Adjust account muốn hiện data. 'Cả 2' kéo song song rồi gộp."></select>
+  </div>
+  <div class="acct-status-list" id="acctStatus"></div>
 
   <div class="periods" id="periods" role="group" aria-label="Date period">
     <button data-period="yesterday">Yesterday</button>
@@ -92,42 +116,51 @@
   <div class="pills-box">
     <div class="pills-head">🏷 Pills shown</div>
     <table class="pills-table">
-      <tr><th></th><th>Meta</th><th>TikTok</th></tr>
+      <tr><th></th><th>Meta</th><th>TikTok</th><th>Google</th></tr>
       <tr>
         <td><span class="pill-tag pill-tag-cohort">D0 3d 7d All</span> Cohort ROAS</td>
         <td><input type="checkbox" id="pillCohort" title="Meta: cohort ROAS pill" /></td>
         <td><input type="checkbox" id="ttPillCohort" title="TikTok: cohort ROAS pill" /></td>
+        <td><input type="checkbox" id="ggPillCohort" title="Google Ads: cohort ROAS pill" /></td>
       </tr>
       <tr>
         <td><span class="pill-tag pill-tag-today">Today</span> Realtime hôm nay</td>
         <td><input type="checkbox" id="pillToday" title="Meta: today realtime pill" /></td>
         <td><input type="checkbox" id="ttPillToday" title="TikTok: today realtime pill" /></td>
+        <td><input type="checkbox" id="ggPillToday" title="Google Ads: today realtime pill" /></td>
       </tr>
       <tr>
         <td><span class="pill-tag pill-tag-yest">Y'day</span> Realtime hôm qua (D-1)</td>
         <td><input type="checkbox" id="pillYesterday" title="Meta: yesterday realtime pill" /></td>
         <td><input type="checkbox" id="ttPillYesterday" title="TikTok: yesterday realtime pill" /></td>
+        <td><input type="checkbox" id="ggPillYesterday" title="Google Ads: yesterday realtime pill" /></td>
       </tr>
       <tr>
         <td><span class="pill-tag pill-tag-d2">D-2</span> Hôm kia (rev+spend Adjust)</td>
         <td><input type="checkbox" id="pillD2" title="Meta: D-2 pill (Adjust revenue ÷ Adjust spend)" /></td>
         <td><input type="checkbox" id="ttPillD2" title="TikTok: D-2 pill (Adjust revenue ÷ Adjust spend)" /></td>
+        <td><input type="checkbox" id="ggPillD2" title="Google Ads: D-2 pill (Adjust revenue ÷ Adjust spend)" /></td>
       </tr>
     </table>
     <div class="pills-hint">
-      Bật cái nào hiện cái đó trên bảng tương ứng. Yesterday (D-1) cần ghé view
-      "Yesterday" 1 lần để đọc spend. D-2 (hôm kia) lấy cả revenue lẫn spend từ
-      Adjust nên không cần ghé view nào. Bật D-1/D-2 (ở bất kỳ bên nào) sẽ tự
-      force-sync để kéo dữ liệu.
+      Bật cái nào hiện cái đó trên bảng tương ứng (Meta / TikTok / Google Ads).
+      Yesterday (D-1) và D-2 lấy cả revenue lẫn spend từ Adjust — không cần ghé
+      view nào. Bật D-1/D-2 (ở bất kỳ bên nào) sẽ tự force-sync để kéo dữ liệu.
     </div>
   </div>
 
   <details>
     <summary>Settings</summary>
-    <div class="row">
-      <label>Adjust API token:<br>
-        <input id="apiToken" type="password" style="width:100%" />
-      </label>
+    <div class="acct-editor">
+      <div class="acct-editor-head">🔗 Adjust accounts</div>
+      <div id="accountList"></div>
+      <button id="addAccount">+ Thêm Adjust account</button>
+      <div class="acct-hint">
+        Mỗi Adjust account = 1 API token riêng (Account Settings → My profile) +
+        list app token riêng của account đó. Chọn account muốn xem ở dropdown
+        "Adjust" phía trên; chọn "Cả 2 (gộp)" để kéo song song cả hai rồi gộp lại.
+        Đổi lựa chọn sẽ tự force-sync.
+      </div>
     </div>
     <div class="tz-box">
       <div class="tz-head">⏱ Timezone alignment</div>
@@ -163,13 +196,6 @@
                title="Rolling: rolling3, rolling7, rolling30 | Adjust keywords: today, yesterday, this_week, last_week, this_month, last_month | or YYYY-MM-DD:YYYY-MM-DD" />
       </label>
     </div>
-    <div class="row">
-      <label style="font-size:11px;color:#777">
-        App tokens (comma-separated, optional but recommended):<br>
-        <input id="appTokens" type="text" placeholder="e.g. lpz0c08fnitc,b6yjkg1hc7wg" style="width:100%"
-               title="Copy from Adjust Datascape URL: app_token__in=&quot;...&quot;. Empty = all apps with default tracker filter (often missing newer networks like TikTok)." />
-      </label>
-    </div>
     <button id="saveCfg">Save config</button>
   </details>
 
@@ -182,23 +208,26 @@
     </div>
     <table class="thresh-table">
       <thead>
-        <tr><th></th><th>Meta %</th><th>TikTok %</th></tr>
+        <tr><th></th><th>Meta %</th><th>TikTok %</th><th>Google %</th></tr>
       </thead>
       <tbody>
         <tr>
           <td>Pill red if d7 below</td>
           <td><input id="metaPause" type="number" min="0" max="500" /></td>
           <td><input id="tiktokPause" type="number" min="0" max="500" /></td>
+          <td><input id="googlePause" type="number" min="0" max="500" /></td>
         </tr>
         <tr>
           <td>Value red below</td>
           <td><input id="metaRed" type="number" min="0" max="500" /></td>
           <td><input id="tiktokRed" type="number" min="0" max="500" /></td>
+          <td><input id="googleRed" type="number" min="0" max="500" /></td>
         </tr>
         <tr>
           <td>Value green above</td>
           <td><input id="metaGreen" type="number" min="0" max="500" /></td>
           <td><input id="tiktokGreen" type="number" min="0" max="500" /></td>
+          <td><input id="googleGreen" type="number" min="0" max="500" /></td>
         </tr>
       </tbody>
     </table>

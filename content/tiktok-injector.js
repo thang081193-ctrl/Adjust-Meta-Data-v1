@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.5.3-adjust-retry-partial-sync';
+  const INJECTOR_VERSION = 'v0.7.0-adjust-yday-spend';
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -261,6 +261,18 @@
     if (path.includes('/manage/adgroup')) return 'adset';
     if (path.includes('/manage/campaign')) return 'campaign';
     return null;
+  }
+
+  // Adjust reporting offset (dataSourceConfig.utcOffset), used only to label the
+  // D-2 pill with the day it actually covers. Kept in sync by the storage
+  // listener below.
+  let reportingUtcOffset = '+07:00';
+
+  async function loadReportingOffset() {
+    try {
+      const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
+      if (dataSourceConfig?.utcOffset) reportingUtcOffset = dataSourceConfig.utcOffset;
+    } catch { /* keep default */ }
   }
 
   async function loadColorThresholds() {
@@ -653,6 +665,11 @@
     if (row.revenueYesterday != null) {
       e.revenueYesterday = (e.revenueYesterday || 0) + row.revenueYesterday;
     }
+    // Adjust network spend for D-1 (v0.12) — the Yesterday pill's primary
+    // denominator, same null-guard contract as the other realtime fields.
+    if (row.costYesterday != null) {
+      e.costYesterday = (e.costYesterday || 0) + row.costYesterday;
+    }
     // D-2 revenue AND spend, both event-date from Adjust (see fetchD2GrossRevenue).
     // Same null-guard + visited-guard rationale as revenueYesterday. Revenue and
     // cost are gated independently so a row with one but not the other still
@@ -664,6 +681,10 @@
       e.costD2 = (e.costD2 || 0) + row.costD2;
     }
     if (!e.adjustCurrency && row.adjustCurrency) e.adjustCurrency = row.adjustCurrency;
+    // Which Adjust account this entry's numbers came from (cache schema v9+).
+    // Shown in the pill tooltips so a wrong-looking number can be traced to the
+    // right dashboard without guessing which account owns the app.
+    if (!e.accountLabel && row.accountLabel) e.accountLabel = row.accountLabel;
     e.todayRowExisted = e.todayRowExisted || !!row.todayRowExisted;
   }
 
@@ -1007,6 +1028,24 @@
     return `${y}-${m}-${day}`;
   }
 
+  // The calendar day the D-2 pill covers, on the ADJUST REPORTING OFFSET — not
+  // the browser clock the today/yesterday helpers above use. D-2's request is
+  // built client-side from that offset (isoDateDaysAgoAtOffset in
+  // src/adjust-client.js), so the tooltip must name the same day or it would
+  // send the user to the wrong row in Datascape when the two clocks straddle
+  // midnight. Falls back to +07:00 (BKT), matching the client's own default.
+  function reportingD2Iso() {
+    const m = String(reportingUtcOffset || '').trim().match(/^([+-])(\d{1,2}):?(\d{2})?$/);
+    const offMin = m
+      ? (m[1] === '-' ? -1 : 1) * (parseInt(m[2], 10) * 60 + (m[3] ? parseInt(m[3], 10) : 0))
+      : 420;
+    const shifted = new Date(Date.now() + offMin * 60000 - 2 * 86400000);
+    const y = shifted.getUTCFullYear();
+    const mo = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(shifted.getUTCDate()).padStart(2, '0');
+    return `${y}-${mo}-${day}`;
+  }
+
   function formatMoneyOrDash(n) {
     if (n == null || !Number.isFinite(n)) return '–';
     return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1166,6 +1205,40 @@
       lastTodayStats.sampleRevYesterday = rev;
     }
 
+    // Adjust-sourced spend (v0.12) — primary path, same closed-day contract as
+    // the D-2 pill; the scraped-spend cache below survives only as a fallback
+    // for rows whose Adjust spend half failed.
+    const adjSpend = (data.costYesterday == null) ? null : data.costYesterday;
+    if (adjSpend != null) {
+      const yestKey = `${mainKey}|yadj:${rev}/${adjSpend}|a:${adjCcy || ''}`;
+      if (decoratedYesterdayKey.get(nameEl) === yestKey) return;
+      const yestPill = document.createElement('span');
+      yestPill.className = YEST_PILL_CLASS_NORMAL;
+      yestPill.appendChild(document.createTextNode(
+        `Y'day: ${formatMoneyOrDash(rev)}/${formatMoneyOrDash(adjSpend)}`
+      ));
+      if (rev != null && adjSpend > 0) {
+        const roas = rev / adjSpend;
+        yestPill.appendChild(document.createTextNode(' '));
+        const valSpan = document.createElement('span');
+        valSpan.textContent = pct(roas);
+        if (roas < colorThresholds.red) valSpan.className = 'adjust-rv-red';
+        else if (roas > colorThresholds.green) valSpan.className = 'adjust-rv-green';
+        yestPill.appendChild(valSpan);
+      }
+      const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+      yestPill.title =
+        `Yesterday ROAS (event-date, closed day — both sides from Adjust)\n` +
+        `Rev (Adjust yesterday${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(rev)}\n` +
+        `Spend (Adjust yesterday${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(adjSpend)}` +
+        (rev == null ? `\n⚠ Thiếu revenue — report event-date yesterday lỗi, xem banner/popup.` : '') +
+        (data.accountLabel ? `\nAdjust account: ${data.accountLabel}` : '') +
+        (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
+      lastTodayStats.pillsYesterday++;
+      commitYesterdayPill(nameEl, anchorPill, yestPill, yestKey);
+      return;
+    }
+
     // A capture only counts if it represents the day Adjust's `yesterday`
     // report covers. Comparing against the live yesterday ISO (not against
     // whatever the picker shows now) is what makes a day-rollover drop the
@@ -1250,12 +1323,21 @@
     if (decoratedD2Key.get(nameEl) === d2Key) return;
 
     const d2Pill = document.createElement('span');
+    const d2Iso = reportingD2Iso();
     if (rev == null && spend == null) {
+      // Two very different causes look identical here — an Adjust report that
+      // failed this sync vs. the row genuinely having no D-2 activity — so name
+      // whichever one applies. A bare dash for both is what made a failed D-2
+      // pipeline indistinguishable from a broken feature.
+      const d2Warnings = syncWarnings.filter((w) => /D-2/i.test(w));
       d2Pill.className = D2_PILL_CLASS_NODATA;
       d2Pill.textContent = `D-2: –/– — chưa có dữ liệu`;
-      d2Pill.title =
-        `D-2 (hôm kia) ROAS chưa có dữ liệu Adjust cho dòng này.\n` +
-        `Nếu vừa bật pill, bấm Force refresh trong popup để kéo report D-2.`;
+      d2Pill.title = d2Warnings.length
+        ? `D-2 (${d2Iso}) — report Adjust lỗi ở lần sync này:\n` +
+          d2Warnings.map((w) => `• ${w}`).join('\n') +
+          `\nBấm Force refresh trong popup để thử lại.`
+        : `D-2 (hôm kia, ${d2Iso}) chưa có dữ liệu Adjust cho dòng này.\n` +
+          `Nếu vừa bật pill, bấm Force refresh trong popup để kéo report D-2.`;
       lastTodayStats.d2NoData++;
     } else {
       d2Pill.className = D2_PILL_CLASS_NORMAL;
@@ -1272,10 +1354,20 @@
         d2Pill.appendChild(valSpan);
       }
       const ageMin = lastSyncAt ? Math.round((Date.now() - lastSyncAt) / 60000) : null;
+      // A dash on ONE side means that half of the D-2 fetch failed while the
+      // other succeeded (they are independent requests). Say so, rather than
+      // leaving the user to wonder why a number is missing.
+      const halfNote = rev == null
+        ? `\n⚠ Thiếu revenue — report event-date D-2 lỗi, xem banner/popup.`
+        : spend == null
+          ? `\n⚠ Thiếu spend — report spend D-2 lỗi, xem banner/popup.`
+          : '';
       d2Pill.title =
-        `D-2 realtime ROAS (event-date, two days ago — final, both sides from Adjust)\n` +
+        `D-2 realtime ROAS (event-date, ${d2Iso} — final, both sides from Adjust)\n` +
         `Rev (Adjust D-2${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(rev)}\n` +
         `Spend (Adjust D-2${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoneyOrDash(spend)}` +
+        halfNote +
+        (data.accountLabel ? `\nAdjust account: ${data.accountLabel}` : '') +
         (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
       lastTodayStats.pillsD2++;
     }
@@ -2071,6 +2163,9 @@
     if (data.cost != null) {
       lines.push(`Cost: $${data.cost.toFixed(2)} · Installs: ${data.installs ?? 0}`);
     }
+    // With more than one Adjust account merged, "Source" names the SELECTION
+    // while this line names the account this particular row came from.
+    if (data.accountLabel) lines.push(`Adjust account: ${data.accountLabel}`);
     lines.push(`Last sync: ${new Date(lastSyncAt).toLocaleString()}`);
     lines.push(`Source: ${sourceLabel}`);
     return lines.join('\n');
@@ -2485,7 +2580,7 @@
   // Load thresholds AND pill visibility first so the very first decoration
   // uses user-configured colors and renders exactly the enabled pill types —
   // rather than briefly painting with defaults and re-painting.
-  Promise.all([loadColorThresholds(), loadPillVisibility()]).then(() => {
+  Promise.all([loadColorThresholds(), loadPillVisibility(), loadReportingOffset()]).then(() => {
     // Checklog: which pill types this page will actually paint. "0 pills"
     // reports that used to mean a broken matcher can now legitimately mean
     // three unticked checkboxes — this line settles it without a code dive.
@@ -2554,8 +2649,10 @@
       // what Adjust now calls "yesterday". Drop them rather than divide a
       // stale spend into fresh revenue.
       ttYestSpendCache.clear();
-      removeAllPills();
-      decorateAllVisibleRows();
+      loadReportingOffset().then(() => {
+        removeAllPills();
+        decorateAllVisibleRows();
+      });
     } else if (changes.pillVisibility) {
       // Full teardown + repaint. Incremental diffing would have to reason
       // about which of the three pill types changed AND about cells recycled

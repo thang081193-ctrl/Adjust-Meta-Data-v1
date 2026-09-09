@@ -6,3 +6,6 @@ node_modules/
 .vscode/
 .idea/
 .claude/settings.local.json
+
+# Claude Code session data (worktrees may hold env files with real tokens)
+.claude/
