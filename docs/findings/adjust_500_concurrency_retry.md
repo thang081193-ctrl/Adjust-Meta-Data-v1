@@ -48,3 +48,7 @@ during that window fired `unhandledrejection` in the service worker. Now uses
   `correlation_id` against Adjust support first.
 - Adding another pill that fetches: it adds 3+ report calls per sync. Keep the
   toggle-gated fetch pattern AND reuse `fetchAdjustRows` so the gate covers it.
+- v0.10.1 (multi-account): the gate is PER API TOKEN — the overload it guards
+  against is per-account, so each Adjust account gets its own MAX_CONCURRENT
+  slots and "Cả 2 (gộp)" no longer serializes two accounts through one gate.
+  The "lower MAX_CONCURRENT to 2" advice above applies per account.

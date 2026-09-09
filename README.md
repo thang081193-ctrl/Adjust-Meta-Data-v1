@@ -65,8 +65,14 @@ Thresholds are in `src/decision-engine.js` → `DEFAULT_THRESHOLDS`. Tune in cod
 1. Each cohort window pulled separately from Adjust API — no client-side cohort math.
 2. Full decimal precision preserved through the pipeline; rounding only at render.
 3. 5-minute cache TTL; "Force refresh" button always bypasses cache.
-4. Sync failure throws — never falls back to stale data silently.
+4. Sync failure throws — never falls back to stale data silently. A *partial*
+   failure (some Adjust reports 500'd, at least one succeeded) caches what
+   worked and labels it: `syncWarnings` drive the popup's amber box and both
+   injector banners. A field that was never fetched stays `null` and renders as
+   a dash — never as a fabricated `0%`.
 5. `lastSyncAt` timestamp visible in the in-page banner and popup.
+6. With several Adjust accounts merged, each pill tooltip names the account its
+   numbers came from, and the popup shows a per-account row count per sync.
 
 ## The Unicode-safe matcher
 
@@ -81,12 +87,38 @@ Thresholds are in `src/decision-engine.js` → `DEFAULT_THRESHOLDS`. Tune in cod
 3. `chrome://extensions` → Developer mode → Load unpacked → select this folder.
 4. Click extension icon → expand Settings → enter tokens → Save → Sync.
 5. Open Meta Ads Manager — pills should appear next to each campaign name.
+   The same pills render on TikTok Ads Manager (`ads.tiktok.com/i18n/manage/*`)
+   and, since v0.11, Google Ads (`ads.google.com/aw/*`) — per-platform toggles
+   and colour thresholds live in the popup. Google's channel id in the Adjust
+   fetch (`partner_7`) is assumed; verify it once per account with
+   `node docs/diagnostics/channel-probe.mjs <token>` (see
+   [docs/findings/google_ads_channel.md](docs/findings/google_ads_channel.md)).
+
+### Multiple Adjust accounts (v0.10+)
+
+Apps split across more than one Adjust account need one card per account — an
+API token only ever sees the apps of the account that minted it.
+
+1. Popup → **Settings** → **🔗 Adjust accounts** → **+ Thêm Adjust account**.
+2. Per card: a display name, that account's **API token**, and that account's
+   **app tokens** (from its Datascape URL's `app_token__in=…`).
+3. The **Adjust** dropdown at the top of the popup picks what the pills show:
+   one account, or `Cả N (gộp)` to pull every account in parallel and merge.
+   Changing it force-syncs.
+4. After a sync the popup lists each account's outcome (`✓ <name> — N rows`).
+   Zero rows with a ✓ means the token is valid but its app-token filter matched
+   nothing.
+
+Timezone, date period, and colour thresholds stay shared across accounts — they
+describe the window you are reading, not the account. Merging resolves an entity
+reported by both accounts to whichever one owns the app; see
+[docs/findings/adjust_multi_account.md](docs/findings/adjust_multi_account.md).
 
 ## TODOs before production use
 
 - [ ] `src/adjust-client.js`: confirm whether your account uses KPI Service v1 or Reporting Service v2; adjust endpoint + response parsing accordingly.
 - [ ] `content/meta-injector.js`: verify `SELECTORS.campaignRow` and `SELECTORS.campaignNameCell` against current Meta Ads Manager DOM (Meta obfuscates classNames so these need periodic check).
-- [ ] Multi-app support: today config is single-app; extend `dataSourceConfig` to array if needed.
+- [x] ~~Multi-app support: today config is single-app; extend `dataSourceConfig` to array if needed.~~ Shipped v0.10 as multi-**account** support (`dataSourceConfig.accounts[]`, `src/accounts.js`).
 - [ ] Marketing API action layer: when ready to add automated pause/scale, add `src/meta-marketing-client.js` and a confirm dialog in the popup showing all 4 windows before sending the API call.
 
 ## Swapping to JM-AM later
