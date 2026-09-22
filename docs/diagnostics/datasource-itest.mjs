@@ -134,9 +134,13 @@ console.log('   d2spend metric used:', calls.some((c) => c.kind === 'd2spend'));
 console.log('   warnings:', res.warnings.length, '| accountsStatus:',
   res.accountsStatus.map((a) => `${a.label}:${a.ok ? 'ok' : 'FAIL'}/${a.rows}`).join(' '));
 const shared = find(res.campaigns, 'Shared');
+// v0.12.2: the mirror row is MERGED in, not dropped — label names both
+// accounts, installs/revenue are summed (mirror adds 0), spend is max (100,
+// NOT 200), and the D-1/D-2 spend halves are max too (40, not 80).
 console.log('   Shared -> account:', shared.accountLabel, '| installs:', shared.installs,
-  '| revenueD2:', shared.revenueD2, '| costD2:', shared.costD2,
-  '| revYest:', shared.revenueYesterday, '| costYest:', shared.costYesterday);
+  '| cost:', shared.cost, '(100 not 200) | revenueD2:', shared.revenueD2, '| costD2:', shared.costD2,
+  '(40 not 80) | revYest:', shared.revenueYesterday, '| costYest:', shared.costYesterday,
+  '| mergeStats:', JSON.stringify(src.lastMergeStats));
 console.log('   OnlyA present:', !!find(res.campaigns, 'OnlyA'), '| OnlyB present:', !!find(res.campaigns, 'OnlyB'));
 console.log('   sourceLabel:', src.describe());
 
@@ -195,6 +199,41 @@ console.log('6) legacy cfg -> tokens:', [...new Set(calls.map((c) => c.token))].
   console.log('8) cross-channel same-name -> kept:', dd.stats.kept, 'dropped:', dd.stats.dropped,
     '| networks kept:', dd.rows.map((r) => r.network).join(' + '),
     '| FB winner installs:', dd.rows.find((r) => r.network === 'Facebook')?.installs);
+}
+
+// ---- 9. Split traffic across accounts: SUM SDK metrics, never double spend --
+// The migration state the pick-one rule got wrong: both accounts carry
+// installs/revenue for the same campaign (new build rolling out with the new
+// account's app_token). Expected: installs 60+40, cohort rev 80+30, cost stays
+// 100 (mirrored, not summed), d0 = (0.2*100 + 0.1*100)/100 = 0.30, d7 = 1.10,
+// allTime = 110/100, revenueToday 5+3, revenueD2 10 (B's null ignored), costD2
+// max(40,40), label "A + B", split flagged.
+{
+  const { __test__ } = await import(BASE + 'data-source.js');
+  const mk = (label, installs, cohRev, d0, d7, revT, revD2, costD2) => ({
+    level: 'campaign', campaignName: 'Split', campaignId: '444', network: 'Facebook',
+    accountId: label, accountLabel: label,
+    cost: 100, installs, cohortAllRevenue: cohRev, roas: { d0, d3: null, d7, allTime: cohRev / 100 },
+    revenueToday: revT, revenueYesterday: null, costYesterday: 100, revenueD2: revD2, costD2,
+    todayRowExisted: true, adjustCurrency: 'USD',
+  });
+  const dd = __test__.dedupeAcrossAccounts([
+    mk('A', 60, 80, 0.2, 0.8, 5, 10, 40),
+    mk('B', 40, 30, 0.1, 0.3, 3, null, 40),
+  ]);
+  const m = dd.rows[0];
+  console.log('9) split traffic -> label:', m.accountLabel, '| cost:', m.cost, '(100 not 200) | installs:', m.installs,
+    '(100) | cohortRev:', m.cohortAllRevenue, '(110) | d0:', m.roas.d0.toFixed(2), '(0.30) | d7:', m.roas.d7.toFixed(2),
+    '(1.10) | allTime:', m.roas.allTime.toFixed(2), '(1.10)');
+  console.log('   revenueToday:', m.revenueToday, '(8) | revenueD2:', m.revenueD2, '(10) | costD2:', m.costD2,
+    '(40) | costYest:', m.costYesterday, '(100) | revYest:', m.revenueYesterday, '(null = not fetched) | split:', dd.stats.split,
+    '| mergedFrom:', m.mergedFrom.map((x) => `${x.accountLabel}:${x.installs}`).join(','));
+  // Clean cut-over (mirror has zeros everywhere) must reduce to the old answer.
+  const clean = __test__.dedupeAcrossAccounts([
+    mk('A', 60, 80, 0.2, 0.8, 5, 10, 40),
+    mk('B', 0, 0, 0, 0, 0, 0, 40),
+  ]).rows[0];
+  console.log('   clean cut-over -> installs:', clean.installs, '(60) | d7:', clean.roas.d7.toFixed(2), '(0.80) | cost:', clean.cost, '(100) | label:', clean.accountLabel);
 }
 
 // ---- 7. D-2 toggled OFF costs nothing ----------------------------------
