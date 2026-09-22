@@ -29,7 +29,7 @@ See [docs/findings/multi_adjust_account_split.md](docs/findings/multi_adjust_acc
 ### Paste-ready (App tokens field — Adjust 1)
 
 ```
-b6yjkg1hc7wg,ox6zszk8msjk,c1um2rdnch6o,rzfdacwjzm68,kb64lotprz7k,vpjmthw8l8u8,lpz0c08fnitc,pmh28w0ksfls,wz9wt6b3bim8,9p5pqomqr8jk,7z52ql6392f4
+b6yjkg1hc7wg,ox6zszk8msjk,c1um2rdnch6o,rzfdacwjzm68,kb64lotprz7k,vpjmthw8l8u8,lpz0c08fnitc,pmh28w0ksfls,wz9wt6b3bim8,9p5pqomqr8jk,7z52ql6392f4,ksrar9dg9zi8,d2khbj9qdgjk
 ```
 
 ### Token → App
@@ -47,23 +47,47 @@ b6yjkg1hc7wg,ox6zszk8msjk,c1um2rdnch6o,rzfdacwjzm68,kb64lotprz7k,vpjmthw8l8u8,lp
 | MathDojo: AI Math Practice | `wz9wt6b3bim8` | Adjust 1 |
 | ScoreDeck: Live Football Score | `9p5pqomqr8jk` | Adjust 1 |
 | Show ID Caller & Spam Blocker | `7z52ql6392f4` | Adjust 1 |
+| ChartPilot: AI Chart Analyst | `ksrar9dg9zi8` | Adjust 1 (cũng có bản `[JM]` ở Adjust 2) |
+| Video Downloader & Player HD | `d2khbj9qdgjk` | Adjust 1 (cũng có bản `[JM]` ở Adjust 2) |
 
-<!-- First 8 confirmed 2026-05-11; last 3 (MathDojo, ScoreDeck, Caller ID) added 2026-06-16. -->
+<!-- First 8 confirmed 2026-05-11; MathDojo, ScoreDeck, Caller ID added 2026-06-16;
+     ChartPilot + Video Downloader added 2026-09-17 after auditing the Adjust 1 AppView
+     list (13 apps total, org "Yaviber Company Limited") — the list is now complete. -->
 
 ## Adjust 2 (tài khoản mới)
 
-Chưa có app nào được chuyển sang. Khi chuyển app đầu tiên: lấy app_token mới từ
-URL Datascape của **tài khoản 2** (`app_token__in=…`), thêm dòng vào bảng dưới,
-cập nhật chuỗi paste-ready, và xoá token cũ khỏi danh sách Adjust 1 ở trên.
+Apps trong tài khoản 2 mang tiền tố `[JM]`.
 
 ### Paste-ready (App tokens field — Adjust 2)
 
 ```
-(trống — chưa chuyển app nào)
+6sai96ci7s3k,irohkt8pb4sg,90klmn4mc740,ag2tjfsq2r5s
 ```
 
 ### Token → App
 
 | App | Adjust app_token | Ngày chuyển |
 |---|---|---|
-| _(chưa có)_ | | |
+| [JM] AI Chatbot Assistant | `6sai96ci7s3k` | 2026-09-09 |
+| [JM] ChartPilot: AI Chart Analyst | `irohkt8pb4sg` | 2026-09-09 |
+| [JM] PlantSmart - AI Identifier | `90klmn4mc740` | 2026-09-09 |
+| [JM] Video Downloader & Player HD | `ag2tjfsq2r5s` | 2026-09-09 |
+
+<!-- 4 token Adjust 2 ghi nhận 2026-09-09 từ Adjust dashboard (Apps list). -->
+
+> ⚠ **Chưa xoá token nào khỏi Adjust 1** (quyết định 2026-09-17: giữ đủ 13 token
+> Adjust 1 làm list hiện hành). Ba app hiện có mặt ở **cả hai** tài khoản với
+> app_token khác nhau:
+>
+> | App | Adjust 1 | Adjust 2 (`[JM]`) |
+> |---|---|---|
+> | PlantSmart - AI Identifier | `lpz0c08fnitc` | `90klmn4mc740` |
+> | ChartPilot: AI Chart Analyst | `ksrar9dg9zi8` | `irohkt8pb4sg` |
+> | Video Downloader & Player HD | `d2khbj9qdgjk` | `ag2tjfsq2r5s` |
+>
+> Từ v0.12.2 extension **gộp** row của cùng một campaign từ 2 account:
+> installs/revenue cộng lại, spend lấy max (không nhân đôi), tooltip pill ghi
+> `Adjust account: Adjust 1 + Adjust 2`. Popup hiện dòng `⇄ N entity có ở ≥2
+> account → gộp` — đó là trạng thái bình thường khi app đang chuyển, không phải
+> lỗi. Khi app đã chuyển hẳn (Adjust 1 hết installs), xoá token cũ khỏi Adjust 1
+> theo mục Migration ở đầu file.

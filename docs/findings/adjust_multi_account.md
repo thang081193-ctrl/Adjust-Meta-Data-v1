@@ -4,9 +4,9 @@ description: How the extension covers apps split across more than one Adjust acc
 type: project
 ---
 
-# Multiple Adjust accounts (v0.10)
+# Multiple Adjust accounts (v0.10, merge rule v0.12.2)
 
-**Date:** 2026-09-01 · **Added in:** v0.10.0 · **Cache schema:** v9
+**Date:** 2026-09-01 · **Added in:** v0.10.0 · **Merge rule:** v0.12.2 (2026-09-18) · **Cache schema:** v12
 
 ## Why
 
@@ -61,21 +61,42 @@ Selecting a single account fetches only that account. **Changing the selection
 force-syncs** — the cached rows belong to the previously selected account, and
 leaving them on screen under a new label would be the worst possible outcome.
 
-## Cross-account dedupe — the ownership rule
+## Cross-account merge — v0.12.2 (supersedes the v0.10 ownership rule)
 
-Two accounts can legitimately report the **same** Meta entity: an Adjust account
-keeps its Meta ad-spend integration (and therefore keeps reporting `cost`) even
-after the app's SDK traffic has moved elsewhere. Summing would double the spend;
-last-one-wins would silently depend on fetch order.
+Two accounts can legitimately report the **same** Meta entity, and — while a
+migration is in flight — **both can carry SDK traffic for it**: the old account
+keeps its Meta ad-spend integration (so it keeps reporting `cost`), the new
+account's app_token ships in a build that rolls out gradually, and for days or
+weeks installs + revenue land on both sides. Verified 2026-09-18: Video
+Downloader is live as `d2khbj9qdgjk` in Adjust 1 (152 installs/day on one
+campaign) and as `[JM] Video Downloader` in Adjust 2 at the same time.
 
-Rule (`dedupeAcrossAccounts` in `src/data-source.js`): keep the row from the
-account that **owns** the app. Ownership shows up as SDK-side signal — only the
-owning account receives installs and revenue; the other mirrors spend with zeros
-beside it. Compared lexicographically: **installs → cohort revenue → realtime
-revenue → cost**, ties keep config order.
+v0.10–v0.12.1 resolved a duplicate by **keeping one row** (the account with
+the most installs). Exact for a clean cut-over, but during a split it silently
+throws away the other account's revenue — up to half the ROAS.
+
+Rule now (`dedupeAcrossAccounts` → `mergeGroup` in `src/data-source.js`):
+
+| field | merge | why |
+|---|---|---|
+| `cost`, `costYesterday`, `costD2` | **max** | spend is one number per Meta ad; every account's integration mirrors the same figure — summing doubles it, max also survives an account with the integration off |
+| `installs`, `cohortAllRevenue`, `revenueToday`, `revenueYesterday`, `revenueD2` | **sum** | an install / revenue event is recorded by exactly one SDK app_token, so accounts never contain each other's events |
+| `roas.d0/d3/d7` | Σ(roas_i × cost_i) ÷ merged cost | Adjust returns ratios, so window revenue is recovered per row first; a row with no cost contributes nothing |
+| `roas.allTime` | Σ cohortAllRevenue ÷ merged cost | |
+| `accountLabel` | `"Adjust 1 + Adjust 2"` | every pill tooltip says the number is a merge |
+| `mergedFrom[]` | per-account raw installs / cost / revenue | diagnostics |
+
+The **primary** row (ids, names, network, currency) is still chosen by the old
+ownership score (installs → cohort revenue → realtime revenue → cost), so
+matching is unchanged — only the arithmetic. Same-network only (see `mergeKey`).
+
+`mergeStats { merged, split, splitSamples }` is written to the cache; the popup
+renders it under the per-account lines (`⇄ N entity có ở ≥2 account → gộp · M
+đang chia traffic`), and the worker logs it. `split > 0` is the normal state
+of a migrating app, not an error.
 
 The key space deliberately mirrors how the injectors index rows, so the only
-rows collapsed are ones that would have collided downstream anyway:
+rows collapsed here are ones that would have collided downstream anyway:
 
 | level | key |
 |---|---|
@@ -85,6 +106,20 @@ rows collapsed are ones that would have collided downstream anyway:
 
 Same-named ads in *different* campaigns keep different keys and both survive —
 the existing composite/id index + ambiguity machinery handles them as before.
+
+### What a STALE worker does to this
+
+The merge runs in the service worker. Chrome replaces the worker only on an
+explicit extension Reload, so after a `git pull` the injectors (re-read from
+disk per injection) can be v0.12.x while the worker is still an older build
+that never merged. The injectors then receive both accounts' rows: campaign
+level indexes last-write-wins (the *second* account's cohort ROAS shows — 0%
+for a `[JM]` twin with no cohort revenue) and `bumpToday` **sums** D-1/D-2
+spend across the twins (doubled denominator). This is exactly what was
+observed 2026-09-18 on the LPT30 Video Downloader campaigns. Since v0.12.2
+every injector refuses a cache whose `schemaVersion` isn't its own and the
+popup refuses to sync through a worker whose `GET_BUILD` doesn't match —
+see [debug_trap_stale_service_worker.md](debug_trap_stale_service_worker.md).
 
 ## What the user can see
 
