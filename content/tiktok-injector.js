@@ -41,7 +41,12 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.7.0-adjust-yday-spend';
+  const INJECTOR_VERSION = 'v0.7.5-perf';
+  // Cache schema this injector was written against. MUST equal
+  // CACHE_SCHEMA_VERSION in background.js — bump both together. Used as the
+  // stale-service-worker tripwire in loadData().
+  const EXPECTED_CACHE_SCHEMA = 12;
+
   // Styled prefix so it's findable in TikTok's verbose console — filter by
   // "AOX-TT" or "Adjust Overlay" to surface every log this injector emits.
   console.log(
@@ -294,13 +299,34 @@
     if (loadInFlight) return;
     loadInFlight = true;
     try {
-      const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
+      // channel: the worker filters to TikTok rows before the payload is
+      // structured-cloned into this tab (v0.12.5). The local filter below stays
+      // so an older worker that ignores `channel` is still correct, just slower.
+      const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED', channel: 'tiktok' });
       if (cached?.error) {
         showBanner(`Data load error: ${cached.error}`, 'error');
         return;
       }
       if (!cached) {
         showBanner('No Adjust data yet. Click extension icon → Sync.', 'warn');
+        return;
+      }
+      // Stale-worker tripwire (v0.12.2). The cache carries the schema of the
+      // service worker that wrote it. A mismatch means Chrome is still running
+      // a previous build's worker (it only reloads on an explicit extension
+      // Reload, while this script is re-read from disk on every injection) —
+      // its rows are shaped for a different pipeline. Observed 2026-09-18: a
+      // pre-merge worker leaves cross-account duplicates in, which this build
+      // would index last-write-wins (wrong account's cohort ROAS) and sum in
+      // bumpToday (doubled D-1/D-2 spend). Refuse to decorate: a pill showing
+      // the wrong account's number looks healthier than no pill at all.
+      if (cached.schemaVersion !== EXPECTED_CACHE_SCHEMA) {
+        showBanner(
+          `⚠ Service worker đang chạy build cũ (cache schema v${cached.schemaVersion ?? '?'}, ` +
+          `injector ${INJECTOR_VERSION} cần v${EXPECTED_CACHE_SCHEMA}). ` +
+          'Vào chrome://extensions → bấm Reload ở card extension → mở popup → Force refresh.',
+          'error'
+        );
         return;
       }
 
@@ -1961,6 +1987,17 @@
   // permanently dead (pills stop following scroll) and impossible to revive
   // without risking a double-schedule. 0 means "no frame scheduled".
   let rafHandle = 0;
+  // Frames of "nothing moved" before the loop parks itself (v0.12.5). Before
+  // this it re-armed unconditionally for the life of the tab: a
+  // getBoundingClientRect on every pill cell every frame — a forced
+  // style+layout flush 60x/s on a page TikTok is already laying out — while
+  // nothing was moving. ~45 frames is about 0.75 s at 60 Hz: long enough to
+  // ride out a fling-scroll's coast, short enough that an idle tab stops
+  // immediately. Everything that can move a row re-arms it: scroll/resize, any
+  // decorate pass (decorateCandidate -> ensureRepositionLoop) and tab re-show.
+  const RAF_IDLE_FRAMES = 45;
+  let idleFrames = 0;
+  let rafParked = false;
   const lastPositioned = new WeakMap(); // cell → {left, top, hidden}
 
   // Cells with at least one live pill. cellToPill is a SUPERSET of the two
@@ -1987,6 +2024,7 @@
   function repositionLoopTick() {
     rafHandle = 0;
     if (!hasLivePills()) return;
+    let moved = 0;
 
     for (const cell of livePillCells()) {
       const pill = cellToPill.get(cell);
@@ -2007,6 +2045,7 @@
       if (prev && prev.top === top && prev.hidden === offscreen && prev.cellRight === r.right) {
         continue;
       }
+      moved++;
       if (pill) {
         positionPillToCell(cell, pill);
       } else {
@@ -2027,6 +2066,12 @@
       if (d2Pill) positionD2PillToCell(cell, yestPill || todayPill || pill, d2Pill);
     }
 
+    if (moved > 0) idleFrames = 0; else idleFrames++;
+    if (idleFrames >= RAF_IDLE_FRAMES) {
+      idleFrames = 0;
+      rafParked = true;
+      return;
+    }
     if (hasLivePills()) {
       rafHandle = requestAnimationFrame(repositionLoopTick);
     }
@@ -2034,8 +2079,19 @@
 
   function ensureRepositionLoop() {
     if (rafHandle || !hasLivePills()) return;
+    rafParked = false;
+    idleFrames = 0;
     rafHandle = requestAnimationFrame(repositionLoopTick);
   }
+
+  // Scroll/resize move rows without necessarily mutating the DOM, and a parked
+  // loop must be woken for pills to keep following. Passive + capture: TikTok
+  // scrolls an inner pane, not the window.
+  const aoxOnViewportChange = () => {
+    if (rafParked || !rafHandle) ensureRepositionLoop();
+  };
+  document.addEventListener('scroll', aoxOnViewportChange, { capture: true, passive: true });
+  window.addEventListener('resize', aoxOnViewportChange, { passive: true });
 
   // Resolve a row at a specific level. Strategy chain:
   //   1. Exact name lookup. If unique → return.
@@ -2189,9 +2245,23 @@
   // click. Position persists to localStorage so the user keeps it where they
   // moved it. showBanner() only updates content + status color; the DOM and
   // event wiring is built once on first call.
+  // Idempotent since v0.12.5. WHY THIS MATTERS FAR MORE THAN IT LOOKS:
+  // decorateAllVisibleRows() ends by calling showBanner(), and
+  // `panel.textContent = text` destroys the old text node and inserts a new
+  // one — a childList mutation inside the very subtree the body
+  // MutationObserver watches. So every decorate pass scheduled the next one,
+  // forever: a self-feeding loop of full-DOM walks + getBoundingClientRect
+  // storms at 5 passes/second on every open ads tab, idle or not. That is the
+  // "extension nặng, lag cả Chrome" report (2026-09-22). The observer now has
+  // an own-node cutout (mutationIsOurs) as the real fix; this early-return is
+  // the cheap second line of defence — and it also stops the banner from
+  // re-rendering on passes where nothing about it changed.
   function showBanner(text, level) {
     let banner = document.getElementById('adjust-overlay-banner');
     if (!banner) banner = createBanner();
+    if (banner._aoxText === text && banner._aoxLevel === level) return;
+    banner._aoxText = text;
+    banner._aoxLevel = level;
     banner.classList.remove('adjust-banner-ok', 'adjust-banner-warn', 'adjust-banner-error');
     banner.classList.add(`adjust-banner-${level}`);
     const panel = banner.querySelector('.adjust-banner-panel');
@@ -2505,17 +2575,55 @@
     return removed;
   }
 
+  let decoratePending = false;
+
   function scheduleDecorate() {
-    if (decorateTimer) return;
+    if (decorateTimer || decoratePending) return;
     decorateTimer = setTimeout(() => {
       decorateTimer = null;
-      decorateAllVisibleRows();
-    }, 200);
+      decoratePending = true;
+      // Run the pass in idle time (v0.12.5) — a decorate walks the DOM and
+      // reads geometry, so running it inline during the host app's own layout
+      // burst is what made the extension feel heavy. The timeout keeps it
+      // bounded: a page that never idles still decorates within 400 ms.
+      const run = () => { decoratePending = false; decorateAllVisibleRows(); };
+      if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(run, { timeout: 400 });
+      } else {
+        run();
+      }
+    }, 300);
+  }
+
+  // Is this mutation one WE caused? Our own pills and banner live inside the
+  // observed subtree, so appending a pill or rewriting the banner text fires
+  // mutations that used to schedule yet another decorate pass — a loop that
+  // never settled (see showBanner's note). This is the cutout.
+  function aoxIsOwnElement(node) {
+    return node.nodeType === 1 && node.classList
+      && (node.classList.contains('adjust-pill') || node.id === 'adjust-overlay-banner');
+  }
+
+  function aoxMutationIsOurs(rec) {
+    const t = rec.target;
+    const host = t && (t.nodeType === 1 ? t : t.parentElement);
+    if (host && host.closest && host.closest('.adjust-pill, #adjust-overlay-banner')) return true;
+    if (rec.type !== 'childList') return false;
+    if (rec.addedNodes.length === 0 && rec.removedNodes.length === 0) return false;
+    for (const node of rec.addedNodes) if (!aoxIsOwnElement(node)) return false;
+    for (const node of rec.removedNodes) if (!aoxIsOwnElement(node)) return false;
+    return true;
   }
 
   function ensureObserving() {
     if (bodyObserver) return;
-    bodyObserver = new MutationObserver(() => scheduleDecorate());
+    bodyObserver = new MutationObserver((records) => {
+      for (const rec of records) {
+        if (aoxMutationIsOurs(rec)) continue;
+        scheduleDecorate();
+        return;
+      }
+    });
     bodyObserver.observe(document.body, { childList: true, subtree: true });
   }
 

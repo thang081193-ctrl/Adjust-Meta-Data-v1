@@ -42,7 +42,12 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.12.0-adjust-yday-spend';
+  const INJECTOR_VERSION = 'v0.12.5-perf';
+  // Cache schema this injector was written against. MUST equal
+  // CACHE_SCHEMA_VERSION in background.js — bump both together. Used as the
+  // stale-service-worker tripwire in loadData().
+  const EXPECTED_CACHE_SCHEMA = 12;
+
   console.log(`[Adjust Overlay] meta-injector loaded ${INJECTOR_VERSION}`);
 
   // ---- Embedded copy of matcher logic (content scripts can't easily import modules) ----
@@ -332,13 +337,34 @@
   // ---- Sync data from background ----
   async function loadData() {
     try {
-      const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
+      // channel: the worker filters to Meta rows before the payload is
+      // structured-cloned into this tab (v0.12.5). The local filter below stays
+      // so an older worker that ignores `channel` is still correct, just slower.
+      const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED', channel: 'meta' });
       if (cached?.error) {
         showBanner(`Data load error: ${cached.error}`, 'error');
         return;
       }
       if (!cached) {
         showBanner('No Adjust data yet. Click extension icon → Sync.', 'warn');
+        return;
+      }
+      // Stale-worker tripwire (v0.12.2). The cache carries the schema of the
+      // service worker that wrote it. A mismatch means Chrome is still running
+      // a previous build's worker (it only reloads on an explicit extension
+      // Reload, while this script is re-read from disk on every injection) —
+      // its rows are shaped for a different pipeline. Observed 2026-09-18: a
+      // pre-merge worker leaves cross-account duplicates in, which this build
+      // would index last-write-wins (wrong account's cohort ROAS) and sum in
+      // bumpToday (doubled D-1/D-2 spend). Refuse to decorate: a pill showing
+      // the wrong account's number looks healthier than no pill at all.
+      if (cached.schemaVersion !== EXPECTED_CACHE_SCHEMA) {
+        showBanner(
+          `⚠ Service worker đang chạy build cũ (cache schema v${cached.schemaVersion ?? '?'}, ` +
+          `injector ${INJECTOR_VERSION} cần v${EXPECTED_CACHE_SCHEMA}). ` +
+          'Vào chrome://extensions → bấm Reload ở card extension → mở popup → Force refresh.',
+          'error'
+        );
         return;
       }
 
@@ -2448,12 +2474,24 @@
   }
 
   // Debounced decoration to avoid bursty work during rapid scroll.
+  let decoratePending = false;
+
   function scheduleDecorate() {
-    if (decorateTimer) return;
+    if (decorateTimer || decoratePending) return;
     decorateTimer = setTimeout(() => {
       decorateTimer = null;
-      decorateAllVisibleRows();
-    }, 200);
+      decoratePending = true;
+      // Run the pass in idle time (v0.12.5) — a decorate walks the DOM and
+      // reads geometry, so running it inline during the host app's own layout
+      // burst is what made the extension feel heavy. The timeout keeps it
+      // bounded: a page that never idles still decorates within 400 ms.
+      const run = () => { decoratePending = false; decorateAllVisibleRows(); };
+      if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(run, { timeout: 400 });
+      } else {
+        run();
+      }
+    }, 300);
   }
 
   function classifyForColor(roas) {
@@ -2495,9 +2533,23 @@
   // click. Position persists to localStorage so the user keeps it where they
   // moved it. showBanner() only updates content + status color; the DOM and
   // event wiring is built once on first call.
+  // Idempotent since v0.12.5. WHY THIS MATTERS FAR MORE THAN IT LOOKS:
+  // decorateAllVisibleRows() ends by calling showBanner(), and
+  // `panel.textContent = text` destroys the old text node and inserts a new
+  // one — a childList mutation inside the very subtree the body
+  // MutationObserver watches. So every decorate pass scheduled the next one,
+  // forever: a self-feeding loop of full-DOM walks + getBoundingClientRect
+  // storms at 5 passes/second on every open ads tab, idle or not. That is the
+  // "extension nặng, lag cả Chrome" report (2026-09-22). The observer now has
+  // an own-node cutout (mutationIsOurs) as the real fix; this early-return is
+  // the cheap second line of defence — and it also stops the banner from
+  // re-rendering on passes where nothing about it changed.
   function showBanner(text, level) {
     let banner = document.getElementById('adjust-overlay-banner');
     if (!banner) banner = createBanner();
+    if (banner._aoxText === text && banner._aoxLevel === level) return;
+    banner._aoxText = text;
+    banner._aoxLevel = level;
     banner.classList.remove('adjust-banner-ok', 'adjust-banner-warn', 'adjust-banner-error');
     banner.classList.add(`adjust-banner-${level}`);
     const panel = banner.querySelector('.adjust-banner-panel');
@@ -2642,14 +2694,34 @@
   // ---- Observer ----
   // Watch the whole body subtree. SPA virtualizes the campaign list so rows
   // come and go on every scroll; debouncing absorbs the burst.
+  // Is this mutation one WE caused? Our own pills and banner live inside the
+  // observed subtree, so appending a pill or rewriting the banner text fires
+  // mutations that used to schedule yet another decorate pass — a loop that
+  // never settled (see showBanner's note). This is the cutout.
+  function aoxIsOwnElement(node) {
+    return node.nodeType === 1 && node.classList
+      && (node.classList.contains('adjust-pill') || node.id === 'adjust-overlay-banner');
+  }
+
+  function aoxMutationIsOurs(rec) {
+    const t = rec.target;
+    const host = t && (t.nodeType === 1 ? t : t.parentElement);
+    if (host && host.closest && host.closest('.adjust-pill, #adjust-overlay-banner')) return true;
+    if (rec.type !== 'childList') return false;
+    if (rec.addedNodes.length === 0 && rec.removedNodes.length === 0) return false;
+    for (const node of rec.addedNodes) if (!aoxIsOwnElement(node)) return false;
+    for (const node of rec.removedNodes) if (!aoxIsOwnElement(node)) return false;
+    return true;
+  }
+
   function ensureObserving() {
     if (bodyObserver) return;
     bodyObserver = new MutationObserver((mutations) => {
       for (const m of mutations) {
-        if (m.addedNodes.length > 0 || m.removedNodes.length > 0) {
-          scheduleDecorate();
-          return;
-        }
+        if (m.addedNodes.length === 0 && m.removedNodes.length === 0) continue;
+        if (aoxMutationIsOurs(m)) continue;
+        scheduleDecorate();
+        return;
       }
     });
     bodyObserver.observe(document.body, { childList: true, subtree: true });

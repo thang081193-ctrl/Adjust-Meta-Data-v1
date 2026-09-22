@@ -2,6 +2,7 @@
 // Adapter pattern. Today: pulls direct from the Adjust API.
 // Later (when JM-AM exits soak): swap to JmAmDataSource without touching anything else.
 //
+// v0.12.2 — cross-account duplicates are MERGED (see dedupeAcrossAccounts).
 // v0.10 — MULTI-ACCOUNT. The user's apps live in more than one Adjust account
 // (some migrated from an older account, some created in the newer one). An
 // Adjust API token can only see the apps of the account that minted it, so one
@@ -108,9 +109,17 @@ export class AdjustDirectDataSource {
     const { rows: campaigns, stats } = dedupeAcrossAccounts(allRows);
     this.lastMergeStats = stats;
     if (stats.dropped) {
+      // checklog: cross-account merge. `split` > 0 means an app's traffic is
+      // genuinely divided between accounts right now (both sides carry
+      // installs/revenue) — the case that v0.10–v0.12.1's pick-one rule
+      // silently undercounted. See docs/findings/adjust_multi_account.md.
       console.info(
         `[Adjust Overlay] merged ${this.accounts.length} Adjust accounts — ` +
-          `${stats.dropped} duplicate row(s) resolved to the owning account.`
+          `${stats.merged} entity(ies) reported by >1 account collapsed ` +
+          `(${stats.dropped} row(s) folded; spend=max, installs/revenue=sum)` +
+          (stats.split
+            ? `; ${stats.split} with SDK traffic on BOTH sides, e.g. ${stats.splitSamples.join(' | ')}`
+            : '')
       );
     }
 
@@ -232,24 +241,46 @@ export class AdjustDirectDataSource {
 
   describe() {
     const base = `Adjust Reporting v2 · ${this.selectionLabel || 'Adjust'}`;
-    const dropped = this.lastMergeStats?.dropped;
-    return dropped ? `${base} · ${dropped} dup row(s) merged` : base;
+    const merged = this.lastMergeStats?.merged;
+    return merged ? `${base} · ${merged} entity gộp từ 2 acc` : base;
   }
 }
 
 // ---- Cross-account merge -----------------------------------------------
 //
 // Two Adjust accounts can legitimately report the SAME Meta entity. The user
-// migrated apps between accounts, and an Adjust account keeps its Meta ad-spend
-// integration (and therefore keeps reporting `cost`) even after the app's SDK
-// traffic has moved elsewhere. Summing those rows would double the spend;
-// last-one-wins would silently depend on fetch order.
+// migrates apps between accounts app-by-app: the old account keeps its Meta
+// ad-spend integration (so it keeps reporting `cost`), and — while a build
+// carrying the new account's app_token rolls out — BOTH accounts receive SDK
+// traffic (installs + revenue) for the same campaign. v0.10–v0.12.1 resolved a
+// duplicate by keeping ONLY the row from the account that "owned" the app
+// (most installs). That is exact for a clean cut-over but silently drops the
+// other account's revenue during a split — which is the state a migrating
+// portfolio is in most of the time (observed 2026-09-18: Video Downloader
+// lives as `d2khbj9qdgjk` in Adjust 1 AND `[JM] …` in Adjust 2, both live).
 //
-// Rule: for a duplicated entity, keep the row from the account that OWNS the
-// app. Ownership shows up as SDK-side signal — only the owning account receives
-// installs and revenue; a non-owning account mirrors spend with zeros next to
-// it. Compared lexicographically: installs → cohort revenue → realtime revenue
-// → cost. Ties keep the earlier account (config order), which is stable.
+// v0.12.2 rule — MERGE, don't pick:
+//   cost / costYesterday / costD2      → MAX across accounts. Spend is one
+//       number per Meta ad; every account's integration mirrors that same
+//       figure, so summing doubles it and taking one loses nothing. MAX also
+//       survives an account whose spend integration is off (0 / null).
+//   installs / cohortAllRevenue /
+//   revenueToday / revenueYesterday /
+//   revenueD2                          → SUM. An install or a revenue event is
+//       recorded by exactly one SDK app_token, so the accounts never contain
+//       each other's events; the sum is the whole picture.
+//   roas.d0 / d3 / d7                  → Σ(roas_i × cost_i) ÷ merged cost.
+//       Adjust returns ratios, not window revenue, so each row's window
+//       revenue is recovered first. A row with no cost contributes nothing
+//       (its window revenue is unknowable) — only undercounts in the rare
+//       SDK-only / no-spend-integration case.
+//   roas.allTime                       → Σ cohortAllRevenue ÷ merged cost.
+//   accountLabel                       → "Adjust 1 + Adjust 2", so every pill
+//       tooltip says the number is a merge; `mergedFrom[]` keeps each side's
+//       raw installs / cost / revenue for diagnostics.
+// The PRIMARY row (ids, names, network, currency) is the one with the strongest
+// SDK signal — the same ownershipScore as before — so nothing about matching
+// changed, only the arithmetic. Same-network only: see mergeKey.
 //
 // Key space deliberately mirrors how the injectors index rows, so the only
 // rows collapsed here are ones that WOULD have collided downstream:
@@ -257,29 +288,118 @@ export class AdjustDirectDataSource {
 //              keys campaigns by name, so same-name rows collide there anyway)
 //   adset/ad → the Meta id when present, else campaignId + canonical name
 function dedupeAcrossAccounts(rows) {
-  const byKey = new Map();
+  const groups = new Map(); // mergeKey -> rows[]
   const order = [];
-  let dropped = 0;
-
   for (const r of rows) {
     const k = mergeKey(r);
-    const prev = byKey.get(k);
-    if (!prev) {
-      byKey.set(k, r);
+    const g = groups.get(k);
+    if (g) g.push(r);
+    else {
+      groups.set(k, [r]);
       order.push(k);
-      continue;
     }
-    dropped++;
-    if (ownershipScore(r) > ownershipScore(prev)) byKey.set(k, r);
   }
 
+  let dropped = 0;
+  let merged = 0;
+  let split = 0;
+  const splitSamples = [];
+  const out = order.map((k) => {
+    const g = groups.get(k);
+    if (g.length === 1) return g[0];
+    dropped += g.length - 1;
+    merged += 1;
+    const res = mergeGroup(g);
+    if (res.split) {
+      split += 1;
+      if (splitSamples.length < 5) splitSamples.push(res.row.campaignName || k);
+    }
+    return res.row;
+  });
+
   return {
-    rows: order.map((k) => byKey.get(k)),
-    stats: { dropped, kept: order.length },
+    rows: out,
+    stats: { dropped, kept: order.length, merged, split, splitSamples },
   };
 }
 
-// The key is NETWORK-SCOPED: this dedupe exists to collapse the same entity
+// Merge one entity's rows from several accounts into a single row. `split` is
+// true when more than one account carries SDK-side signal (installs/revenue)
+// — i.e. the app's traffic is genuinely divided between accounts, the case the
+// old pick-one rule got wrong.
+function mergeGroup(group) {
+  // Stable sort → ties keep config order (Array.prototype.sort is stable).
+  const sorted = [...group].sort((a, b) => ownershipScore(b) - ownershipScore(a));
+  const primary = sorted[0];
+  const hasSignal = (r) =>
+    num(r.installs) > 0 || num(r.cohortAllRevenue) > 0 ||
+    num(r.revenueToday) + num(r.revenueYesterday) + num(r.revenueD2) > 0;
+  const split = group.filter(hasSignal).length > 1;
+
+  const cost = maxOrNull(group.map((r) => r.cost));
+  const cohortAllRevenue = sumOrNull(group.map((r) => r.cohortAllRevenue));
+  const roasWindow = (key) => {
+    let rev = 0;
+    let any = false;
+    for (const r of group) {
+      const ratio = r.roas?.[key];
+      const c = num(r.cost);
+      if (typeof ratio === 'number' && Number.isFinite(ratio) && c > 0) {
+        rev += ratio * c;
+        any = true;
+      }
+    }
+    if (any && cost > 0) return rev / cost;
+    return primary.roas?.[key] ?? null;
+  };
+
+  const labels = [];
+  for (const r of group) {
+    if (r.accountLabel && !labels.includes(r.accountLabel)) labels.push(r.accountLabel);
+  }
+
+  const row = {
+    ...primary,
+    cost,
+    installs: sumOrNull(group.map((r) => r.installs)),
+    cohortAllRevenue,
+    roas: {
+      d0: roasWindow('d0'),
+      d3: roasWindow('d3'),
+      d7: roasWindow('d7'),
+      allTime:
+        cost != null && cost > 0 && cohortAllRevenue != null
+          ? cohortAllRevenue / cost
+          : (primary.roas?.allTime ?? null),
+    },
+    // revenueToday's contract is "number, 0 when no today row" (never null).
+    revenueToday: sumOrNull(group.map((r) => r.revenueToday)) ?? 0,
+    // The D-1 / D-2 halves keep their null-means-not-fetched contract: null
+    // only when EVERY account's fetch of that half failed.
+    revenueYesterday: sumOrNull(group.map((r) => r.revenueYesterday)),
+    costYesterday: maxOrNull(group.map((r) => r.costYesterday)),
+    revenueD2: sumOrNull(group.map((r) => r.revenueD2)),
+    costD2: maxOrNull(group.map((r) => r.costD2)),
+    todayRowExisted: group.some((r) => !!r.todayRowExisted),
+    adjustCurrency: group.map((r) => r.adjustCurrency).find(Boolean) || null,
+    accountLabel: labels.join(' + ') || primary.accountLabel,
+    mergedFrom: group.map((r) => ({
+      accountId: r.accountId,
+      accountLabel: r.accountLabel,
+      installs: r.installs ?? null,
+      cost: r.cost ?? null,
+      cohortAllRevenue: r.cohortAllRevenue ?? null,
+      revenueToday: r.revenueToday ?? null,
+      revenueYesterday: r.revenueYesterday ?? null,
+      costYesterday: r.costYesterday ?? null,
+      revenueD2: r.revenueD2 ?? null,
+      costD2: r.costD2 ?? null,
+    })),
+  };
+  return { row, split };
+}
+
+// The key is NETWORK-SCOPED: this merge exists to collapse the same entity
 // reported by two ACCOUNTS, and one entity lives on exactly one ad network —
 // so two rows on different channels are never the same entity, however equal
 // their names are. Without the network prefix, the user's cross-network naming
@@ -306,7 +426,9 @@ function mergeKey(r) {
 // Lexicographic ownership score packed into one comparable number. Each tier
 // dominates the next by construction (installs are weighted far above any
 // plausible revenue figure), so a row with even a single install always beats a
-// spend-only mirror row from the account the app moved away from.
+// spend-only mirror row from the account the app moved away from. Since v0.12.2
+// it only chooses the PRIMARY row (ids / names / currency) of a merge — the
+// numbers themselves are combined in mergeGroup.
 function ownershipScore(r) {
   const installs = num(r.installs);
   const cohortRev = num(r.cohortAllRevenue);
@@ -317,6 +439,24 @@ function ownershipScore(r) {
 
 function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+// null-aware reducers: null in → ignored; all null → null (keeps the
+// "not fetched" contract of the realtime halves intact through a merge).
+function sumOrNull(vals) {
+  let s = null;
+  for (const v of vals) {
+    if (typeof v === 'number' && Number.isFinite(v)) s = (s ?? 0) + v;
+  }
+  return s;
+}
+
+function maxOrNull(vals) {
+  let m = null;
+  for (const v of vals) {
+    if (typeof v === 'number' && Number.isFinite(v)) m = m == null ? v : Math.max(m, v);
+  }
+  return m;
 }
 
 // ---- Realtime merge (within one account) -------------------------------
@@ -560,4 +700,4 @@ export async function createDataSource() {
 
 // Exported for the offline unit test in docs/diagnostics/ — not used by the
 // extension at runtime.
-export const __test__ = { dedupeAcrossAccounts, ownershipScore, mergeRealtimeInto, mergeKey };
+export const __test__ = { dedupeAcrossAccounts, mergeGroup, ownershipScore, mergeRealtimeInto, mergeKey };

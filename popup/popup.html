@@ -6,6 +6,7 @@
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; width: 360px; margin: 0; padding: 12px; }
   h3 { margin: 0 0 8px; font-size: 14px; }
+  .ver { font-size: 10px; font-weight: 500; color: #999; margin-left: 6px; }
   .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
   button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
   button.primary { background: #1877f2; color: #fff; border-color: #1877f2; }
@@ -25,7 +26,9 @@
   .group-hold  { background: #f5f5f5; color: #424242; }
   .group-noisy { background: #fff3e0; color: #6a3a00; }
 
-  .err { color: #b00020; font-size: 12px; margin: 6px 0; }
+  /* pre-line so the multi-line build-mismatch message from checkWorkerBuild()
+     keeps its line breaks instead of collapsing into one wall of text. */
+  .err { color: #b00020; font-size: 12px; margin: 6px 0; white-space: pre-line; line-height: 1.5; }
   .warnbox { color: #6a3a00; background: #fff3e0; border-radius: 4px; padding: 6px 8px; font-size: 11px; margin: 6px 0; white-space: pre-line; line-height: 1.5; }
   details { margin-top: 8px; }
   textarea { width: 100%; height: 60px; font-family: ui-monospace, monospace; font-size: 11px; }
@@ -38,11 +41,16 @@
   .thresh-table input { width: 48px; padding: 2px 4px; font-size: 11px; }
   .thresh-hint { font-size: 11px; color: #777; margin: 4px 0 8px; }
 
+  /* Timezone box sits at the TOP of the popup (v0.12.1) — it is the setting
+     the user flips most often, so it must not hide behind Settings. Both
+     fields self-save on change (see persistTimezone in popup.js). */
   .tz-box { border: 1px solid #d0d7de; border-radius: 6px; padding: 8px; margin: 8px 0; background: #fafbfc; }
-  .tz-head { font-size: 12px; font-weight: 600; color: #444; margin-bottom: 6px; }
-  .tz-field { margin: 8px 0; }
-  .tz-field:first-of-type { margin-top: 0; }
-  .tz-tag { display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 3px; margin-bottom: 3px; letter-spacing: .2px; }
+  .tz-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; font-weight: 600; color: #444; margin-bottom: 4px; }
+  .tz-auto { font-size: 10px; font-weight: 500; color: #888; }
+  .tz-field { margin: 6px 0 0; }
+  .tz-line { display: flex; align-items: center; gap: 6px; }
+  .tz-line input, .tz-line select { flex: 1; min-width: 0; font-size: 12px; padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; background: #fff; box-sizing: border-box; }
+  .tz-tag { flex: 0 0 auto; display: inline-block; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; letter-spacing: .2px; white-space: nowrap; cursor: pointer; }
   .tz-tag-adjust { background: #e7f0ff; color: #1851a6; }
   .tz-tag-meta { background: #ffe9d6; color: #9a4a00; }
   .tz-hint { font-size: 10px; color: #888; margin-top: 3px; line-height: 1.4; }
@@ -85,7 +93,7 @@
 </style>
 </head>
 <body>
-  <h3>Adjust ROAS Overlay</h3>
+  <h3>Adjust ROAS Overlay <span class="ver" id="ver"></span></h3>
 
   <div class="status" id="status">Loading…</div>
 
@@ -94,6 +102,37 @@
     <select id="activeAccount" title="Chọn Adjust account muốn hiện data. 'Cả 2' kéo song song rồi gộp."></select>
   </div>
   <div class="acct-status-list" id="acctStatus"></div>
+
+  <div class="tz-box">
+    <div class="tz-head">⏱ Timezone <span class="tz-auto">đổi là tự lưu</span></div>
+
+    <div class="tz-field">
+      <div class="tz-line">
+        <label class="tz-tag tz-tag-adjust" for="utcOffset"
+               title="Adjust reporting offset — utc_offset gửi lên mọi report Adjust (điều chỉnh REVENUE).">Adjust offset · REVENUE</label>
+        <input id="utcOffset" type="text" list="utcOffsetList" value="+07:00"
+               placeholder="Search city or offset, e.g. Bangkok or +07:00"
+               title="Adjust reporting offset. Gõ tên thành phố hoặc ±HH:MM; giá trị lưu luôn chuẩn hoá về ±HH:MM. Đổi là tự lưu + force-sync." />
+        <datalist id="utcOffsetList"></datalist>
+      </div>
+      <div class="tz-hint">Mốc giờ Adjust kéo doanh thu. Muốn ROAS khớp tuyệt đối: set theo giờ ad-account (vd LA = -08:00) và để Meta = "Same". Đổi → tự force-sync.</div>
+    </div>
+
+    <div class="tz-field">
+      <div class="tz-line">
+        <label class="tz-tag tz-tag-meta" for="accountTimezone"
+               title="Meta ad-account timezone — chỉ dùng để ước lượng SPEND về cửa sổ Adjust.">Meta ad-acct tz · SPEND</label>
+        <select id="accountTimezone"
+                title="Meta ad-account timezone (spend estimate). Đổi là tự lưu, pill tự cập nhật — không cần sync.">
+          <option value="">Same as Adjust offset (no estimate)</option>
+          <option value="America/Los_Angeles">America/Los_Angeles (LA, PT)</option>
+          <option value="America/New_York">America/New_York (ET)</option>
+          <option value="UTC">UTC</option>
+        </select>
+      </div>
+      <div class="tz-hint">Giữ Adjust ở +07:00 mà ad-account chạy giờ khác: chọn ở đây, extension ước lượng spend Meta về cửa sổ BKT (revenue giữ nguyên). Để "Same" nếu đã chỉnh offset ở trên. Đổi → pill tự cập nhật.</div>
+    </div>
+  </div>
 
   <div class="periods" id="periods" role="group" aria-label="Date period">
     <button data-period="yesterday">Yesterday</button>
@@ -160,33 +199,6 @@
         list app token riêng của account đó. Chọn account muốn xem ở dropdown
         "Adjust" phía trên; chọn "Cả 2 (gộp)" để kéo song song cả hai rồi gộp lại.
         Đổi lựa chọn sẽ tự force-sync.
-      </div>
-    </div>
-    <div class="tz-box">
-      <div class="tz-head">⏱ Timezone alignment</div>
-
-      <div class="tz-field">
-        <span class="tz-tag tz-tag-adjust">Adjust · điều chỉnh REVENUE</span><br>
-        <label>UTC offset (Adjust reporting timezone):<br>
-          <input id="utcOffset" type="text" list="utcOffsetList" value="+07:00" style="width:100%"
-                 placeholder="Search city or offset, e.g. Bangkok or +07:00"
-                 title="Adjust reporting offset. Type a city name or the ±HH:MM offset; the stored value is always normalized to ±HH:MM." />
-          <datalist id="utcOffsetList"></datalist>
-        </label>
-        <div class="tz-hint">Mốc giờ Adjust kéo doanh thu. Muốn ROAS khớp tuyệt đối: set thẳng theo giờ ad-account (vd LA = -08:00) và để dropdown dưới = "Same".</div>
-      </div>
-
-      <div class="tz-field">
-        <span class="tz-tag tz-tag-meta">Meta · điều chỉnh SPEND</span><br>
-        <label>Meta ad-account timezone (spend estimate):<br>
-          <select id="accountTimezone" style="width:100%">
-            <option value="">Same as UTC offset (no estimate)</option>
-            <option value="America/Los_Angeles">America/Los_Angeles (LA, PT)</option>
-            <option value="America/New_York">America/New_York (ET)</option>
-            <option value="UTC">UTC</option>
-          </select>
-        </label>
-        <div class="tz-hint">Để khi GIỮ Adjust ở +07:00 mà ad-account chạy giờ khác: chọn ở đây, extension ước lượng spend Meta về cửa sổ BKT (revenue giữ nguyên). Để "Same" nếu đã chỉnh UTC offset ở trên.</div>
       </div>
     </div>
     <div class="row">

@@ -9,6 +9,48 @@ import {
 
 const $ = (id) => document.getElementById(id);
 
+// Build stamp. MUST match WORKER_BUILD in background.js — see the comment there
+// for why a popup and a service worker end up on different builds after a git
+// pull (Chrome re-reads this file on every open; the worker only on Reload).
+const POPUP_BUILD = 'v0.12.5';
+
+// Returns true when the service worker is running the same build as this popup.
+// On mismatch it takes over the error box and the caller must NOT sync: no
+// amount of Force refresh fixes a stale worker, and letting the old worker run
+// would overwrite an accurate diagnosis with plausible-looking wrong numbers
+// (2026-09-18: a v0.9.8 worker under this popup showed the wrong Adjust
+// account's row for a migrated app and doubled D-2 spend — no error anywhere).
+async function checkWorkerBuild() {
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: 'GET_BUILD' });
+  } catch (err) {
+    res = { error: err.message };
+  }
+  if (res && !res.error && res.build === POPUP_BUILD) return true;
+
+  const worker = res?.build || 'cũ hơn v0.12.4 (không trả lời GET_BUILD)';
+  console.warn(
+    `[Adjust Overlay] build mismatch — popup ${POPUP_BUILD}, service worker ${worker}. ` +
+    'Reload extension để service worker nạp code mới.'
+  );
+  $('error').style.display = 'block';
+  // Multi-line message. Every segment is ONE template literal ending in an
+  // explicit \n escape. A single-quoted string CANNOT contain a raw newline,
+  // and the version of this block that did (v0.12.2, 2026-09-18) was a parse
+  // error that killed the WHOLE module: popup stuck on "Loading…" with an
+  // empty Adjust dropdown and no version stamp, because a SyntaxError means
+  // not one line of popup.js ever runs. See
+  // docs/findings/debug_trap_popup_module_parse_error.md.
+  $('error').textContent =
+    `⚠ Service worker đang chạy build ${worker}, còn popup là ${POPUP_BUILD}.\n` +
+    `Chrome chỉ nạp lại service worker khi RELOAD extension — popup và injector thì đọc code mới mỗi lần mở.\n` +
+    `Vào chrome://extensions → bấm Reload ở card extension → mở lại popup → Force refresh.\n` +
+    `Ở trạng thái này số trên pill KHÔNG tin được: worker cũ không gộp 2 Adjust account ` +
+    `(app có ở cả 2 account sẽ hiện row của account sai và spend D-1/D-2 bị nhân đôi).`;
+  return false;
+}
+
 // In-memory mirror of dataSourceConfig.accounts. The account cards are built
 // from this, and every edit writes straight back to storage — there is no
 // separate "Save" for accounts because a half-saved token list is the one state
@@ -26,6 +68,7 @@ async function refreshStatus() {
   }
   renderSyncWarnings(cached.syncWarnings);
   renderAccountStatus(cached.accountsStatus);
+  renderMergeStats(cached.mergeStats);
   const ageMin = Math.round(cached.ageMs / 60000);
   // Cached array now mixes 'campaign'- and 'ad'-level rows. Show counts of
   // each. Decision groups classify ad-level rows since ads are the unit the
@@ -67,6 +110,8 @@ async function doSync(force = false) {
   $('forceSync').disabled = true;
   $('error').style.display = 'none';
   try {
+    // Refuse to sync through a stale worker — see checkWorkerBuild.
+    if (!(await checkWorkerBuild())) return;
     const result = await chrome.runtime.sendMessage({
       type: force ? 'FORCE_SYNC' : 'SYNC',
     });
@@ -167,6 +212,8 @@ async function loadCfg(prefetched) {
 
 // Saves the SHARED settings only. Accounts have their own write path
 // (persistAccounts) so a token edit is never lost by forgetting this button.
+// The timezone fields (top of popup) also self-save via persistTimezone; this
+// button re-reads the same two DOM elements, so re-saving them here is a no-op.
 async function saveCfg() {
   const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
   const cfg = {
@@ -185,6 +232,38 @@ async function saveCfg() {
   await chrome.storage.local.set({ dataSourceConfig: cfg });
   $('status').textContent = 'Config saved. Click Sync.';
   syncPeriodButtons(cfg.datePeriod);
+}
+
+// The timezone box moved to the top of the popup (v0.12.1), outside the
+// Settings <details>, so it can no longer lean on the Save-config button down
+// there — a change must land in storage the moment it is committed.
+//   utcOffset       : the utc_offset every Adjust report is queried with, so a
+//                     change invalidates every cached row → force-sync.
+//   accountTimezone : only feeds the injectors' Meta spend estimate; all three
+//                     injectors re-read dataSourceConfig on storage change and
+//                     repaint, so a plain save is enough — no refetch.
+async function persistTimezone({ resync }) {
+  const { dataSourceConfig } = await chrome.storage.local.get('dataSourceConfig');
+  const cfg = {
+    ...(dataSourceConfig || {}),
+    kind: 'adjust-direct',
+    utcOffset: parseOffsetInput($('utcOffset').value),
+    accountTimezone: $('accountTimezone').value.trim(),
+  };
+  delete cfg.apiToken;
+  delete cfg.appTokens;
+  await chrome.storage.local.set({ dataSourceConfig: cfg });
+  console.log(
+    `[AOX popup] timezone saved → utcOffset=${cfg.utcOffset} ` +
+    `accountTimezone=${cfg.accountTimezone || '(same)'} resync=${resync}`,
+  );
+  if (resync) {
+    $('status').textContent = `Adjust offset = ${cfg.utcOffset} — đang force-sync…`;
+    doSync(true);
+  } else {
+    $('status').textContent =
+      `Đã lưu Meta timezone (${cfg.accountTimezone || 'Same'}) — pill tự cập nhật.`;
+  }
 }
 
 // ---- Adjust accounts ----
@@ -350,6 +429,24 @@ function renderAccountStatus(statusList) {
     if (!st.ok && st.error) div.title = st.error;
     el.appendChild(div);
   }
+}
+
+// Cross-account merge outcome of the last sync (cache.mergeStats, schema v12+).
+// Rendered under the per-account lines so a merged number is never silent: the
+// user can see how many entities live in >1 account and how many of those are
+// genuinely split (SDK traffic on both sides) right now.
+function renderMergeStats(stats) {
+  const el = $('acctStatus');
+  if (!stats || !stats.merged) return;
+  const div = document.createElement('div');
+  div.className = 'muted';
+  div.textContent =
+    `⇄ ${stats.merged} entity có ở ≥2 account → gộp (revenue/installs cộng, spend lấy max)` +
+    (stats.split
+      ? ` · ${stats.split} đang chia traffic${stats.splitSamples?.length ? ` (vd: ${stats.splitSamples.slice(0, 2).join(' | ')})` : ''}`
+      : '');
+  div.title = 'Xem docs/findings/adjust_multi_account.md — rule gộp v0.12.2.';
+  el.appendChild(div);
 }
 
 // Highlights whichever quick-period button matches the saved value, or none if
@@ -569,9 +666,12 @@ $('addAccount').addEventListener('click', () => {
 // edit (blur or datalist pick). Without this, hand-editing just the sign — e.g.
 // flipping "+07:00 — Bangkok" to "-07:00" — leaves the stale cities showing,
 // even though the saved value is correct. Snapping makes the zone unambiguous.
+// Then persist + force-sync: the box lives at the top, with no Save button.
 $('utcOffset').addEventListener('change', () => {
   $('utcOffset').value = offsetLabelFor($('utcOffset').value);
+  persistTimezone({ resync: true });
 });
+$('accountTimezone').addEventListener('change', () => persistTimezone({ resync: false }));
 $('saveThresholds').addEventListener('click', saveColorThresholds);
 
 for (const btn of $('periods').querySelectorAll('button')) {
@@ -588,10 +688,34 @@ for (const ids of Object.values(PILL_PLATFORMS)) {
 // burst so the popup paints faster on open. Sequential awaits used to add
 // 15-45ms of unnecessary IPC latency across three round trips.
 (async function bootstrap() {
+  // Build stamp in the header so a stale popup is visible at a glance. This is
+  // the popup's OWN constant, not the manifest: the manifest can be re-parsed
+  // (browser restart) while the worker is not, so the two must be compared as
+  // two independent constants (see checkWorkerBuild).
+  $('ver').textContent = POPUP_BUILD;
+  const manifestVer = `v${chrome.runtime.getManifest().version}`;
+  if (manifestVer !== POPUP_BUILD) {
+    console.warn(`[Adjust Overlay] popup ${POPUP_BUILD} but manifest ${manifestVer} — bump both together.`);
+  }
+  // Checklog: one line per popup open. If this is absent from the popup's
+  // devtools console, popup.js did not run at all (module parse error) and
+  // nothing below — including the Adjust dropdown — was ever built.
+  console.info(`[Adjust Overlay] popup ${POPUP_BUILD} booted (manifest ${manifestVer})`);
+  // Handshake first: if the worker is stale, every number below it is suspect.
+  checkWorkerBuild();
   populateUtcOffsetList();
+  // refreshStatus() talks to the service worker. If the worker is dead or
+  // mid-restart, sendMessage REJECTS — and before v0.12.3 that rejection took
+  // the whole bootstrap down with it, leaving the popup on "Loading…" with an
+  // empty Adjust dropdown and no clue why. Catch it here so the account picker
+  // and every settings field still render: a token list the user cannot see is
+  // indistinguishable from a token list that is gone.
   const [{ dataSourceConfig, colorThresholds, pillVisibility }] = await Promise.all([
     chrome.storage.local.get(['dataSourceConfig', 'colorThresholds', 'pillVisibility']),
-    refreshStatus(),
+    refreshStatus().catch((err) => {
+      console.error('[Adjust Overlay] refreshStatus failed —', err);
+      $('status').textContent = `Không đọc được cache từ service worker: ${err.message}`;
+    }),
   ]);
   // Accounts first: renderAccountStatus (already called by refreshStatus) reads
   // `accounts.length`, and loadCfg no longer owns the token fields.
@@ -610,6 +734,19 @@ for (const ids of Object.values(PILL_PLATFORMS)) {
   // Re-render account status now that `accounts` is populated: the call inside
   // refreshStatus ran before migration, so a first-run popup would otherwise
   // show nothing where the per-account lines belong.
-  const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
+  const cached = await chrome.runtime
+    .sendMessage({ type: 'GET_CACHED' })
+    .catch(() => null);
   renderAccountStatus(cached?.accountsStatus);
-})();
+  renderMergeStats(cached?.mergeStats);
+})().catch((err) => {
+  // Last-resort net. A throw past this point used to be silent: the popup just
+  // stopped painting. Surface it in the error box so the next bug of this shape
+  // is one screenshot away from a diagnosis instead of a console dive.
+  console.error('[Adjust Overlay] popup bootstrap failed —', err);
+  const box = document.getElementById('error');
+  if (box) {
+    box.style.display = 'block';
+    box.textContent = `⚠ Popup bootstrap lỗi: ${err.message}\nMở devtools của popup (chuột phải vào popup → Inspect) để xem stack.`;
+  }
+});

@@ -38,7 +38,12 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.12.0-adjust-yday-spend';
+  const INJECTOR_VERSION = 'v0.12.5-perf';
+  // Cache schema this injector was written against. MUST equal
+  // CACHE_SCHEMA_VERSION in background.js — bump both together. Used as the
+  // stale-service-worker tripwire in loadData().
+  const EXPECTED_CACHE_SCHEMA = 12;
+
   console.log(
     `%c[AOX-GG ${INJECTOR_VERSION}]%c google-injector loaded`,
     'background:#188038;color:#fff;padding:2px 6px;border-radius:3px;font-weight:bold',
@@ -194,13 +199,34 @@
     if (loadInFlight) return;
     loadInFlight = true;
     try {
-      const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED' });
+      // channel: the worker filters to Google rows before the payload is
+      // structured-cloned into this tab (v0.12.5). The local filter below
+      // stays as-is so an older worker that ignores `channel` is still correct.
+      const cached = await chrome.runtime.sendMessage({ type: 'GET_CACHED', channel: 'google' });
       if (cached?.error) {
         showBanner(`Data load error: ${cached.error}`, 'error');
         return;
       }
       if (!cached) {
         showBanner('No Adjust data yet. Click extension icon → Sync.', 'warn');
+        return;
+      }
+      // Stale-worker tripwire (v0.12.2). The cache carries the schema of the
+      // service worker that wrote it. A mismatch means Chrome is still running
+      // a previous build's worker (it only reloads on an explicit extension
+      // Reload, while this script is re-read from disk on every injection) —
+      // its rows are shaped for a different pipeline. Observed 2026-09-18: a
+      // pre-merge worker leaves cross-account duplicates in, which this build
+      // would index last-write-wins (wrong account's cohort ROAS) and sum in
+      // bumpToday (doubled D-1/D-2 spend). Refuse to decorate: a pill showing
+      // the wrong account's number looks healthier than no pill at all.
+      if (cached.schemaVersion !== EXPECTED_CACHE_SCHEMA) {
+        showBanner(
+          `⚠ Service worker đang chạy build cũ (cache schema v${cached.schemaVersion ?? '?'}, ` +
+          `injector ${INJECTOR_VERSION} cần v${EXPECTED_CACHE_SCHEMA}). ` +
+          'Vào chrome://extensions → bấm Reload ở card extension → mở popup → Force refresh.',
+          'error'
+        );
         return;
       }
 
@@ -502,16 +528,63 @@
   // the same tick, and each scan is a full leaf walk.
   let candCache = { t: 0, list: [] };
 
+  // ---- Shared leaf snapshot (v0.12.5, perf) ----
+  //
+  // WHY: one decorate pass used to walk the DOM FOUR separate times —
+  // pickNameCandidates and detectGoogleDateInfo over document, locateCostColumn
+  // (twice: headers, then currency cells) and ensureRowYBuckets over the table
+  // scope — each re-running the same tag filter, the same `children.length`
+  // leaf test and the same `textContent` read on every node. Those passes fire
+  // every 200 ms for as long as Google Ads mutates, which on the campaigns view
+  // is continuously. Now ONE walk per pass produces (el, text) pairs and every
+  // scan filters that array; per-scan getBoundingClientRect calls are unchanged,
+  // so the geometry each scan sees is identical to before.
+  let leafSnap = null;        // { t, leaves: [{ el, text }] }
+  let scopedLeafSnap = null;  // { scope, t, leaves }
+
+  function allLeaves() {
+    const now = Date.now();
+    if (leafSnap && now - leafSnap.t < 120) return leafSnap.leaves;
+    const leaves = [];
+    for (const el of document.querySelectorAll('*')) {
+      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
+      if (el.children.length > 0) continue; // leaf only
+      const text = (el.textContent || '').trim();
+      if (!text) continue;
+      leaves.push({ el, text });
+    }
+    leafSnap = { t: now, leaves };
+    return leaves;
+  }
+
+  // Leaves inside a subtree. Node.contains is a native ancestor walk, cheaper
+  // than re-running querySelectorAll('*') over the subtree and re-reading every
+  // textContent — and it reuses the snapshot the document-wide scans already paid for.
+  function scopedLeaves(scope) {
+    const now = Date.now();
+    if (scopedLeafSnap && scopedLeafSnap.scope === scope && now - scopedLeafSnap.t < 120) {
+      return scopedLeafSnap.leaves;
+    }
+    const base = allLeaves();
+    const leaves = (!scope || scope === document.body)
+      ? base
+      : base.filter(l => scope.contains(l.el));
+    scopedLeafSnap = { scope, t: now, leaves };
+    return leaves;
+  }
+
+  function invalidateLeafSnapshots() {
+    leafSnap = null;
+    scopedLeafSnap = null;
+  }
+
   function pickNameCandidates() {
     if (!dataLoaded) return [];
     const now = Date.now();
     if (now - candCache.t < 120) return candCache.list;
 
     const matches = [];
-    for (const el of document.querySelectorAll('*')) {
-      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
-      if (el.children.length > 0) continue; // leaf only
-      const raw = (el.textContent || '').trim();
+    for (const { el, text: raw } of allLeaves()) {
       if (raw.length < 5 || raw.length > 300) continue;
       const k = canonicalKey(raw);
       if (!campaignIndex.has(k) && !adsetIndex.has(k) && !adIndex.has(k)) continue;
@@ -598,11 +671,8 @@
     const tableScope = currentTableScope || document.body;
 
     const candidates = [];
-    for (const el of tableScope.querySelectorAll('*')) {
-      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
-      if (el.children.length > 0) continue;
-      const raw = (el.textContent || '').trim();
-      if (!raw || raw.length > 60) continue;
+    for (const { el, text: raw } of scopedLeaves(tableScope)) {
+      if (raw.length > 60) continue;
       const k = canonicalKey(raw);
       let matched = GOOGLE_COST_HEADER_KEYS.has(k);
       if (!matched && raw.match(/[.…]+$/)) {
@@ -629,11 +699,7 @@
       winner = candidates[0];
     } else {
       const currencyLeaves = [];
-      for (const el of tableScope.querySelectorAll('*')) {
-        if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
-        if (el.children.length > 0) continue;
-        const txt = (el.textContent || '').trim();
-        if (!txt) continue;
+      for (const { el, text: txt } of scopedLeaves(tableScope)) {
         if (!looksLikeCurrency(txt)) continue;
         if (isOwnNode(el)) continue;
         const r = el.getBoundingClientRect();
@@ -679,11 +745,8 @@
     if (rowYBuckets) return rowYBuckets;
     rowYBuckets = new Map();
     const tableScope = currentTableScope || document.body;
-    for (const el of tableScope.querySelectorAll('*')) {
-      if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
-      if (el.children.length > 0) continue;
-      const t = (el.textContent || '').trim();
-      if (!t || t.length > 300) continue;
+    for (const { el, text: t } of scopedLeaves(tableScope)) {
+      if (t.length > 300) continue;
       if (isOwnNode(el)) continue;
       const r = el.getBoundingClientRect();
       if (r.height === 0) continue;
@@ -827,11 +890,8 @@
   function detectGoogleDateInfo() {
     try {
       let label = null;
-      for (const el of document.querySelectorAll('*')) {
-        if (HEADER_SCAN_SKIP_TAGS.has(el.tagName)) continue;
-        if (el.children.length > 0) continue;
-        const raw = (el.textContent || '').trim();
-        if (!raw || raw.length > 48) continue;
+      for (const { el, text: raw } of allLeaves()) {
+        if (raw.length > 48) continue;
         const r = el.getBoundingClientRect();
         // Sticky toolbars can sit a few px above the viewport origin (and
         // embedded contexts can report small negative tops), so gate on
@@ -1301,6 +1361,12 @@
 
   // ---- rAF reposition loop ----
   let rafHandle = 0;
+  // Frames of "nothing moved" before the loop parks itself. ~45 frames is
+  // about 0.75 s at 60 Hz: long enough to ride out a fling-scroll's coast,
+  // short enough that an idle tab stops burning layout almost immediately.
+  const RAF_IDLE_FRAMES = 45;
+  let idleFrames = 0;
+  let rafParked = false;
   const lastPositioned = new WeakMap();
 
   function livePillCells() {
@@ -1320,6 +1386,7 @@
   function repositionLoopTick() {
     rafHandle = 0;
     if (!hasLivePills()) return;
+    let moved = 0;
 
     for (const cell of livePillCells()) {
       const pill = cellToPill.get(cell);
@@ -1332,6 +1399,7 @@
       if (prev && prev.top === top && prev.hidden === offscreen && prev.cellRight === r.right) {
         continue;
       }
+      moved++;
       if (pill) {
         positionPillToCell(cell, pill);
       } else {
@@ -1348,6 +1416,21 @@
       if (d2Pill) positionTrailingPill(cell, d2Pill, 'd2');
     }
 
+    // Park the loop once the table has been still for a while (v0.12.5).
+    //
+    // WHY: this used to re-arm unconditionally, so for the entire life of the
+    // tab it ran every frame and called getBoundingClientRect on every pill
+    // cell — a forced style+layout flush 60x/s on a page Google is already
+    // laying out. Nothing was moving for the vast majority of those frames.
+    // Everything that CAN move a row re-arms the loop: scroll/wheel/resize
+    // (listeners below), any decorate pass (decorateCandidate ->
+    // ensureRepositionLoop), and tab re-show (visibilitychange).
+    if (moved > 0) idleFrames = 0; else idleFrames++;
+    if (idleFrames >= RAF_IDLE_FRAMES) {
+      idleFrames = 0;
+      rafParked = true;
+      return;
+    }
     if (hasLivePills()) {
       rafHandle = requestAnimationFrame(repositionLoopTick);
     }
@@ -1355,6 +1438,8 @@
 
   function ensureRepositionLoop() {
     if (rafHandle || !hasLivePills()) return;
+    rafParked = false;
+    idleFrames = 0;
     rafHandle = requestAnimationFrame(repositionLoopTick);
   }
 
@@ -1576,9 +1661,23 @@
   }
 
   // ---- Banner (same draggable badge as the other injectors) ----
+  // Idempotent since v0.12.5. WHY THIS MATTERS FAR MORE THAN IT LOOKS:
+  // decorateAllVisibleRows() ends by calling showBanner(), and
+  // `panel.textContent = text` destroys the old text node and inserts a new
+  // one — a childList mutation inside the very subtree the body
+  // MutationObserver watches. So every decorate pass scheduled the next one,
+  // forever: a self-feeding loop of full-DOM walks + getBoundingClientRect
+  // storms at 5 passes/second on every open ads tab, idle or not. That is the
+  // "extension nặng, lag cả Chrome" report (2026-09-22). The observer now has
+  // an own-node cutout (mutationIsOurs) as the real fix; this early-return is
+  // the cheap second line of defence — and it also stops the banner from
+  // re-rendering on passes where nothing about it changed.
   function showBanner(text, level) {
     let banner = document.getElementById('adjust-overlay-banner');
     if (!banner) banner = createBanner();
+    if (banner._aoxText === text && banner._aoxLevel === level) return;
+    banner._aoxText = text;
+    banner._aoxLevel = level;
     banner.classList.remove('adjust-banner-ok', 'adjust-banner-warn', 'adjust-banner-error');
     banner.classList.add(`adjust-banner-${level}`);
     const panel = banner.querySelector('.adjust-banner-panel');
@@ -1715,6 +1814,7 @@
     lastTodayStats = createEmptyTodayStats();
     rowYBuckets = null;
     candCache = { t: 0, list: [] };
+    invalidateLeafSnapshots();
 
     lastDecorateStats.gcOrphans = gcDisconnectedPills();
     lastDecorateStats.gcLeaked = sweepUntrackedPills();
@@ -1818,12 +1918,45 @@
     return removed;
   }
 
+  let decoratePending = false;
+
   function scheduleDecorate() {
-    if (decorateTimer) return;
+    if (decorateTimer || decoratePending) return;
     decorateTimer = setTimeout(() => {
       decorateTimer = null;
-      decorateAllVisibleRows();
-    }, 200);
+      decoratePending = true;
+      // Run the pass in idle time (v0.12.5): a decorate walks the DOM and reads
+      // geometry, so running it inline during Google's own layout burst is what
+      // turned "extension on" into visible jank. The timeout keeps it bounded —
+      // a page that never goes idle still gets decorated within 400 ms.
+      const run = () => { decoratePending = false; decorateAllVisibleRows(); };
+      if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(run, { timeout: 400 });
+      } else {
+        run();
+      }
+    }, 300);
+  }
+
+  // Is this mutation one WE caused? Appending a pill to <body>, moving one, or
+  // rewriting the banner all fire mutations on the very tree we observe.
+  // v0.12.4 reacted to those too, so every decorate pass scheduled the next one
+  // — a self-sustaining 200 ms loop of full-DOM walks that never settled even
+  // on a completely idle tab. This is the cutout.
+  function isOwnElement(node) {
+    return node.nodeType === 1 && node.classList
+      && (node.classList.contains('adjust-pill') || node.id === 'adjust-overlay-banner');
+  }
+
+  function mutationIsOurs(rec) {
+    const t = rec.target;
+    const host = t && (t.nodeType === 1 ? t : t.parentElement);
+    if (host && isOwnNode(host)) return true;
+    if (rec.type !== 'childList') return false;
+    if (rec.addedNodes.length === 0 && rec.removedNodes.length === 0) return false;
+    for (const node of rec.addedNodes) if (!isOwnElement(node)) return false;
+    for (const node of rec.removedNodes) if (!isOwnElement(node)) return false;
+    return true;
   }
 
   function ensureObserving() {
@@ -1831,12 +1964,25 @@
     // characterData included: Google's virtual scroller sometimes swaps a
     // cell's text in place instead of replacing the node, which childList
     // alone would miss — the recycled node would keep the old row's pill.
-    bodyObserver = new MutationObserver(() => scheduleDecorate());
+    bodyObserver = new MutationObserver((records) => {
+      for (const rec of records) {
+        if (mutationIsOurs(rec)) continue;
+        scheduleDecorate();
+        return;
+      }
+    });
     bodyObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
     // Virtual scrolling may translate existing nodes without DOM mutations;
     // the rAF loop repositions live pills, but newly revealed rows need a
-    // decorate pass. Debounced, passive, capture (Google scrolls inner panes).
-    document.addEventListener('scroll', scheduleDecorate, { capture: true, passive: true });
+    // decorate pass. Wake the cheap reposition loop immediately (it parks itself
+    // when idle — see RAF_IDLE_FRAMES) and leave the expensive decorate pass
+    // debounced. Passive + capture: Google scrolls inner panes, not the window.
+    const onViewportChange = () => {
+      if (rafParked || !rafHandle) ensureRepositionLoop();
+      scheduleDecorate();
+    };
+    document.addEventListener('scroll', onViewportChange, { capture: true, passive: true });
+    window.addEventListener('resize', onViewportChange, { passive: true });
   }
 
   function logDomDiagnostics() {
@@ -1906,18 +2052,32 @@
   // Safety net: Google Ads renders its table seconds after document_idle, and
   // the first GET_CACHED can race a cold service worker. Retry until data has
   // loaded AND some candidate matched, then settle into observer-driven mode.
-  const RETRY_INTERVAL_MS = 2000;
-  const MAX_RETRIES = 15;
+  // Budget raised from 30 s (15 x 2 s, v0.12.4) to ~2.5 min, and the tail
+  // backs off to 5 s. WHY: on the Jelly - Chatbot 2 account the campaigns view
+  // (2 filters / 725 campaigns) does not paint its first rows for well over a
+  // minute — measured 2026-09-22, a CDP Runtime.evaluate against that tab timed
+  // out at 45 s while it was still loading. The old budget expired before the
+  // table existed, so the FIRST paint of pills depended entirely on a later
+  // mutation arriving — which is exactly the "Google Ads đã load nhưng không
+  // show pills" report. Backing off keeps the long tail cheap.
+  const MAX_RETRIES = 40;
+  const FAST_RETRIES = 15;
   let retriesLeft = MAX_RETRIES;
-  const retryHandle = setInterval(() => {
-    if (retriesLeft-- <= 0) { clearInterval(retryHandle); return; }
-    if (!dataLoaded) { loadData(); return; }
-    if (cellToPill.size === 0 && !hasLivePills()) {
+  let retryTimer = 0;
+
+  function retryTick() {
+    if (retriesLeft-- <= 0) return;
+    if (!dataLoaded) {
+      loadData();
+    } else if (!hasLivePills()) {
       scheduleDecorate();
     } else {
-      clearInterval(retryHandle);
+      return; // table found and decorated — the observer owns it from here
     }
-  }, RETRY_INTERVAL_MS);
+    const delay = retriesLeft > (MAX_RETRIES - FAST_RETRIES) ? 2000 : 5000;
+    retryTimer = setTimeout(retryTick, delay);
+  }
+  retryTimer = setTimeout(retryTick, 2000);
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
