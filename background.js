@@ -25,7 +25,7 @@ import { createDataSource } from './src/data-source.js';
 // header cheerfully read v0.12.1. chrome.runtime.getManifest().version cannot
 // catch this — the manifest is re-parsed on browser restart while the cached
 // worker script is not — only a constant baked into THIS file can.
-const WORKER_BUILD = 'v0.12.5';
+const WORKER_BUILD = 'v0.12.6';
 
 const TTL_MS = 5 * 60 * 1000;
 const CACHE_KEY = 'campaignDataCache';

@@ -509,9 +509,13 @@ function mergeRealtimeInto(
       ...c,
       revenueToday: tMatch?.revenueToday ?? 0,
       revenueYesterday: yMatch?.revenueYesterday ?? yRevMiss,
-      costYesterday: yMatch?.costYesterday ?? yCostMiss,
+      // A matched realtime row whose spend half came back null means "Adjust
+      // returned no spend row for this entity" (joinDayRevenueSpend) — keep it
+      // null. The *CostMiss fallback applies only when there is no match at all;
+      // `??` here used to turn that null into a fabricated 0 spend.
+      costYesterday: yMatch ? (yMatch.costYesterday ?? null) : yCostMiss,
       revenueD2: dMatch?.revenueD2 ?? d2RevMiss,
-      costD2: dMatch?.costD2 ?? d2CostMiss,
+      costD2: dMatch ? (dMatch.costD2 ?? null) : d2CostMiss,
       todayRowExisted: !!tMatch,
       adjustCurrency: tMatch?.currency ?? yMatch?.currency ?? dMatch?.currency ?? null,
     });
@@ -553,14 +557,14 @@ function mergeRealtimeInto(
     else if (which === 'yesterday') {
       // Two independent halves — keep a null half null (same rule as D-2).
       o.revenueYesterday = r.revenueYesterday ?? yRevMiss;
-      o.costYesterday = r.costYesterday ?? yCostMiss;
+      o.costYesterday = r.costYesterday ?? null;
     }
     else {
       // A D-2 row carries the two halves independently: keep a null half null
       // rather than collapsing it to 0, so a half-failed D-2 fetch still shows
       // the half that worked.
       o.revenueD2 = r.revenueD2 ?? d2RevMiss;
-      o.costD2 = r.costD2 ?? d2CostMiss;
+      o.costD2 = r.costD2 ?? null;
     }
     if (!o.adjustCurrency && r.currency) o.adjustCurrency = r.currency;
   };

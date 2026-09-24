@@ -41,7 +41,7 @@
 (function () {
   'use strict';
 
-  const INJECTOR_VERSION = 'v0.7.5-perf';
+  const INJECTOR_VERSION = 'v0.7.6-yday-zero-cost';
   // Cache schema this injector was written against. MUST equal
   // CACHE_SCHEMA_VERSION in background.js — bump both together. Used as the
   // stale-service-worker tripwire in loadData().
@@ -1235,7 +1235,18 @@
     // the D-2 pill; the scraped-spend cache below survives only as a fallback
     // for rows whose Adjust spend half failed.
     const adjSpend = (data.costYesterday == null) ? null : data.costYesterday;
-    if (adjSpend != null) {
+    const cached = ttYestSpendCache.get(mainKey);
+    const spendFresh = !!(
+      cached && cached.representsDay === yesterdayLocalIsoDate() && cached.spend != null
+    );
+    // An Adjust cost of 0 is NOT authoritative on its own: Adjust ingests the
+    // network's spend for a closed day with a lag, and until it lands the cohort
+    // report answers 0 for every row. Trust it only when nothing contradicts it —
+    // a fresh UI capture (user parked the picker on Yesterday) or revenue > 0
+    // with zero spend both mean "not ingested yet", so fall through to the
+    // UI-capture path (captured spend, or the "cần view Yesterday" prompt).
+    const adjSpendUsable = adjSpend != null && (adjSpend > 0 || (!spendFresh && !(rev > 0)));
+    if (adjSpendUsable) {
       const yestKey = `${mainKey}|yadj:${rev}/${adjSpend}|a:${adjCcy || ''}`;
       if (decoratedYesterdayKey.get(nameEl) === yestKey) return;
       const yestPill = document.createElement('span');
@@ -1269,10 +1280,6 @@
     // report covers. Comparing against the live yesterday ISO (not against
     // whatever the picker shows now) is what makes a day-rollover drop the
     // stale capture instead of misattributing it.
-    const cached = ttYestSpendCache.get(mainKey);
-    const spendFresh = !!(
-      cached && cached.representsDay === yesterdayLocalIsoDate() && cached.spend != null
-    );
     const spend = spendFresh ? cached.spend : null;
     const ttCcy = spendFresh ? cached.currency : null;
     const currencyMismatch = ttCcy && adjCcy && ttCcy !== adjCcy;

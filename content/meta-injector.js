@@ -42,7 +42,7 @@
   // Bump on every change to confirm the page is running the freshly-reloaded
   // build (page console logs this on every diagnostic dump). Format: vMAJOR.
   // MINOR.PATCH. Bump PATCH for fixes, MINOR for new strategies/fields.
-  const INJECTOR_VERSION = 'v0.12.5-perf';
+  const INJECTOR_VERSION = 'v0.12.6-yday-zero-cost';
   // Cache schema this injector was written against. MUST equal
   // CACHE_SCHEMA_VERSION in background.js — bump both together. Used as the
   // stale-service-worker tripwire in loadData().
@@ -1388,9 +1388,19 @@
     // D-2 pill — so the timezone-window and cross-currency guards below are
     // moot: numerator and denominator share Adjust's window and currency by
     // construction. The UI-capture machinery below survives only as a
-    // fallback for rows whose Adjust spend half failed.
+    // fallback for rows whose Adjust spend half failed or is still 0 (not
+    // ingested yet — see adjSpendUsable).
     const adjSpend = (data.costYesterday == null) ? null : data.costYesterday;
-    if (adjSpend != null) {
+    const cached = metaYestSpendCache.get(mainKey);
+    const spendFresh = !!(cached && cached.representsDay === reportingYesterdayIso() && cached.spend != null);
+    // An Adjust cost of 0 is NOT authoritative on its own: Adjust ingests the
+    // network's spend for a closed day with a lag, and until it lands the cohort
+    // report answers 0 for every row. Trust it only when nothing contradicts it —
+    // a fresh UI capture (user parked the picker on Yesterday) or revenue > 0
+    // with zero spend both mean "not ingested yet", so fall through to the
+    // UI-capture path (captured spend, or the "cần view Yesterday" prompt).
+    const adjSpendUsable = adjSpend != null && (adjSpend > 0 || (!spendFresh && !(rev > 0)));
+    if (adjSpendUsable) {
       const tag = `${mainKey}|yadj:${rev}/${adjSpend}|a:${adjCcy || ''}`;
       if (decoratedYesterdayKey.get(nameEl) === tag) return;
       const stale = findRowPill(nameEl, mainKey, isYesterdayVariantPill);
@@ -1432,8 +1442,6 @@
     // yesterday-revenue fetch, so rather than mislead we show a revenue-only pill.
     const tzMisaligned = computeTzWindows() != null;
 
-    const cached = metaYestSpendCache.get(mainKey);
-    const spendFresh = !!(cached && cached.representsDay === reportingYesterdayIso() && cached.spend != null);
     const spend = spendFresh ? cached.spend : null;
     const metaCcy = spendFresh ? cached.currency : null;
     const currencyMismatch = metaCcy && adjCcy && metaCcy !== adjCcy;
@@ -1464,7 +1472,8 @@
         `Yesterday ROAS chưa tính — chưa bắt được Meta spend hôm qua.\n` +
         `Chuyển Meta date picker sang "Yesterday" một lần để extension đọc spend cell,\n` +
         `rồi quay lại. Revenue hôm qua (Adjust, event-date) đã có: ` +
-        `${formatMoneyOrDash(rev)}${adjCcy ? ` ${adjCcy}` : ''}.`;
+        `${formatMoneyOrDash(rev)}${adjCcy ? ` ${adjCcy}` : ''}.` +
+        (adjSpend === 0 ? `\nAdjust cost hôm qua = 0 — Adjust chưa ingest spend, chưa dùng được.` : '');
       lastTodayStats.yestNeedSpend = (lastTodayStats.yestNeedSpend || 0) + 1;
     } else if (currencyMismatch) {
       pill.className = 'adjust-pill adjust-pill-yest-mismatch';
@@ -1491,6 +1500,7 @@
         `Yesterday realtime ROAS (event-date — directional, not cohort d0)\n` +
         `Rev (Adjust yesterday${adjCcy ? `, ${adjCcy}` : ''}): ${formatMoney(rev)}\n` +
         `Spend (Meta yesterday${metaCcy ? `, ${metaCcy}` : ''}): ${formatMoney(spend)}` +
+        (adjSpend != null ? `\nAdjust cost hôm qua: ${formatMoneyOrDash(adjSpend)} (chưa ingest → dùng spend Meta)` : '') +
         (ageMin != null ? `\nAdjust sync age: ${ageMin}m` : '');
       lastTodayStats.pillsYesterday = (lastTodayStats.pillsYesterday || 0) + 1;
     }
