@@ -12,7 +12,7 @@ const $ = (id) => document.getElementById(id);
 // Build stamp. MUST match WORKER_BUILD in background.js — see the comment there
 // for why a popup and a service worker end up on different builds after a git
 // pull (Chrome re-reads this file on every open; the worker only on Reload).
-const POPUP_BUILD = 'v0.12.5';
+const POPUP_BUILD = 'v0.12.6';
 
 // Returns true when the service worker is running the same build as this popup.
 // On mismatch it takes over the error box and the caller must NOT sync: no
