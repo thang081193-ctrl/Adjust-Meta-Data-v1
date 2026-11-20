@@ -29,7 +29,7 @@ See [docs/findings/multi_adjust_account_split.md](docs/findings/multi_adjust_acc
 ### Paste-ready (App tokens field — Adjust 1)
 
 ```
-b6yjkg1hc7wg,ox6zszk8msjk,c1um2rdnch6o,rzfdacwjzm68,kb64lotprz7k,vpjmthw8l8u8,lpz0c08fnitc,pmh28w0ksfls,wz9wt6b3bim8,9p5pqomqr8jk,7z52ql6392f4,ksrar9dg9zi8,d2khbj9qdgjk
+b6yjkg1hc7wg,ox6zszk8msjk,c1um2rdnch6o,rzfdacwjzm68,kb64lotprz7k,vpjmthw8l8u8,lpz0c08fnitc,pmh28w0ksfls,wz9wt6b3bim8,9p5pqomqr8jk,7z52ql6392f4,ksrar9dg9zi8,d2khbj9qdgjk,h0yg84tdxjpc,ynh7ew4mt3b4,hi8yd90hdb7k
 ```
 
 ### Token → App
@@ -49,10 +49,18 @@ b6yjkg1hc7wg,ox6zszk8msjk,c1um2rdnch6o,rzfdacwjzm68,kb64lotprz7k,vpjmthw8l8u8,lp
 | Show ID Caller & Spam Blocker | `7z52ql6392f4` | Adjust 1 |
 | ChartPilot: AI Chart Analyst | `ksrar9dg9zi8` | Adjust 1 (cũng có bản `[JM]` ở Adjust 2) |
 | Video Downloader & Player HD | `d2khbj9qdgjk` | Adjust 1 (cũng có bản `[JM]` ở Adjust 2) |
+| AimDot - Custom Crosshair FPS | `h0yg84tdxjpc` | Adjust 1 (thêm 2026-10-30) |
+| Evania: AI Character Chat | `ynh7ew4mt3b4` | Adjust 1 (thêm 2026-10-30) |
+| Video Downloader & Player HD (app thứ 2) | `hi8yd90hdb7k` | Adjust 1 (thêm 2026-10-30) — trùng tên với `d2khbj9qdgjk`, app khác |
+| MathDojo: AI Math Practice (bản rỗng) | `dvmblzzdl98g` | **Không** đưa vào paste list — chưa set platform, 0 installs |
 
 <!-- First 8 confirmed 2026-05-11; MathDojo, ScoreDeck, Caller ID added 2026-06-16;
      ChartPilot + Video Downloader added 2026-09-17 after auditing the Adjust 1 AppView
-     list (13 apps total, org "Yaviber Company Limited") — the list is now complete. -->
+     list (13 apps total, org "Yaviber Company Limited").
+     2026-10-30: AimDot, Evania, and a 2nd Video Downloader app (hi8yd90hdb7k) added from
+     the Adjust 1 "All apps" page (16 tokens in the paste list). A 2nd MathDojo app
+     (dvmblzzdl98g, no platform set up, 0 installs) is listed but left out of the paste
+     list; add it once it has a platform + traffic. -->
 
 ## Adjust 2 (tài khoản mới)
 
@@ -75,8 +83,8 @@ Apps trong tài khoản 2 mang tiền tố `[JM]`.
 
 <!-- 4 token Adjust 2 ghi nhận 2026-09-09 từ Adjust dashboard (Apps list). -->
 
-> ⚠ **Chưa xoá token nào khỏi Adjust 1** (quyết định 2026-09-17: giữ đủ 13 token
-> Adjust 1 làm list hiện hành). Ba app hiện có mặt ở **cả hai** tài khoản với
+> ⚠ **Chưa xoá token nào khỏi Adjust 1** (quyết định 2026-09-17, giữ nguyên khi thêm
+> 3 app 2026-10-30: Adjust 1 hiện là 16 token). Ba app hiện có mặt ở **cả hai** tài khoản với
 > app_token khác nhau:
 >
 > | App | Adjust 1 | Adjust 2 (`[JM]`) |
